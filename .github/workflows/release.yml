@@ -13,29 +13,30 @@ jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
       - name: Get version from tag
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ steps.get_version.outputs.version }}
+          name: Release ${{ steps.get_version.outputs.version }}
           draft: false
           prerelease: false
+          generate_release_notes: true
 
   build:
     name: Build for ${{ matrix.target }}
-    needs: create-release
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -110,39 +111,32 @@ jobs:
           fi
         shell: bash
 
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Prepare artifacts (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz dht_crawler
-          mv dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+          tar czf dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz dht_crawler
+          mv dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+        shell: bash
 
       - name: Prepare artifacts (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip dht_crawler.exe
-          move dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
+          7z a dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler.exe
+          move dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
+        shell: bash
 
-      - name: Upload Release Asset (Unix)
-        if: runner.os != 'Windows'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz
-          asset_name: dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Release Asset (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip
-          asset_name: dht_crawler-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip
-          asset_content_type: application/zip
+          files: |
+            dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.*
 
