@@ -160,7 +160,7 @@ impl DHTServer {
     /// - 如果回调执行过慢，可能会导致任务队列堆积。
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,ignore
     /// server.on_metadata_fetch(|hash| async move {
     ///     // 检查数据库是否存在
     ///     // let exists = db.has(hash).await;
@@ -188,7 +188,7 @@ impl DHTServer {
     /// - 否则会阻塞当前的元数据获取 Worker，降低系统吞吐量。
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,ignore
     /// server.on_torrent(|info| {
     ///     // 简单操作可以直接做
     ///     println!("Got torrent: {}", info.name);
