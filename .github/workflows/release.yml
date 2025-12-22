@@ -3,37 +3,15 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'  # 当推送 v1.0.0 这样的 tag 时触发
+      - 'v*.*.*'  # 只在推送 v1.0.0 这样的 tag 时触发
   workflow_dispatch:  # 允许手动触发
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - name: Get version from tag
-        id: get_version
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release ${{ steps.get_version.outputs.version }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-
-  build:
-    name: Build for ${{ matrix.target }}
+  build-and-release:
+    name: Build and Release for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -114,7 +92,11 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
         shell: bash
 
@@ -131,12 +113,12 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           7z a dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler.exe
-          move dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
-        shell: bash
+          Move-Item dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
+        shell: pwsh
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.*
-
