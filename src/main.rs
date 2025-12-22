@@ -1,0 +1,105 @@
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+use dht_crawler::prelude::*;
+use std::sync::Arc;
+use mimalloc::MiMalloc;
+use tracing_subscriber::EnvFilter;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    
+    // 直接输出到 stdout，避免 _guard 被 drop 导致日志丢失
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_ansi(true)
+        .init();
+
+    let options = DHTOptions {
+        port: 45452,
+        auto_metadata: true,
+        metadata_timeout: 3,                   // ✅ 快速超时，快速失败
+        max_metadata_queue_size: 100000,       // ✅ 大缓冲区（防止饱和）
+        max_metadata_worker_count: 1000,       // ✅ 激进并发（最大化吞吐）
+    };
+
+    // 统计计数器
+    let torrent_count = Arc::new(AtomicUsize::new(0));
+    let torrent_count_clone = torrent_count.clone();
+
+    // 🚀 初始化 DHT Server
+    log::info!("🔧 正在初始化 DHT Server...");
+    let server = DHTServer::new(options.clone()).await?;
+
+    log::info!("🚀 DHT Server 启动，监听端口: {}", options.port);
+
+    // 设置 torrent 回调
+    server.on_torrent(move |_torrent| {
+        let _count = torrent_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // 🔇 取消打印 torrent 信息，减少日志输出
+        // let total_size: u64 = torrent.files.iter().map(|f| f.size).sum();
+        // let files_display = if torrent.files.len() <= 3 {
+        //     torrent.files.iter()
+        //         .map(|f| format!("{} ({})", f.path, format_size(f.size)))
+        //         .collect::<Vec<_>>()
+        //         .join(", ")
+        // } else {
+        //     format!("{}个文件", torrent.files.len())
+        // };
+        //
+        // log::info!(
+        //     "🎉 [{}] {} ({}, {})",
+        //     count,
+        //     torrent.name,
+        //     format_size(total_size),
+        //     files_display
+        // );
+    });
+
+    // 设置元数据获取前的检查回调
+    server.on_metadata_fetch(|_hash| async move {
+        true
+    });
+
+    server.set_filter(|_hash| {
+        true
+    });
+
+    server.on_duplicate(|_hash| {
+
+    });
+
+    // 启动监控任务
+    let dht_monitor = server.clone();
+    let count_monitor = torrent_count.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let start_time = std::time::Instant::now();
+
+        loop {
+            interval.tick().await;
+            let success_fetch = count_monitor.load(Ordering::Relaxed);
+            let uptime = start_time.elapsed().as_secs();
+
+            // ✅ 监控：布隆过滤器的位使用情况反映了爬虫的活跃度
+            log::info!(
+                "📊 [监控] 时长: {}s | 成功抓取: ✨ {} | 活跃指纹: {}",
+                uptime, success_fetch, dht_monitor.get_seen_count()
+            );
+
+            if uptime > 0 && success_fetch > 0 {
+                let speed = (success_fetch as f64) / (uptime as f64 / 60.0);
+                log::info!("📈 平均抓取速度: {:.2} 种子/分钟", speed);
+            }
+        }
+    });
+
+    server.start().await?;
+    Ok(())
+}
