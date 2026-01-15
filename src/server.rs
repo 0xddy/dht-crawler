@@ -52,7 +52,6 @@ pub struct DHTServer {
     socket_v6: Option<Arc<UdpSocket>>,
     token_secret: Vec<u8>,
 
-    // 这些回调现在与 MetadataScheduler 共享
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     filter: Arc<RwLock<Option<FilterCallback>>>,
     on_duplicate: Arc<RwLock<Option<DuplicateCallback>>>,
