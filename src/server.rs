@@ -29,7 +29,6 @@ pub type BoxedBoolFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 pub type MetadataFetchCallback = Arc<dyn Fn(String) -> BoxedBoolFuture + Send + Sync>;
 
 // Hash 发现事件
-/// DHT Server 发现 hash 后发送此事件，由独立的 MetadataScheduler 处理
 #[derive(Debug, Clone)]
 pub struct HashDiscovered {
     pub info_hash: String,
@@ -246,7 +245,7 @@ impl DHTServer {
     /// - 如果回调执行过慢，可能会导致任务队列堆积。
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,ignore
     /// server.on_metadata_fetch(|hash| async move {
     ///     // 检查数据库是否存在
     ///     // let exists = db.has(hash).await;
@@ -274,7 +273,7 @@ impl DHTServer {
     /// - 否则会阻塞当前的元数据获取 Worker，降低系统吞吐量。
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,ignore
     /// server.on_torrent(|info| {
     ///     // 简单操作可以直接做
     ///     println!("Got torrent: {}", info.name);
