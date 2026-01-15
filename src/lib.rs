@@ -8,7 +8,7 @@ pub mod scheduler;  // 元数据调度器
 
 pub use error::{DHTError, Result};
 pub use server::{DHTServer, HashDiscovered};
-pub use types::{DHTOptions, FileInfo, TorrentInfo};
+pub use types::{DHTOptions, FileInfo, TorrentInfo, NetMode};
 pub use sharded::{ShardedBloom, ShardedNodeQueue, NodeTuple};
 pub use scheduler::MetadataScheduler;
 
@@ -16,6 +16,6 @@ pub use scheduler::MetadataScheduler;
 pub mod prelude {
     pub use crate::error::{DHTError, Result};
     pub use crate::server::DHTServer;
-    pub use crate::types::{DHTOptions, FileInfo, TorrentInfo};
+    pub use crate::types::{DHTOptions, FileInfo, TorrentInfo, NetMode};
     pub use crate::scheduler::MetadataScheduler;
 }

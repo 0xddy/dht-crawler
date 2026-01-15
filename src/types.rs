@@ -1,5 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+/// 网络模式配置
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetMode {
+    /// 仅使用 IPv4
+    Ipv4Only,
+    /// 仅使用 IPv6
+    Ipv6Only,
+    /// 双栈（同时支持 IPv4 和 IPv6）
+    DualStack,
+}
+
+impl Default for NetMode {
+    fn default() -> Self {
+        Self::DualStack
+    }
+}
+
 /// 完整的种子信息（包含元数据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentInfo {
@@ -62,6 +79,9 @@ pub struct DHTOptions {
 
     /// 并发元数据获取工作线程数
     pub max_metadata_worker_count: usize,
+
+    /// 网络模式配置（仅IPv4、仅IPv6、或双栈）
+    pub netmode: NetMode,
 }
 
 impl Default for DHTOptions {
@@ -75,6 +95,8 @@ impl Default for DHTOptions {
             max_metadata_queue_size: 10000,
             // 提高并发，模拟 Node.js 的高并发 IO
             max_metadata_worker_count: 1000,
+            // 默认双栈
+            netmode: NetMode::DualStack,
         }
     }
 }

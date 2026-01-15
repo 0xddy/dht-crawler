@@ -21,11 +21,12 @@ async fn main() -> Result<()> {
         .init();
 
     let options = DHTOptions {
-        port: 45452,
+        port: 12313,
         auto_metadata: true,
         metadata_timeout: 3,                   // ✅ 快速超时，快速失败
         max_metadata_queue_size: 100000,       // ✅ 大缓冲区（防止饱和）
         max_metadata_worker_count: 1000,       // ✅ 激进并发（最大化吞吐）
+        netmode: NetMode::DualStack,      // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
     };
 
     // 统计计数器

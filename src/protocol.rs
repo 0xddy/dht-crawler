@@ -29,5 +29,7 @@ pub struct DhtResponse {
     pub id: Option<serde_bytes::ByteBuf>,
     #[serde(default)]
     pub nodes: Option<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    pub nodes6: Option<serde_bytes::ByteBuf>,
 }
 

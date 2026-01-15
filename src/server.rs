@@ -2,12 +2,12 @@ use crate::error::Result;
 use crate::metadata::RbitFetcher;
 use crate::protocol::{DhtMessage, DhtArgs, DhtResponse};
 use crate::scheduler::MetadataScheduler;
-use crate::types::{DHTOptions, TorrentInfo};
+use crate::types::{DHTOptions, TorrentInfo, NetMode};
 use crate::sharded::{ShardedBloom, ShardedNodeQueue, NodeTuple};
 use rand::Rng;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -49,6 +49,7 @@ pub struct DHTServer {
     options: DHTOptions,
     node_id: Vec<u8>,
     socket: Arc<UdpSocket>,
+    socket_v6: Option<Arc<UdpSocket>>,
     token_secret: Vec<u8>,
 
     // 这些回调现在与 MetadataScheduler 共享
@@ -71,19 +72,69 @@ pub struct DHTServer {
 
 impl DHTServer {
     pub async fn new(options: DHTOptions) -> Result<Self> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        #[cfg(not(windows))]
-        { let _ = socket.set_reuse_port(true); }
-        let _ = socket.set_reuse_address(true);
-        socket.set_nonblocking(true)?;
-        
-        // 增加网络缓冲区以应对高QPS
-        let _ = socket.set_recv_buffer_size(32 * 1024 * 1024);  // 32MB（原16MB）
-        let _ = socket.set_send_buffer_size(8 * 1024 * 1024);   // 8MB（原4MB）
+        let (socket, socket_v6) = match options.netmode {
+            NetMode::Ipv4Only => {
+                let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+                #[cfg(not(windows))]
+                { let _ = sock.set_reuse_port(true); }
+                let _ = sock.set_reuse_address(true);
+                sock.set_nonblocking(true)?;
+                
+                // 增加网络缓冲区以应对高QPS
+                let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);  // 32MB
+                let _ = sock.set_send_buffer_size(8 * 1024 * 1024);   // 8MB
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
-        socket.bind(&addr.into())?;
-        let socket = UdpSocket::from_std(socket.into())?;
+                let addr: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
+                sock.bind(&addr.into())?;
+                (Arc::new(UdpSocket::from_std(sock.into())?), None)
+            },
+            NetMode::Ipv6Only => {
+                let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                #[cfg(not(windows))]
+                { let _ = sock.set_reuse_port(true); }
+                let _ = sock.set_reuse_address(true);
+                // 设置仅IPv6模式（Windows默认是仅IPv6，Linux/Unix需要设置）
+                #[cfg(not(windows))]
+                { let _ = sock.set_only_v6(true); }
+                sock.set_nonblocking(true)?;
+                
+                let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
+                let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+
+                let addr: SocketAddr = format!("[::]:{}", options.port).parse().unwrap();
+                sock.bind(&addr.into())?;
+                (Arc::new(UdpSocket::from_std(sock.into())?), None)
+            },
+            NetMode::DualStack => {
+                // IPv4 socket
+                let sock_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+                #[cfg(not(windows))]
+                { let _ = sock_v4.set_reuse_port(true); }
+                let _ = sock_v4.set_reuse_address(true);
+                sock_v4.set_nonblocking(true)?;
+                let _ = sock_v4.set_recv_buffer_size(32 * 1024 * 1024);
+                let _ = sock_v4.set_send_buffer_size(8 * 1024 * 1024);
+                let addr_v4: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
+                sock_v4.bind(&addr_v4.into())?;
+                let socket = Arc::new(UdpSocket::from_std(sock_v4.into())?);
+
+                // IPv6 socket
+                let sock_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                #[cfg(not(windows))]
+                { let _ = sock_v6.set_reuse_port(true); }
+                let _ = sock_v6.set_reuse_address(true);
+                #[cfg(not(windows))]
+                { let _ = sock_v6.set_only_v6(true); }  // 仅IPv6，避免与IPv4冲突
+                sock_v6.set_nonblocking(true)?;
+                let _ = sock_v6.set_recv_buffer_size(32 * 1024 * 1024);
+                let _ = sock_v6.set_send_buffer_size(8 * 1024 * 1024);
+                let addr_v6: SocketAddr = format!("[::]:{}", options.port).parse().unwrap();
+                sock_v6.bind(&addr_v6.into())?;
+                let socket_v6 = Some(Arc::new(UdpSocket::from_std(sock_v6.into())?));
+
+                (socket, socket_v6)
+            },
+        };
 
         let node_id = generate_random_id();
         let mut rng = rand::thread_rng();
@@ -129,7 +180,8 @@ impl DHTServer {
         let server = Self {
             options: options.clone(),
             node_id: node_id.clone(),
-            socket: Arc::new(socket),
+            socket,
+            socket_v6,
             token_secret,
             callback,
             on_metadata_fetch,
@@ -149,6 +201,41 @@ impl DHTServer {
         Ok(self.socket.local_addr()?)
     }
 
+    /// 验证地址类型是否与当前 netmode 配置匹配
+    /// 
+    /// 防御性编程：虽然 socket 层面理论上不应该接收到不匹配的数据包，
+    /// 但在某些特殊情况下（如系统配置、双栈模式切换等）可能会有问题。
+    /// 此方法确保在应用层也进行验证，避免处理不匹配的地址类型。
+    fn is_addr_allowed(&self, addr: &SocketAddr) -> bool {
+        match self.options.netmode {
+            NetMode::Ipv4Only => addr.is_ipv4(),
+            NetMode::Ipv6Only => addr.is_ipv6(),
+            NetMode::DualStack => true, // 双栈模式接受所有地址类型
+        }
+    }
+
+    /// 根据目标地址选择合适的socket
+    fn select_socket(&self, addr: &SocketAddr) -> &Arc<UdpSocket> {
+        match self.options.netmode {
+            NetMode::Ipv4Only => {
+                // IPv4Only 模式：只有 IPv4 socket
+                &self.socket
+            },
+            NetMode::Ipv6Only => {
+                // IPv6Only 模式：只有 IPv6 socket
+                &self.socket
+            },
+            NetMode::DualStack => {
+                // 双栈模式：根据地址类型选择
+                if addr.is_ipv6() {
+                    self.socket_v6.as_ref().unwrap_or(&self.socket)
+                } else {
+                    &self.socket
+                }
+            },
+        }
+    }
+
     /// 设置元数据获取前的检查回调
     ///
     /// 此回调在发现新的 info_hash 后，但在实际连接对等端获取元数据之前执行。
@@ -160,7 +247,7 @@ impl DHTServer {
     /// - 如果回调执行过慢，可能会导致任务队列堆积。
     ///
     /// # 示例
-    /// ```rust,ignore
+    /// ```rust
     /// server.on_metadata_fetch(|hash| async move {
     ///     // 检查数据库是否存在
     ///     // let exists = db.has(hash).await;
@@ -188,7 +275,7 @@ impl DHTServer {
     /// - 否则会阻塞当前的元数据获取 Worker，降低系统吞吐量。
     ///
     /// # 示例
-    /// ```rust,ignore
+    /// ```rust
     /// server.on_torrent(|info| {
     ///     // 简单操作可以直接做
     ///     println!("Got torrent: {}", info.name);
@@ -250,17 +337,14 @@ impl DHTServer {
             let mut loop_tick = 0;
 
             loop {
-                // 自适应爬取速度：根据 Metadata 队列负载调整爬取策略
+                // 🚀 自适应爬取速度：根据 Metadata 队列负载调整爬取策略
                 let queue_len = server.metadata_queue_len.load(Ordering::Relaxed);
                 let queue_pressure = queue_len as f64 / server.max_metadata_queue_size as f64;
                 
                 // 动态计算批次大小和休眠时间
-                let (batch_size, sleep_duration) = if queue_pressure < 0.5 {
-                    // 🟢 绿区：队列空闲，全速爬取
-                    (200, Duration::from_millis(10))
-                } else if queue_pressure < 0.8 {
+                let (batch_size, sleep_duration) = if queue_pressure < 0.8 {
                     // 🟡 黄区：队列有压力，适度减速
-                    (200, Duration::from_millis(20))
+                    (200, Duration::from_millis(10))
                 } else if queue_pressure < 0.95 {
                     // 🟠 橙区：队列高压，大幅减速
                     (20, Duration::from_millis(500))
@@ -269,11 +353,21 @@ impl DHTServer {
                     (0, Duration::from_millis(1000))
                 };
 
+                // 根据配置决定从哪个队列获取节点
+                let filter_ipv6 = match server.options.netmode {
+                    NetMode::Ipv4Only => Some(false),
+                    NetMode::Ipv6Only => Some(true),
+                    NetMode::DualStack => None,
+                };
+                
+                // 检查对应队列是否为空
+                let queue_empty = server.node_queue.is_empty_for(filter_ipv6);
+                
                 let nodes_batch = {
-                    if server.node_queue.is_empty() || batch_size == 0 {
+                    if queue_empty || batch_size == 0 {
                         None
                     } else {
-                        Some(server.node_queue.pop_batch(batch_size))
+                        Some(server.node_queue.pop_batch(batch_size, filter_ipv6))
                     }
                 };
 
@@ -309,6 +403,7 @@ impl DHTServer {
 
     fn start_receiver(&self) {
         let socket = self.socket.clone();
+        let socket_v6 = self.socket_v6.clone();
         let server = self.clone();
 
         let num_workers = std::thread::available_parallelism()
@@ -331,6 +426,7 @@ impl DHTServer {
             });
         }
 
+        let senders_for_v6 = senders.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];
             let mut next_worker_idx = 0;
@@ -340,7 +436,6 @@ impl DHTServer {
                     Ok((size, addr)) => {
                         // 🛡️ 安全检查1：拒绝异常大的包（DHT 消息通常 < 2KB）
                         if size > 8192 {
-                            #[cfg(debug_assertions)]
                             log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
                             continue;
                         }
@@ -371,9 +466,52 @@ impl DHTServer {
                 }
             }
         });
+
+        // IPv6 接收任务
+        if let Some(socket_v6) = socket_v6 {
+            let senders_v6 = senders_for_v6;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65536];
+                let mut next_worker_idx = 0;
+
+                loop {
+                    match socket_v6.recv_from(&mut buf).await {
+                        Ok((size, addr)) => {
+                            if size > 8192 { continue; }
+                            if size == 0 || buf[0] != b'd' { continue; }
+
+                            let data = buf[..size].to_vec();
+
+                            let tx = &senders_v6[next_worker_idx];
+                            next_worker_idx = (next_worker_idx + 1) % num_workers;
+
+                            match tx.try_send((data, addr)) {
+                                Ok(_) => {},
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    #[cfg(debug_assertions)]
+                                    log::trace!("UDP worker queue full, dropping packet");
+                                },
+                                Err(_) => { break; }
+                            }
+                        }
+                        Err(_e) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     async fn handle_message(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
+        // 🛡️ 验证地址类型是否与当前 netmode 配置匹配
+        // 防御性编程：虽然 socket 层面理论上不应该接收到不匹配的数据包，
+        // 但在某些特殊情况下（如系统配置、双栈模式切换等）可能会有问题
+        if !self.is_addr_allowed(&addr) {
+            log::trace!("⚠️ 拒绝不匹配的地址类型: {} (当前模式: {:?})", addr, self.options.netmode);
+            return Ok(());
+        }
+
         let msg: DhtMessage = match serde_bencode::from_bytes(data) {
             Ok(m) => m,
             Err(_) => return Ok(()),
@@ -469,7 +607,7 @@ impl DHTServer {
                 // 使用 try_send，队列满时直接丢弃（背压）
                 if let Err(_) = self.hash_tx.try_send(event) {
                     #[cfg(debug_assertions)]
-                    log::trace!("⚠️ Hash 队列满，丢弃 hash");
+                    log::debug!("⚠️ Hash 队列满，丢弃 hash");
                 }
             }
         }
@@ -477,13 +615,23 @@ impl DHTServer {
     }
 
     async fn handle_response(&self, response: &DhtResponse) -> Result<()> {
+        // 处理 IPv4 节点
         if let Some(nodes_bytes) = &response.nodes {
             self.process_compact_nodes(nodes_bytes);
+        }
+        // 处理 IPv6 节点
+        if let Some(nodes6_bytes) = &response.nodes6 {
+            self.process_compact_nodes_v6(nodes6_bytes);
         }
         Ok(())
     }
 
     fn process_compact_nodes(&self, nodes_bytes: &[u8]) {
+        // 根据配置决定是否处理IPv4节点
+        if self.options.netmode == NetMode::Ipv6Only {
+            return;
+        }
+
         if nodes_bytes.len() % 26 != 0 { return; }
 
         // 使用分片队列，直接并发插入（无锁竞争）
@@ -495,6 +643,29 @@ impl DHTServer {
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
             
             self.node_queue.push(NodeTuple { id, addr });
+        }
+    }
+
+    fn process_compact_nodes_v6(&self, nodes_bytes: &[u8]) {
+        // 根据配置决定是否处理IPv6节点
+        if self.options.netmode == NetMode::Ipv4Only {
+            return;
+        }
+
+        if nodes_bytes.len() % 38 != 0 { return; }
+        for chunk in nodes_bytes.chunks(38) {
+            let id = chunk[0..20].to_vec();
+            let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+            let ip_bytes: [u8; 16] = match chunk[20..36].try_into() {
+                Ok(b) => b,
+                Err(_) => continue, // 如果转换失败（理论上不会），跳过该节点
+            };
+            let ip = Ipv6Addr::from(ip_bytes);
+            // 过滤掉不可用地址 (组播, 未指定等)
+            if !ip.is_unspecified() && !ip.is_multicast() {
+                let addr = SocketAddr::new(IpAddr::V6(ip), port);
+                self.node_queue.push(NodeTuple { id, addr });
+            }
         }
     }
 
@@ -520,20 +691,50 @@ impl DHTServer {
         r_dict.insert(b"token".to_vec(), serde_bencode::value::Value::Bytes(token));
 
         if query_type == "get_peers" || query_type == "find_node" {
-            // 使用分片队列获取随机节点（无锁竞争）
-            let nodes = self.node_queue.get_random_nodes(8);
+            // 根据配置和请求方IP类型决定需要获取的节点类型
+            let requestor_is_ipv6 = addr.is_ipv6();
+            let filter_ipv6 = match self.options.netmode {
+                NetMode::Ipv4Only => Some(false),  // 只要 IPv4
+                NetMode::Ipv6Only => Some(true),   // 只要 IPv6
+                NetMode::DualStack => Some(requestor_is_ipv6),  // 双栈模式：根据请求方IP类型返回对应类型的节点
+            };
+            
+            // 使用分片队列获取随机节点（无锁竞争，带地址族过滤）
+            let nodes = self.node_queue.get_random_nodes(8, filter_ipv6);
             
             let mut nodes_data = Vec::new();
+            let mut nodes6_data = Vec::new();
+
             for node in nodes {
-                nodes_data.extend_from_slice(&node.id);
                 match node.addr.ip() {
-                    IpAddr::V4(ip) => nodes_data.extend_from_slice(&ip.octets()),
-                    _ => continue,
+                    // IPv4 节点
+                    IpAddr::V4(ip) => {
+                        nodes_data.extend_from_slice(&node.id);
+                        nodes_data.extend_from_slice(&ip.octets());
+                        nodes_data.extend_from_slice(&node.addr.port().to_be_bytes());
+                    },
+                    // IPv6 节点
+                    IpAddr::V6(ip) => {
+                        nodes6_data.extend_from_slice(&node.id);
+                        nodes6_data.extend_from_slice(&ip.octets());
+                        nodes6_data.extend_from_slice(&node.addr.port().to_be_bytes());
+                    },
                 }
-                nodes_data.extend_from_slice(&node.addr.port().to_be_bytes());
             }
             
-            r_dict.insert(b"nodes".to_vec(), serde_bencode::value::Value::Bytes(nodes_data));
+            // 根据请求方IP类型返回对应类型的节点
+            // 在单栈模式下，get_random_nodes 已经过滤了节点类型，所以这里直接根据请求方类型返回即可
+            if requestor_is_ipv6 {
+                // 请求方是IPv6：返回IPv6节点
+                if !nodes6_data.is_empty() {
+                    r_dict.insert(b"nodes6".to_vec(), serde_bencode::value::Value::Bytes(nodes6_data));
+                }
+            } else {
+                // 请求方是IPv4：返回IPv4节点
+                if !nodes_data.is_empty() {
+                    r_dict.insert(b"nodes".to_vec(), serde_bencode::value::Value::Bytes(nodes_data));
+                }
+            }
         }
 
         let mut response: std::collections::HashMap<String, serde_bencode::value::Value> = std::collections::HashMap::new();
@@ -542,7 +743,7 @@ impl DHTServer {
         response.insert("r".to_string(), serde_bencode::value::Value::Dict(r_dict));
 
         if let Ok(encoded) = serde_bencode::to_bytes(&response) {
-            let _ = self.socket.send_to(&encoded, addr).await;
+            let _ = self.select_socket(&addr).send_to(&encoded, addr).await;
         }
         Ok(())
     }
@@ -553,7 +754,18 @@ impl DHTServer {
             match tokio::net::lookup_host(node).await {
                 Ok(addrs) => {
                     for addr in addrs {
-                        if addr.is_ipv6() { continue; }
+                        // 根据配置过滤地址
+                        match self.options.netmode {
+                            NetMode::Ipv4Only => {
+                                if addr.is_ipv6() { continue; }
+                            },
+                            NetMode::Ipv6Only => {
+                                if addr.is_ipv4() { continue; }
+                            },
+                            NetMode::DualStack => {
+                                // 双栈模式，接受所有地址
+                            },
+                        }
                         let _ = self.send_find_node(addr, &target, &self.node_id).await;
                     }
                 }
@@ -574,7 +786,7 @@ impl DHTServer {
         msg.insert("a".to_string(), serde_bencode::value::Value::Dict(args));
 
         if let Ok(encoded) = serde_bencode::to_bytes(&msg) {
-            let _ = self.socket.send_to(&encoded, addr).await;
+            let _ = self.select_socket(&addr).send_to(&encoded, addr).await;
         }
         Ok(())
     }
