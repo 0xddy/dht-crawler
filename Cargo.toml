@@ -1,43 +1,46 @@
 [package]
-name = "dht_crawler"
-version = "3.0.0"
+name = "dht-crawler"
+version = "0.0.1"
 edition = "2021"
+authors = ["桥下红药 <1121744186@qq.com>"]
+description = "高性能的 Rust DHT（分布式哈希表）爬虫库，用于爬取 BitTorrent DHT 网络中的种子信息"
+license = "MIT"
+documentation = "https://docs.rs/dht-crawler"
+keywords = ["dht", "bittorrent", "crawler", "p2p", "torrent", "metadata"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "dht_crawler"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_bencode = "0.2"  # 更成熟的 bencode 库，支持 UTF-8
+serde_bencode = "0.2"
 sha1 = "0.10"
 hex = "0.4"
 rand = "0.8"
-
 log = "0.4"
-tracing = "0.1.43"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tracing-appender = "0.2"
-tracing-log = "0.2"
-
-
 thiserror = "1.0"
-
 socket2 = { version = "0.5", features = ["all"] }
 rbit = "0.1"
 bytes = "1.0"
-
-mimalloc = "0.1"
 bloomfilter = "1.0"
-ahash = "0.8"  # 快速哈希算法（比 SHA1 快 10倍+）
-
-# 可选：用于 Web API
-actix-web = { version = "4.4", optional = true }
-encoding_rs = { version = "0.8.35", optional = true }
+ahash = "0.8"
 serde_bytes = "0.11.19"
+mimalloc = { version = "0.1", optional = true }
 
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 default = []
-web = ["actix-web"]
-encoding = ["dep:encoding_rs"]
+mimalloc = ["dep:mimalloc"]
+
+[[example]]
+name = "dht_crawler_example"
+path = "examples/main.rs"
 
 # ==================== 性能优化配置 ====================
 
@@ -52,8 +55,3 @@ strip = true               # 移除调试符号 - 减小二进制
 [profile.dev]
 opt-level = 0
 debug = true
-
-# 性能测试配置
-[profile.bench]
-inherits = "release"
-debug = true               # 保留符号以便性能分析

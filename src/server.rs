@@ -3,7 +3,7 @@ use crate::metadata::RbitFetcher;
 use crate::protocol::{DhtMessage, DhtArgs, DhtResponse};
 use crate::scheduler::MetadataScheduler;
 use crate::types::{DHTOptions, TorrentInfo, NetMode};
-use crate::sharded::{ShardedBloom, ShardedNodeQueue, NodeTuple};
+use crate::sharded::{ShardedNodeQueue, NodeTuple};
 use rand::Rng;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
@@ -40,7 +40,6 @@ pub struct HashDiscovered {
 
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
 type FilterCallback = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-type DuplicateCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct DHTServer {
@@ -53,12 +52,10 @@ pub struct DHTServer {
 
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     filter: Arc<RwLock<Option<FilterCallback>>>,
-    on_duplicate: Arc<RwLock<Option<DuplicateCallback>>>,
     on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
 
     // 使用分片锁，大幅减少竞争
     node_queue: Arc<ShardedNodeQueue>,
-    seen_hashes: Arc<ShardedBloom>,
 
     // 发送 hash 发现事件
     hash_tx: mpsc::Sender<HashDiscovered>,
@@ -138,13 +135,9 @@ impl DHTServer {
         let mut rng = rand::thread_rng();
         let token_secret: Vec<u8> = (0..10).map(|_| rng.gen()).collect();
 
-        // 使用分片队列和分片布隆过滤器
-        // 队列容量：100000 个节点（扩容以适应 DHT 网络裂变速度）
-        let node_queue = ShardedNodeQueue::new(100000);
-        
-        // 布隆过滤器：预期500万元素，0.1%误判率
-        // 内存使用：约 90MB（32分片 × 2.8MB）
-        let bloom = ShardedBloom::new_for_fp_rate(5_000_000, 0.001);
+        // 使用分片队列
+        // 队列容量：从配置获取
+        let node_queue = ShardedNodeQueue::new(options.node_queue_capacity);
 
         // -----------------------------------------------------------
         // 内部初始化 MetadataScheduler
@@ -184,9 +177,7 @@ impl DHTServer {
             callback,
             on_metadata_fetch,
             node_queue: Arc::new(node_queue),
-            seen_hashes: Arc::new(bloom),
             filter: Arc::new(RwLock::new(None)),
-            on_duplicate: Arc::new(RwLock::new(None)),
             hash_tx,
             metadata_queue_len,
             max_metadata_queue_size: options.max_metadata_queue_size,
@@ -302,22 +293,6 @@ impl DHTServer {
         *self.filter.write().unwrap() = Some(Arc::new(filter));
     }
 
-    /// 设置重复 Hash 发现的回调
-    ///
-    /// 当接收到的 Hash 已经被布隆过滤器标记为“已存在”时调用。
-    ///
-    /// # 注意事项
-    /// - 库内部已经自动为每次调用包裹了 `tokio::spawn`。
-    /// - 因此你可以放心地在回调中执行耗时操作（如数据库记录），而不用担心阻塞 UDP 线程。
-    /// - 虽然内部有 spawn，但频繁触发仍会产生大量任务，请注意资源控制。
-    pub fn on_duplicate<F>(&self, callback: F) where F: Fn(&str) + Send + Sync + 'static {
-        *self.on_duplicate.write().unwrap() = Some(Arc::new(callback));
-    }
-
-    pub fn get_seen_count(&self) -> usize {
-        // 分片布隆过滤器的位数统计
-        self.seen_hashes.number_of_bits() as usize
-    }
 
     pub fn get_node_pool_size(&self) -> usize {
         self.node_queue.len()
@@ -565,20 +540,6 @@ impl DHTServer {
                 Ok(arr) => arr, Err(_) => return Ok(()),
             };
             let hash_hex = hex::encode(info_hash_arr);
-
-            // 使用分片布隆过滤器进行高效去重
-            let is_duplicate = self.seen_hashes.check_and_set(&info_hash_arr);
-
-            if is_duplicate {
-                let dup_cb = self.on_duplicate.read().unwrap().clone();
-                if let Some(cb) = dup_cb {
-                    let hash_hex_clone = hash_hex.clone();
-                    tokio::spawn(async move {
-                        cb(&hash_hex_clone);
-                    });
-                }
-                return Ok(());
-            }
 
             let filter_cb = self.filter.read().unwrap().clone();
             if let Some(f) = filter_cb {

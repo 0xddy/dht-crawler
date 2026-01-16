@@ -2,9 +2,9 @@ mod error;
 mod server;
 pub mod protocol;
 pub mod types;
-pub mod metadata;  // 公开 metadata 模块
-mod sharded;  // 分片锁模块
-pub mod scheduler;  // 元数据调度器
+pub mod metadata;
+mod sharded;
+pub mod scheduler;
 
 pub use error::{DHTError, Result};
 pub use server::{DHTServer, HashDiscovered};

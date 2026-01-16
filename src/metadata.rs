@@ -33,7 +33,6 @@ impl RbitFetcher {
 
         let peer_id = PeerId::generate();
 
-        // 🔥 修改点：缩短连接超时到 3 秒
         // DHT 网络很不稳定，如果 3 秒连不上，基本就是连不上了，不要浪费时间
         let mut conn = match timeout(
             Duration::from_secs(3),

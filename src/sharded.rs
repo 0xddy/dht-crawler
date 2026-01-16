@@ -1,8 +1,6 @@
 // 分片锁实现 - 大幅减少锁竞争，提升并发性能
 //
 // 核心思想：1个大锁 → N个小锁
-// 性能提升：预期 3-4 倍
-
 use bloomfilter::Bloom;
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -226,8 +224,6 @@ impl ShardedNodeQueue {
     }
     
     /// 获取随机节点（用于DHT响应）
-    /// 🚀 优化：IPv4 和 IPv6 分开存储，直接从对应队列获取，无需过滤
-    /// 
     /// # Arguments
     /// * `count` - 需要获取的节点数量
     /// * `filter_ipv6` - 如果为 `Some(true)`，只返回 IPv6 节点；如果为 `Some(false)`，只返回 IPv4 节点；如果为 `None`，返回所有节点（混合）

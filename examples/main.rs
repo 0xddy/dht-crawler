@@ -1,9 +1,9 @@
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use dht_crawler::prelude::*;
 use std::sync::Arc;
-use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,7 +26,8 @@ async fn main() -> Result<()> {
         metadata_timeout: 3,                   // ✅ 快速超时，快速失败
         max_metadata_queue_size: 100000,       // ✅ 大缓冲区（防止饱和）
         max_metadata_worker_count: 1000,       // ✅ 激进并发（最大化吞吐）
-        netmode: NetMode::DualStack,      // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
+        netmode: NetMode::Ipv4Only,      // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
+        ..Default::default()  // 使用默认值填充其他字段（节点队列容量等）
     };
 
     // 统计计数器
@@ -72,12 +73,7 @@ async fn main() -> Result<()> {
         true
     });
 
-    server.on_duplicate(|_hash| {
-
-    });
-
     // 启动监控任务
-    let dht_monitor = server.clone();
     let count_monitor = torrent_count.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -88,10 +84,10 @@ async fn main() -> Result<()> {
             let success_fetch = count_monitor.load(Ordering::Relaxed);
             let uptime = start_time.elapsed().as_secs();
 
-            // ✅ 监控：布隆过滤器的位使用情况反映了爬虫的活跃度
+            // ✅ 监控：爬虫运行状态
             log::info!(
-                "📊 [监控] 时长: {}s | 成功抓取: ✨ {} | 活跃指纹: {}",
-                uptime, success_fetch, dht_monitor.get_seen_count()
+                "📊 [监控] 时长: {}s | 成功抓取: ✨ {}",
+                uptime, success_fetch
             );
 
             if uptime > 0 && success_fetch > 0 {
@@ -104,3 +100,4 @@ async fn main() -> Result<()> {
     server.start().await?;
     Ok(())
 }
+

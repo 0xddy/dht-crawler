@@ -4,6 +4,7 @@ use crate::metadata::RbitFetcher;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Mutex};
+#[cfg(debug_assertions)]
 use std::time::Duration;
 
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
@@ -124,37 +125,63 @@ impl MetadataScheduler {
         }
         
         // 主循环：只负责接收 hash 并转发到 worker 队列
+        #[cfg(debug_assertions)]
         let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
+        #[cfg(debug_assertions)]
         stats_interval.tick().await;
         
         loop {
-            tokio::select! {
-                Some(hash) = self.hash_rx.recv() => {
-                    self.total_received.fetch_add(1, Ordering::Relaxed);
-                    
-                    // 尝试发送到 worker 队列
-                    match task_tx.try_send(hash) {
-                        Ok(_) => {
-                            // 成功入队，增加计数器
-                            self.queue_len.fetch_add(1, Ordering::Relaxed);
+            #[cfg(debug_assertions)]
+            {
+                tokio::select! {
+                    Some(hash) = self.hash_rx.recv() => {
+                        self.total_received.fetch_add(1, Ordering::Relaxed);
+                        
+                        // 尝试发送到 worker 队列
+                        match task_tx.try_send(hash) {
+                            Ok(_) => {
+                                // 成功入队，增加计数器
+                                self.queue_len.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // 队列满，丢弃
+                                self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => break,  // Channel 关闭
                         }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // 队列满，丢弃
-                            self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => break,  // Channel 关闭
                     }
+                    
+                    _ = stats_interval.tick() => {
+                        self.print_stats(&task_tx);
+                    }
+                    
+                    else => break,
                 }
-                
-                _ = stats_interval.tick() => {
-                    self.print_stats(&task_tx);
+            }
+            
+            #[cfg(not(debug_assertions))]
+            {
+                match self.hash_rx.recv().await {
+                    Some(hash) => {
+                        self.total_received.fetch_add(1, Ordering::Relaxed);
+                        
+                        // 尝试发送到 worker 队列
+                        match task_tx.try_send(hash) {
+                            Ok(_) => {
+                                // 成功入队，增加计数器
+                                self.queue_len.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // 队列满，丢弃
+                                self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => break,  // Channel 关闭
+                        }
+                    }
+                    None => break,  // Channel 关闭
                 }
-                
-                else => break,
             }
         }
-        
-        // log::info!("🛑 Metadata 调度器停止");
     }
     
     /// 处理单个 hash（Worker 调用）
@@ -221,7 +248,8 @@ impl MetadataScheduler {
         }
     }
     
-    /// 输出统计信息
+    /// 输出统计信息（仅在 debug 模式下编译）
+    #[cfg(debug_assertions)]
     fn print_stats(&self, task_tx: &mpsc::Sender<HashDiscovered>) {
         let received = self.total_received.load(Ordering::Relaxed);
         let dropped = self.total_dropped.load(Ordering::Relaxed);
