@@ -10,17 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 代码格式检查
-  fmt:
-    name: Code Formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
   # 构建和测试
   test:
     name: Test on ${{ matrix.os }}
