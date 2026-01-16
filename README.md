@@ -24,42 +24,16 @@ dht-crawler = "0.0.1"
 
 ### 基本使用
 
-```rust
-use dht_crawler::prelude::*;
+请参考 `examples/main.rs` 查看完整的使用示例。
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 配置选项
-    let options = DHTOptions {
-        port: 6881,
-        auto_metadata: true,
-        metadata_timeout: 3,
-        max_metadata_queue_size: 10000,
-        max_metadata_worker_count: 500,
-        netmode: NetMode::DualStack,
-        ..Default::default()
-    };
-
-    // 创建 DHT 服务器
-    let server = DHTServer::new(options).await?;
-
-    // 设置种子发现回调
-    server.on_torrent(|torrent| {
-        println!("发现种子: {} ({})", torrent.name, torrent.format_size());
-    });
-
-    // 启动服务器
-    server.start().await?;
-    Ok(())
-}
-```
-
-## 性能优化
-
-推荐使用 mimalloc 分配器以获得更好的内存性能：
+### 编译示例
 
 ```bash
-cargo build --release --features mimalloc
+# 编译 Linux 版本（推荐使用 mimalloc 以获得更好的内存性能）
+cargo build --release --target x86_64-unknown-linux-gnu --examples --features mimalloc
+
+# 编译后的可执行文件位于：
+# target/x86_64-unknown-linux-gnu/release/examples/dht_crawler_example
 ```
 
 使用 mimalloc 可以显著降低内存占用（通常降低 10-30%）。
