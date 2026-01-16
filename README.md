@@ -1,4 +1,4 @@
-# dht_crawler
+# dht-crawler
 
 一个高性能的 Rust DHT（分布式哈希表）爬虫库，用于爬取 BitTorrent DHT 网络中的种子信息。
 
