@@ -1,6 +1,6 @@
 [package]
 name = "dht-crawler"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 authors = ["桥下红药 <1121744186@qq.com>"]
 description = "高性能的 Rust DHT（分布式哈希表）爬虫库，用于爬取 BitTorrent DHT 网络中的种子信息"
@@ -15,7 +15,7 @@ name = "dht_crawler"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bencode = "0.2"
 sha1 = "0.10"
@@ -24,19 +24,19 @@ rand = "0.8"
 log = "0.4"
 thiserror = "1.0"
 socket2 = { version = "0.5", features = ["all"] }
-rbit = "0.1"
+rbit = "0.2"
 bytes = "1.0"
 bloomfilter = "1.0"
 ahash = "0.8"
 serde_bytes = "0.11.19"
-mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+mimalloc = "0.1"
 
 [features]
 default = []
-mimalloc = ["dep:mimalloc"]
+mimalloc = []
 
 [[example]]
 name = "dht_crawler_example"

@@ -409,6 +409,7 @@ impl DHTServer {
                     Ok((size, addr)) => {
                         // 🛡️ 安全检查1：拒绝异常大的包（DHT 消息通常 < 2KB）
                         if size > 8192 {
+                            #[cfg(debug_assertions)]
                             log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
                             continue;
                         }

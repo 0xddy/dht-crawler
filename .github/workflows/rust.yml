@@ -40,6 +40,8 @@ jobs:
         run: cargo test --verbose
       - name: Build examples
         run: cargo build --examples --verbose
+      - name: Build examples with mimalloc
+        run: cargo build --examples --verbose --features mimalloc
 
   # 测试不同的 feature 组合
   test-features:
@@ -73,4 +75,11 @@ jobs:
             cargo test --verbose
           else
             cargo test --verbose --features "${{ matrix.features }}"
+          fi
+      - name: Build examples with features
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo build --examples --verbose
+          else
+            cargo build --examples --verbose --features "${{ matrix.features }}"
           fi
