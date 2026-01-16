@@ -17,7 +17,7 @@
 
 ```toml
 [dependencies]
-dht-crawler = "0.0.1"
+dht-crawler = "0.0.2"
 ```
 
 ## 快速开始
