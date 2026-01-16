@@ -91,9 +91,9 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }} --examples --features mimalloc
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc
           fi
         shell: bash
 
@@ -108,17 +108,17 @@ jobs:
       - name: Prepare artifacts (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz dht_crawler
-          mv dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+          cd target/${{ matrix.target }}/release/examples
+          tar czf dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz dht_crawler_example
+          mv dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
         shell: bash
 
       - name: Prepare artifacts (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler.exe
-          Move-Item dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
+          cd target/${{ matrix.target }}/release/examples
+          7z a dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler_example.exe
+          Move-Item dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
         shell: pwsh
 
       - name: Upload Release Assets
@@ -126,4 +126,4 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.version }}
           files: |
-            dht_crawler-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.*
+            dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.*
