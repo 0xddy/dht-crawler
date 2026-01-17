@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 async fn main() -> Result<()> {
 
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        unsafe { std::env::set_var("RUST_LOG", "info"); }
     }
 
     tracing_subscriber::fmt()
