@@ -10,12 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    if std::env::var("RUST_LOG").is_err() {
-        unsafe { std::env::set_var("RUST_LOG", "info"); }
-    }
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_ansi(true)
         .init();
 
