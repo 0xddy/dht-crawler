@@ -1,13 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// 网络模式配置
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetMode {
-    /// 仅使用 IPv4
     Ipv4Only,
-    /// 仅使用 IPv6
     Ipv6Only,
-    /// 双栈（同时支持 IPv4 和 IPv6）
     DualStack,
 }
 
@@ -17,7 +13,6 @@ impl Default for NetMode {
     }
 }
 
-/// 完整的种子信息（包含元数据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentInfo {
     pub info_hash: String,
@@ -30,7 +25,6 @@ pub struct TorrentInfo {
     pub timestamp: u64,
 }
 
-/// 文件信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
@@ -62,45 +56,32 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit_index])
 }
 
-/// DHT 服务器配置
 #[derive(Debug, Clone)]
 pub struct DHTOptions {
-    /// DHT 端口
     pub port: u16,
 
-    /// 是否自动获取元数据
     pub auto_metadata: bool,
 
-    /// 元数据获取超时（秒）
     pub metadata_timeout: u64,
 
-    /// 元数据获取队列大小（背压限制）
     pub max_metadata_queue_size: usize,
 
-    /// 并发元数据获取工作线程数
     pub max_metadata_worker_count: usize,
 
-    /// 网络模式配置（仅IPv4、仅IPv6、或双栈）
     pub netmode: NetMode,
 
-    /// 节点队列容量（默认 100000）
     pub node_queue_capacity: usize,
 }
 
 impl Default for DHTOptions {
     fn default() -> Self {
         Self {
-            port: 6881,  // BitTorrent DHT 默认端口
+            port: 6881,
             auto_metadata: true,
-            // 缩短超时，快速失败，不等待慢节点
             metadata_timeout: 3,
-            // 加大队列，防止流量高峰丢包
             max_metadata_queue_size: 100000,
-            // 提高并发，模拟 Node.js 的高并发 IO
             max_metadata_worker_count: 1000,
-            // 默认双栈
             netmode: NetMode::Ipv4Only,
-            // 节点队列容量：100000 个节点（扩容以适应 DHT 网络裂变速度）
             node_queue_capacity: 100000,
         }
     }

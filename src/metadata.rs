@@ -28,12 +28,8 @@ impl RbitFetcher {
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
     ) -> Option<(String, u64, Vec<FileInfo>)> {
-        let info_hash_hex = hex::encode(info_hash);
-        log::debug!("[Metadata] 开始获取: {} @ {}", info_hash_hex, peer_addr);
-
         let peer_id = PeerId::generate();
 
-        // DHT 网络很不稳定，如果 3 秒连不上，基本就是连不上了，不要浪费时间
         let mut conn = match timeout(
             Duration::from_secs(3),
             PeerConnection::connect(peer_addr, *info_hash, *peer_id.as_bytes()),

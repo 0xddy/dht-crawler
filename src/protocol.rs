@@ -4,9 +4,9 @@ use serde::Deserialize;
 #[allow(dead_code)]
 pub struct DhtMessage {
     pub t: serde_bytes::ByteBuf,
-    #[allow(dead_code)]  // 用于快速预检查，不在反序列化后使用
+    #[allow(dead_code)]
     pub y: String,
-    #[allow(dead_code)]  // 用于快速预检查，不在反序列化后使用
+    #[allow(dead_code)]
     pub q: Option<String>,
     pub a: Option<DhtArgs>,
     pub r: Option<DhtResponse>,

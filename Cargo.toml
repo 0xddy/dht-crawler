@@ -29,7 +29,7 @@ bytes = "1.0"
 bloomfilter = "1.0"
 ahash = "0.8"
 serde_bytes = "0.11.19"
-metrics = "0.24"
+metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tracing = "0.1"
@@ -38,6 +38,7 @@ mimalloc = "0.1"
 
 [features]
 default = []
+metrics = ["dep:metrics"]
 mimalloc = []
 
 [[example]]

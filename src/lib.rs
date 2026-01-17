@@ -12,7 +12,6 @@ pub use types::{DHTOptions, FileInfo, TorrentInfo, NetMode};
 pub use sharded::{ShardedBloom, ShardedNodeQueue, NodeTuple};
 pub use scheduler::MetadataScheduler;
 
-// 重新导出常用类型
 pub mod prelude {
     pub use crate::error::{DHTError, Result};
     pub use crate::server::DHTServer;

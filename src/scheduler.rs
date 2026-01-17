@@ -10,29 +10,16 @@ use std::time::Duration;
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
 type MetadataFetchCallback = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
 
-/// 元数据调度器（优雅版：Worker 池 + Channel）
-/// 负责管理元数据获取队列和任务调度
 pub struct MetadataScheduler {
-    // 输入通道
     hash_rx: mpsc::Receiver<HashDiscovered>,
-    
-    // 配置
     max_queue_size: usize,
     max_concurrent: usize,
-    
-    // 元数据获取器
     fetcher: Arc<RbitFetcher>,
-    
-    // 回调
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
-    
-    // 统计（使用 Atomic 支持多线程访问）
     total_received: Arc<AtomicU64>,
     total_dropped: Arc<AtomicU64>,
     total_dispatched: Arc<AtomicU64>,
-    
-    // 共享的队列长度计数器（用于向 Server 反馈背压）
     queue_len: Arc<AtomicUsize>,
 }
 
@@ -44,7 +31,7 @@ impl MetadataScheduler {
         max_concurrent: usize,
         callback: Arc<RwLock<Option<TorrentCallback>>>,
         on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
-        queue_len: Arc<AtomicUsize>, // 新增参数
+        queue_len: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             hash_rx,
@@ -60,44 +47,37 @@ impl MetadataScheduler {
         }
     }
     
-    /// 设置 torrent 回调
     pub fn set_callback(&mut self, callback: TorrentCallback) {
         if let Ok(mut guard) = self.callback.try_write() {
             *guard = Some(callback);
         }
     }
     
-    /// 设置元数据获取前的检查回调
     pub fn set_metadata_fetch_callback(&mut self, callback: MetadataFetchCallback) {
         if let Ok(mut guard) = self.on_metadata_fetch.try_write() {
             *guard = Some(callback);
         }
     }
     
-    /// 运行调度器（完全事件驱动）
     pub async fn run(mut self) {        
-        // 创建任务队列（channel 自带背压）
         let (task_tx, task_rx) = mpsc::channel::<HashDiscovered>(self.max_queue_size);
         let task_rx = Arc::new(Mutex::new(task_rx));
         
-        // 启动 Worker 池
         for worker_id in 0..self.max_concurrent {
             let task_rx = task_rx.clone();
             let fetcher = self.fetcher.clone();
             let callback = self.callback.clone();
             let on_metadata_fetch = self.on_metadata_fetch.clone();
             let total_dispatched = self.total_dispatched.clone();
-            let queue_len = self.queue_len.clone(); // 传递计数器
+            let queue_len = self.queue_len.clone();
             
             tokio::spawn(async move {
                 log::trace!("Worker {} 启动", worker_id);
                 
                 loop {
-                    // Worker 从队列取任务（阻塞等待，零延迟）
                     let hash = {
                         let mut rx = task_rx.lock().await;
                         let h = rx.recv().await;
-                        // 取出任务后，减少计数器
                         if h.is_some() {
                             queue_len.fetch_sub(1, Ordering::Relaxed);
                         }
@@ -106,12 +86,11 @@ impl MetadataScheduler {
                     
                     let hash = match hash {
                         Some(h) => h,
-                        None => break,  // Channel 关闭，退出
+                        None => break,
                     };
                     
                     total_dispatched.fetch_add(1, Ordering::Relaxed);
                     
-                    // 执行任务
                     Self::process_hash(
                         hash,
                         &fetcher,
@@ -124,7 +103,6 @@ impl MetadataScheduler {
             });
         }
         
-        // 主循环：只负责接收 hash 并转发到 worker 队列
         #[cfg(debug_assertions)]
         let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
         #[cfg(debug_assertions)]
@@ -137,17 +115,14 @@ impl MetadataScheduler {
                     Some(hash) = self.hash_rx.recv() => {
                         self.total_received.fetch_add(1, Ordering::Relaxed);
                         
-                        // 尝试发送到 worker 队列
                         match task_tx.try_send(hash) {
                             Ok(_) => {
-                                // 成功入队，增加计数器
                                 self.queue_len.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // 队列满，丢弃
                                 self.total_dropped.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(_) => break,  // Channel 关闭
+                            Err(_) => break,
                         }
                     }
                     
@@ -165,26 +140,22 @@ impl MetadataScheduler {
                     Some(hash) => {
                         self.total_received.fetch_add(1, Ordering::Relaxed);
                         
-                        // 尝试发送到 worker 队列
                         match task_tx.try_send(hash) {
                             Ok(_) => {
-                                // 成功入队，增加计数器
                                 self.queue_len.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // 队列满，丢弃
                                 self.total_dropped.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(_) => break,  // Channel 关闭
+                            Err(_) => break,
                         }
                     }
-                    None => break,  // Channel 关闭
+                    None => break,
                 }
             }
         }
     }
     
-    /// 处理单个 hash（Worker 调用）
     async fn process_hash(
         hash: HashDiscovered,
         fetcher: &Arc<RbitFetcher>,
@@ -194,11 +165,10 @@ impl MetadataScheduler {
         let info_hash = hash.info_hash.clone();
         let peer_addr = hash.peer_addr;
         
-        // 检查是否需要获取（获取回调快照并释放锁）
         let maybe_check_fn = {
             match on_metadata_fetch.read() {
                 Ok(guard) => guard.clone(),
-                Err(_) => return, // 锁中毒
+                Err(_) => return,
             }
         };
 
@@ -208,7 +178,6 @@ impl MetadataScheduler {
             }
         }
         
-        // 解码 info_hash
         let info_hash_bytes: [u8; 20] = match hex::decode(&info_hash) {
             Ok(bytes) if bytes.len() == 20 => {
                 let mut arr = [0u8; 20];
@@ -218,7 +187,6 @@ impl MetadataScheduler {
             _ => return,
         };
         
-        // 获取元数据
         if let Some((name, total_size, files)) = fetcher.fetch(&info_hash_bytes, peer_addr).await {
             let metadata = TorrentInfo {
                 info_hash,
@@ -234,11 +202,10 @@ impl MetadataScheduler {
                     .as_secs(),
             };
             
-            // 获取回调快照并释放锁
             let maybe_torrent_cb = {
                 match callback.read() {
                     Ok(guard) => guard.clone(),
-                    Err(_) => return, // 锁中毒
+                    Err(_) => return,
                 }
             };
             
@@ -248,7 +215,6 @@ impl MetadataScheduler {
         }
     }
     
-    /// 输出统计信息（仅在 debug 模式下编译）
     #[cfg(debug_assertions)]
     fn print_stats(&self, task_tx: &mpsc::Sender<HashDiscovered>) {
         let received = self.total_received.load(Ordering::Relaxed);
@@ -264,7 +230,6 @@ impl MetadataScheduler {
         let queue_size = self.max_queue_size - task_tx.capacity();
         let queue_pressure = (queue_size as f64 / self.max_queue_size as f64) * 100.0;
         
-        // 根据压力选择日志级别
         if queue_pressure > 80.0 {
             log::warn!(
                 "⚠️ Metadata 队列高压：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",
