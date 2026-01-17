@@ -1,7 +1,7 @@
 [package]
 name = "dht-crawler"
 version = "0.0.4"
-edition = "2021"
+edition = "2024"
 authors = ["桥下红药 <1121744186@qq.com>"]
 description = "高性能的 Rust DHT（分布式哈希表）爬虫库，用于爬取 BitTorrent DHT 网络中的种子信息"
 license = "MIT"
@@ -29,9 +29,11 @@ bytes = "1.0"
 bloomfilter = "1.0"
 ahash = "0.8"
 serde_bytes = "0.11.19"
+metrics = "0.24"
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
 mimalloc = "0.1"
 
 [features]
@@ -42,16 +44,13 @@ mimalloc = []
 name = "dht_crawler_example"
 path = "examples/main.rs"
 
-# ==================== 性能优化配置 ====================
-
 [profile.release]
-opt-level = 3              # 最高优化级别
-lto = "fat"                # 链接时优化（LTO）- 显著提升性能
-codegen-units = 1          # 单编译单元 - 更好的优化但编译慢
-panic = "abort"            # panic时直接终止 - 减少二进制大小
-strip = true               # 移除调试符号 - 减小二进制
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
 
-# 开发时快速编译
 [profile.dev]
 opt-level = 0
 debug = true

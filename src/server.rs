@@ -133,7 +133,7 @@ impl DHTServer {
 
         let node_id = generate_random_id();
         let mut rng = rand::thread_rng();
-        let token_secret: Vec<u8> = (0..10).map(|_| rng.gen()).collect();
+        let token_secret: Vec<u8> = (0..10).map(|_| rng.r#gen::<u8>()).collect();
 
         // 使用分片队列
         // 队列容量：从配置获取
@@ -780,7 +780,7 @@ impl DHTServer {
 
 fn generate_random_id() -> Vec<u8> {
     let mut rng = rand::thread_rng();
-    (0..20).map(|_| rng.gen()).collect()
+    (0..20).map(|_| rng.r#gen::<u8>()).collect()
 }
 
 fn generate_neighbor_target(remote_id: &[u8], local_id: &[u8]) -> Vec<u8> {
