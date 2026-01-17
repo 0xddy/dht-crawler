@@ -19,6 +19,9 @@ pub enum DHTError {
     
     #[error("元数据验证失败")]
     InvalidMetadata,
+    
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, DHTError>;

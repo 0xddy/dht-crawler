@@ -4,6 +4,7 @@ use crate::metadata::RbitFetcher;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 #[cfg(debug_assertions)]
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ pub struct MetadataScheduler {
     total_dropped: Arc<AtomicU64>,
     total_dispatched: Arc<AtomicU64>,
     queue_len: Arc<AtomicUsize>,
+    shutdown: CancellationToken,
 }
 
 impl MetadataScheduler {
@@ -32,6 +34,7 @@ impl MetadataScheduler {
         callback: Arc<RwLock<Option<TorrentCallback>>>,
         on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
         queue_len: Arc<AtomicUsize>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             hash_rx,
@@ -44,6 +47,7 @@ impl MetadataScheduler {
             total_dropped: Arc::new(AtomicU64::new(0)),
             total_dispatched: Arc::new(AtomicU64::new(0)),
             queue_len,
+            shutdown,
         }
     }
     
@@ -63,6 +67,8 @@ impl MetadataScheduler {
         let (task_tx, task_rx) = mpsc::channel::<HashDiscovered>(self.max_queue_size);
         let task_rx = Arc::new(Mutex::new(task_rx));
         
+        let shutdown = self.shutdown.clone();
+        #[cfg_attr(not(debug_assertions), allow(unused_variables))]
         for worker_id in 0..self.max_concurrent {
             let task_rx = task_rx.clone();
             let fetcher = self.fetcher.clone();
@@ -70,36 +76,48 @@ impl MetadataScheduler {
             let on_metadata_fetch = self.on_metadata_fetch.clone();
             let total_dispatched = self.total_dispatched.clone();
             let queue_len = self.queue_len.clone();
+            let shutdown_worker = shutdown.clone();
             
             tokio::spawn(async move {
                 #[cfg(debug_assertions)]
                 log::trace!("Worker {} 启动", worker_id);
                 
                 loop {
-                    let hash = {
-                        let mut rx = task_rx.lock().await;
-                        let h = rx.recv().await;
-                        if h.is_some() {
-                            queue_len.fetch_sub(1, Ordering::Relaxed);
+                    tokio::select! {
+                        _ = shutdown_worker.cancelled() => {
+                            #[cfg(debug_assertions)]
+                            log::trace!("Worker {} 收到关闭信号，退出", worker_id);
+                            break;
                         }
-                        h
-                    };
-                    
-                    let hash = match hash {
-                        Some(h) => h,
-                        None => break,
-                    };
-                    
-                    total_dispatched.fetch_add(1, Ordering::Relaxed);
-                    
-                    Self::process_hash(
-                        hash,
-                        &fetcher,
-                        &callback,
-                        &on_metadata_fetch,
-                    ).await;
+                        result = async {
+                            let mut rx = task_rx.lock().await;
+                            rx.recv().await
+                        } => {
+                            let hash = {
+                                if result.is_some() {
+                                    queue_len.fetch_sub(1, Ordering::Relaxed);
+                                }
+                                result
+                            };
+                            
+                            let hash = match hash {
+                                Some(h) => h,
+                                None => break,
+                            };
+                            
+                            total_dispatched.fetch_add(1, Ordering::Relaxed);
+                            
+                            Self::process_hash(
+                                hash,
+                                &fetcher,
+                                &callback,
+                                &on_metadata_fetch,
+                            ).await;
+                        }
+                    }
                 }
                 
+                #[cfg(debug_assertions)]
                 log::trace!("Worker {} 退出", worker_id);
             });
         }
@@ -109,10 +127,16 @@ impl MetadataScheduler {
         #[cfg(debug_assertions)]
         stats_interval.tick().await;
         
+        let shutdown = self.shutdown.clone();
         loop {
             #[cfg(debug_assertions)]
             {
                 tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        #[cfg(debug_assertions)]
+                        log::trace!("MetadataScheduler 主循环收到关闭信号，退出");
+                        break;
+                    }
                     Some(hash) = self.hash_rx.recv() => {
                         self.total_received.fetch_add(1, Ordering::Relaxed);
                         
@@ -137,21 +161,30 @@ impl MetadataScheduler {
             
             #[cfg(not(debug_assertions))]
             {
-                match self.hash_rx.recv().await {
-                    Some(hash) => {
-                        self.total_received.fetch_add(1, Ordering::Relaxed);
-                        
-                        match task_tx.try_send(hash) {
-                            Ok(_) => {
-                                self.queue_len.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        #[cfg(debug_assertions)]
+                        log::trace!("MetadataScheduler 主循环收到关闭信号，退出");
+                        break;
+                    }
+                    result = self.hash_rx.recv() => {
+                        match result {
+                            Some(hash) => {
+                                self.total_received.fetch_add(1, Ordering::Relaxed);
+                                
+                                match task_tx.try_send(hash) {
+                                    Ok(_) => {
+                                        self.queue_len.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => break,
+                            None => break,
                         }
                     }
-                    None => break,
                 }
             }
         }

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
+use tokio_util::sync::CancellationToken;
 use socket2::{Socket, Domain, Type, Protocol};
 use std::pin::Pin;
 use std::future::Future;
@@ -52,6 +53,7 @@ pub struct DHTServer {
     hash_tx: mpsc::Sender<HashDiscovered>,
     metadata_queue_len: Arc<AtomicUsize>,
     max_metadata_queue_size: usize,
+    shutdown: CancellationToken,
 }
 
 impl DHTServer {
@@ -131,6 +133,9 @@ impl DHTServer {
         
         let metadata_queue_len = Arc::new(AtomicUsize::new(0));
 
+        let shutdown = CancellationToken::new();
+        let shutdown_for_scheduler = shutdown.clone();
+
         let scheduler = MetadataScheduler::new(
             hash_rx,
             fetcher,
@@ -139,6 +144,7 @@ impl DHTServer {
             callback.clone(),
             on_metadata_fetch.clone(),
             metadata_queue_len.clone(),
+            shutdown_for_scheduler,
         );
 
         tokio::spawn(async move {
@@ -159,6 +165,7 @@ impl DHTServer {
             hash_tx,
             metadata_queue_len,
             max_metadata_queue_size,
+            shutdown,
         };
 
         Ok(server)
@@ -218,17 +225,30 @@ impl DHTServer {
     }
 
     pub async fn start(&self) -> Result<()> {
+        // 检查是否已经被关闭
+        if self.shutdown.is_cancelled() {
+            log::warn!("⚠️ 尝试启动已关闭的服务器");
+            return Err(crate::error::DHTError::Other("服务器已关闭".to_string()));
+        }
 
         self.start_receiver();
         self.bootstrap().await;
 
         let server = self.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let semaphore = Arc::new(Semaphore::new(2000));
             let mut loop_tick = 0;
 
             loop {
+                // 检查关闭信号
+                if shutdown.is_cancelled() {
+                    #[cfg(debug_assertions)]
+                    log::trace!("主循环收到关闭信号，退出");
+                    break;
+                }
+
                 let queue_len = server.metadata_queue_len.load(Ordering::Relaxed);
                 let queue_pressure = queue_len as f64 / server.max_metadata_queue_size as f64;
                 
@@ -260,7 +280,10 @@ impl DHTServer {
                 if nodes_batch.is_none() || loop_tick % 50 == 0 {
                     server.bootstrap().await;
                     if nodes_batch.is_none() {
-                        tokio::time::sleep(sleep_duration).await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = tokio::time::sleep(sleep_duration) => {},
+                        }
                         continue;
                     }
                 }
@@ -295,18 +318,26 @@ impl DHTServer {
                     }
                 }
 
-                tokio::time::sleep(sleep_duration).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(sleep_duration) => {},
+                }
             }
         });
-
-        std::future::pending::<()>().await;
+        self.shutdown.cancelled().await;
         Ok(())
+    }
+
+    /// 显式关闭服务器，停止所有后台任务
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     fn start_receiver(&self) {
         let socket = self.socket.clone();
         let socket_v6 = self.socket_v6.clone();
         let server = self.clone();
+        let shutdown = self.shutdown.clone();
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -320,86 +351,92 @@ impl DHTServer {
             senders.push(tx);
 
             let server_clone = server.clone();
+            let shutdown_worker = shutdown.clone();
 
             tokio::spawn(async move {
-                while let Some((data, addr)) = rx.recv().await {
-                    let _ = server_clone.handle_message(&data, addr).await;
+                loop {
+                    tokio::select! {
+                        _ = shutdown_worker.cancelled() => {
+                            #[cfg(debug_assertions)]
+                            log::trace!("Worker 收到关闭信号，退出");
+                            break;
+                        }
+                        msg = rx.recv() => {
+                            match msg {
+                                Some((data, addr)) => {
+                                    let _ = server_clone.handle_message(&data, addr).await;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
                 }
             });
         }
 
-        let senders_for_v6 = senders.clone();
+        Self::spawn_udp_reader(socket, senders.clone(), shutdown.clone());
+
+        if let Some(socket_v6) = socket_v6 {
+            Self::spawn_udp_reader(socket_v6, senders, shutdown);
+        }
+    }
+
+    fn spawn_udp_reader(
+        socket: Arc<UdpSocket>,
+        senders: Vec<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+        shutdown: CancellationToken,
+    ) {
+        let num_workers = senders.len();
+        
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];
             let mut next_worker_idx = 0;
 
             loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((size, addr)) => {
-                        if size > 8192 {
-                            #[cfg(debug_assertions)]
-                            log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
-                            continue;
-                        }
-                        
-                        if size == 0 || buf[0] != b'd' {
-                            continue;
-                        }
-
-                        let data = buf[..size].to_vec();
-
-                        let tx = &senders[next_worker_idx];
-                        next_worker_idx = (next_worker_idx + 1) % num_workers;
-
-                        match tx.try_send((data, addr)) {
-                            Ok(_) => {},
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                #[cfg(debug_assertions)]
-                                log::trace!("UDP worker queue full, dropping packet");
-                            },
-                            Err(_) => { break; }
-                        }
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        #[cfg(debug_assertions)]
+                        log::trace!("UDP 读取循环收到关闭信号，退出");
+                        break;
                     }
-                    Err(_e) => {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((size, addr)) => {
+                                if size > 8192 {
+                                    #[cfg(debug_assertions)]
+                                    log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
+                                    continue;
+                                }
+                                
+                                if size == 0 || buf[0] != b'd' {
+                                    continue;
+                                }
+
+                                let data = buf[..size].to_vec();
+
+                                let tx = &senders[next_worker_idx];
+                                next_worker_idx = (next_worker_idx + 1) % num_workers;
+
+                                match tx.try_send((data, addr)) {
+                                    Ok(_) => {},
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        #[cfg(debug_assertions)]
+                                        log::trace!("UDP worker queue full, dropping packet");
+                                    },
+                                    Err(_) => { break; }
+                                }
+                            }
+                            Err(_e) => {
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
-
-        if let Some(socket_v6) = socket_v6 {
-            let senders_v6 = senders_for_v6;
-            tokio::spawn(async move {
-                let mut buf = [0u8; 65536];
-                let mut next_worker_idx = 0;
-
-                loop {
-                    match socket_v6.recv_from(&mut buf).await {
-                        Ok((size, addr)) => {
-                            if size > 8192 { continue; }
-                            if size == 0 || buf[0] != b'd' { continue; }
-
-                            let data = buf[..size].to_vec();
-
-                            let tx = &senders_v6[next_worker_idx];
-                            next_worker_idx = (next_worker_idx + 1) % num_workers;
-
-                            match tx.try_send((data, addr)) {
-                                Ok(_) => {},
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    #[cfg(debug_assertions)]
-                                    log::trace!("UDP worker queue full, dropping packet");
-                                },
-                                Err(_) => { break; }
-                            }
-                        }
-                        Err(_e) => {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    }
-                }
-            });
-        }
     }
 
     async fn handle_message(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
