@@ -72,6 +72,7 @@ impl MetadataScheduler {
             let queue_len = self.queue_len.clone();
             
             tokio::spawn(async move {
+                #[cfg(debug_assertions)]
                 log::trace!("Worker {} 启动", worker_id);
                 
                 loop {
@@ -154,6 +155,11 @@ impl MetadataScheduler {
                 }
             }
         }
+        
+        // 显式关闭 task_tx，让所有 worker 任务能够退出
+        drop(task_tx);
+        #[cfg(debug_assertions)]
+        log::trace!("MetadataScheduler 主循环退出，等待 worker 任务完成");
     }
     
     async fn process_hash(
