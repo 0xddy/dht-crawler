@@ -1,16 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetMode {
     Ipv4Only,
     Ipv6Only,
+    #[default]
     DualStack,
-}
-
-impl Default for NetMode {
-    fn default() -> Self {
-        Self::DualStack
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

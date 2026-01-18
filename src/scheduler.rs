@@ -1,15 +1,19 @@
+use crate::metadata::RbitFetcher;
 use crate::server::HashDiscovered;
 use crate::types::TorrentInfo;
-use crate::metadata::RbitFetcher;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::{mpsc, Mutex};
-use tokio_util::sync::CancellationToken;
+use std::sync::{Arc, RwLock};
 #[cfg(debug_assertions)]
 use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
-type MetadataFetchCallback = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
+type MetadataFetchCallback = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct MetadataScheduler {
     hash_rx: mpsc::Receiver<HashDiscovered>,
@@ -26,6 +30,7 @@ pub struct MetadataScheduler {
 }
 
 impl MetadataScheduler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hash_rx: mpsc::Receiver<HashDiscovered>,
         fetcher: Arc<RbitFetcher>,
@@ -50,23 +55,23 @@ impl MetadataScheduler {
             shutdown,
         }
     }
-    
+
     pub fn set_callback(&mut self, callback: TorrentCallback) {
         if let Ok(mut guard) = self.callback.try_write() {
             *guard = Some(callback);
         }
     }
-    
+
     pub fn set_metadata_fetch_callback(&mut self, callback: MetadataFetchCallback) {
         if let Ok(mut guard) = self.on_metadata_fetch.try_write() {
             *guard = Some(callback);
         }
     }
-    
-    pub async fn run(mut self) {        
+
+    pub async fn run(mut self) {
         let (task_tx, task_rx) = mpsc::channel::<HashDiscovered>(self.max_queue_size);
         let task_rx = Arc::new(Mutex::new(task_rx));
-        
+
         let shutdown = self.shutdown.clone();
         #[cfg_attr(not(debug_assertions), allow(unused_variables))]
         for worker_id in 0..self.max_concurrent {
@@ -77,11 +82,11 @@ impl MetadataScheduler {
             let total_dispatched = self.total_dispatched.clone();
             let queue_len = self.queue_len.clone();
             let shutdown_worker = shutdown.clone();
-            
+
             tokio::spawn(async move {
                 #[cfg(debug_assertions)]
                 log::trace!("Worker {} 启动", worker_id);
-                
+
                 loop {
                     tokio::select! {
                         _ = shutdown_worker.cancelled() => {
@@ -99,14 +104,14 @@ impl MetadataScheduler {
                                 }
                                 result
                             };
-                            
+
                             let hash = match hash {
                                 Some(h) => h,
                                 None => break,
                             };
-                            
+
                             total_dispatched.fetch_add(1, Ordering::Relaxed);
-                            
+
                             Self::process_hash(
                                 hash,
                                 &fetcher,
@@ -116,17 +121,17 @@ impl MetadataScheduler {
                         }
                     }
                 }
-                
+
                 #[cfg(debug_assertions)]
                 log::trace!("Worker {} 退出", worker_id);
             });
         }
-        
+
         #[cfg(debug_assertions)]
         let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
         #[cfg(debug_assertions)]
         stats_interval.tick().await;
-        
+
         let shutdown = self.shutdown.clone();
         loop {
             #[cfg(debug_assertions)]
@@ -139,7 +144,7 @@ impl MetadataScheduler {
                     }
                     Some(hash) = self.hash_rx.recv() => {
                         self.total_received.fetch_add(1, Ordering::Relaxed);
-                        
+
                         match task_tx.try_send(hash) {
                             Ok(_) => {
                                 self.queue_len.fetch_add(1, Ordering::Relaxed);
@@ -150,15 +155,15 @@ impl MetadataScheduler {
                             Err(_) => break,
                         }
                     }
-                    
+
                     _ = stats_interval.tick() => {
                         self.print_stats(&task_tx);
                     }
-                    
+
                     else => break,
                 }
             }
-            
+
             #[cfg(not(debug_assertions))]
             {
                 tokio::select! {
@@ -171,7 +176,7 @@ impl MetadataScheduler {
                         match result {
                             Some(hash) => {
                                 self.total_received.fetch_add(1, Ordering::Relaxed);
-                                
+
                                 match task_tx.try_send(hash) {
                                     Ok(_) => {
                                         self.queue_len.fetch_add(1, Ordering::Relaxed);
@@ -188,13 +193,13 @@ impl MetadataScheduler {
                 }
             }
         }
-        
+
         // 显式关闭 task_tx，让所有 worker 任务能够退出
         drop(task_tx);
         #[cfg(debug_assertions)]
         log::trace!("MetadataScheduler 主循环退出，等待 worker 任务完成");
     }
-    
+
     async fn process_hash(
         hash: HashDiscovered,
         fetcher: &Arc<RbitFetcher>,
@@ -203,7 +208,7 @@ impl MetadataScheduler {
     ) {
         let info_hash = hash.info_hash.clone();
         let peer_addr = hash.peer_addr;
-        
+
         let maybe_check_fn = {
             match on_metadata_fetch.read() {
                 Ok(guard) => guard.clone(),
@@ -211,12 +216,11 @@ impl MetadataScheduler {
             }
         };
 
-        if let Some(f) = maybe_check_fn {
-            if !f(info_hash.clone()).await {
-                return;
-            }
+        if let Some(f) = maybe_check_fn
+            && !f(info_hash.clone()).await {
+            return;
         }
-        
+
         let info_hash_bytes: [u8; 20] = match hex::decode(&info_hash) {
             Ok(bytes) if bytes.len() == 20 => {
                 let mut arr = [0u8; 20];
@@ -225,7 +229,7 @@ impl MetadataScheduler {
             }
             _ => return,
         };
-        
+
         if let Some((name, total_size, files)) = fetcher.fetch(&info_hash_bytes, peer_addr).await {
             let metadata = TorrentInfo {
                 info_hash,
@@ -240,35 +244,35 @@ impl MetadataScheduler {
                     .unwrap()
                     .as_secs(),
             };
-            
+
             let maybe_torrent_cb = {
                 match callback.read() {
                     Ok(guard) => guard.clone(),
                     Err(_) => return,
                 }
             };
-            
+
             if let Some(cb) = maybe_torrent_cb {
                 cb(metadata);
             }
         }
     }
-    
+
     #[cfg(debug_assertions)]
     fn print_stats(&self, task_tx: &mpsc::Sender<HashDiscovered>) {
         let received = self.total_received.load(Ordering::Relaxed);
         let dropped = self.total_dropped.load(Ordering::Relaxed);
         let dispatched = self.total_dispatched.load(Ordering::Relaxed);
-        
+
         let drop_rate = if received > 0 {
             dropped as f64 / received as f64 * 100.0
         } else {
             0.0
         };
-        
+
         let queue_size = self.max_queue_size - task_tx.capacity();
         let queue_pressure = (queue_size as f64 / self.max_queue_size as f64) * 100.0;
-        
+
         if queue_pressure > 80.0 {
             log::warn!(
                 "⚠️ Metadata 队列高压：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",

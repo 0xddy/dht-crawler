@@ -1,24 +1,24 @@
 use crate::error::Result;
 use crate::metadata::RbitFetcher;
-use crate::protocol::{DhtMessage, DhtArgs, DhtResponse};
+use crate::protocol::{DhtArgs, DhtMessage, DhtResponse};
 use crate::scheduler::MetadataScheduler;
-use crate::types::{DHTOptions, TorrentInfo, NetMode};
-use crate::sharded::{ShardedNodeQueue, NodeTuple};
-use rand::Rng;
+use crate::sharded::{NodeTuple, ShardedNodeQueue};
+use crate::types::{DHTOptions, NetMode, TorrentInfo};
 use ahash::AHasher;
-use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Semaphore};
-use tokio_util::sync::CancellationToken;
-use socket2::{Socket, Domain, Type, Protocol};
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge};
-use std::pin::Pin;
+use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 const BOOTSTRAP_NODES: &[&str] = &[
     "router.bittorrent.com:6881",
@@ -64,37 +64,45 @@ impl DHTServer {
             NetMode::Ipv4Only => {
                 let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
                 #[cfg(not(windows))]
-                { let _ = sock.set_reuse_port(true); }
+                {
+                    let _ = sock.set_reuse_port(true);
+                }
                 let _ = sock.set_reuse_address(true);
                 sock.set_nonblocking(true)?;
-                
+
                 let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
                 let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
 
                 let addr: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
                 sock.bind(&addr.into())?;
                 (Arc::new(UdpSocket::from_std(sock.into())?), None)
-            },
+            }
             NetMode::Ipv6Only => {
                 let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
                 #[cfg(not(windows))]
-                { let _ = sock.set_reuse_port(true); }
+                {
+                    let _ = sock.set_reuse_port(true);
+                }
                 let _ = sock.set_reuse_address(true);
                 #[cfg(not(windows))]
-                { let _ = sock.set_only_v6(true); }
+                {
+                    let _ = sock.set_only_v6(true);
+                }
                 sock.set_nonblocking(true)?;
-                
+
                 let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
                 let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
 
                 let addr: SocketAddr = format!("[::]:{}", options.port).parse().unwrap();
                 sock.bind(&addr.into())?;
                 (Arc::new(UdpSocket::from_std(sock.into())?), None)
-            },
+            }
             NetMode::DualStack => {
                 let sock_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
                 #[cfg(not(windows))]
-                { let _ = sock_v4.set_reuse_port(true); }
+                {
+                    let _ = sock_v4.set_reuse_port(true);
+                }
                 let _ = sock_v4.set_reuse_address(true);
                 sock_v4.set_nonblocking(true)?;
                 let _ = sock_v4.set_recv_buffer_size(32 * 1024 * 1024);
@@ -105,10 +113,14 @@ impl DHTServer {
 
                 let sock_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
                 #[cfg(not(windows))]
-                { let _ = sock_v6.set_reuse_port(true); }
+                {
+                    let _ = sock_v6.set_reuse_port(true);
+                }
                 let _ = sock_v6.set_reuse_address(true);
                 #[cfg(not(windows))]
-                { let _ = sock_v6.set_only_v6(true); }
+                {
+                    let _ = sock_v6.set_only_v6(true);
+                }
                 sock_v6.set_nonblocking(true)?;
                 let _ = sock_v6.set_recv_buffer_size(32 * 1024 * 1024);
                 let _ = sock_v6.set_send_buffer_size(8 * 1024 * 1024);
@@ -117,7 +129,7 @@ impl DHTServer {
                 let socket_v6 = Some(Arc::new(UdpSocket::from_std(sock_v6.into())?));
 
                 (socket, socket_v6)
-            },
+            }
         };
 
         let node_id = generate_random_id();
@@ -129,10 +141,10 @@ impl DHTServer {
         let (hash_tx, hash_rx) = mpsc::channel::<HashDiscovered>(10000);
 
         let fetcher = Arc::new(RbitFetcher::new(options.metadata_timeout));
-        
+
         let callback = Arc::new(RwLock::new(None));
         let on_metadata_fetch = Arc::new(RwLock::new(None));
-        
+
         let metadata_queue_len = Arc::new(AtomicUsize::new(0));
 
         let shutdown = CancellationToken::new();
@@ -187,19 +199,15 @@ impl DHTServer {
 
     fn select_socket(&self, addr: &SocketAddr) -> &Arc<UdpSocket> {
         match self.options.netmode {
-            NetMode::Ipv4Only => {
-                &self.socket
-            },
-            NetMode::Ipv6Only => {
-                &self.socket
-            },
+            NetMode::Ipv4Only => &self.socket,
+            NetMode::Ipv6Only => &self.socket,
             NetMode::DualStack => {
                 if addr.is_ipv6() {
                     self.socket_v6.as_ref().unwrap_or(&self.socket)
                 } else {
                     &self.socket
                 }
-            },
+            }
         }
     }
 
@@ -208,19 +216,23 @@ impl DHTServer {
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        *self.on_metadata_fetch.write().unwrap() = Some(Arc::new(move |hash| {
-            Box::pin(callback(hash))
-        }));
+        *self.on_metadata_fetch.write().unwrap() =
+            Some(Arc::new(move |hash| Box::pin(callback(hash))));
     }
 
-    pub fn on_torrent<F>(&self, callback: F) where F: Fn(TorrentInfo) + Send + Sync + 'static {
+    pub fn on_torrent<F>(&self, callback: F)
+    where
+        F: Fn(TorrentInfo) + Send + Sync + 'static,
+    {
         *self.callback.write().unwrap() = Some(Arc::new(callback));
     }
-    
-    pub fn set_filter<F>(&self, filter: F) where F: Fn(&str) -> bool + Send + Sync + 'static {
+
+    pub fn set_filter<F>(&self, filter: F)
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
         *self.filter.write().unwrap() = Some(Arc::new(filter));
     }
-
 
     pub fn get_node_pool_size(&self) -> usize {
         self.node_queue.len()
@@ -253,14 +265,14 @@ impl DHTServer {
 
                 let queue_len = server.metadata_queue_len.load(Ordering::Relaxed);
                 let queue_pressure = queue_len as f64 / server.max_metadata_queue_size as f64;
-                
+
                 #[cfg(feature = "metrics")]
                 {
                     gauge!("dht_metadata_queue_size").set(queue_len as f64);
                     gauge!("dht_metadata_worker_pressure").set(queue_pressure);
                     gauge!("dht_node_queue_size").set(server.node_queue.len() as f64);
                 }
-                
+
                 let (batch_size, sleep_duration) = if queue_pressure < 0.8 {
                     (200, Duration::from_millis(10))
                 } else if queue_pressure < 0.95 {
@@ -274,9 +286,9 @@ impl DHTServer {
                     NetMode::Ipv6Only => Some(true),
                     NetMode::DualStack => None,
                 };
-                
+
                 let queue_empty = server.node_queue.is_empty_for(filter_ipv6);
-                
+
                 let nodes_batch = {
                     if queue_empty || batch_size == 0 {
                         None
@@ -302,7 +314,7 @@ impl DHTServer {
                     let socket = server.socket.clone();
                     let socket_v6 = server.socket_v6.clone();
                     let netmode = server.options.netmode;
-                    
+
                     for node in nodes {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let node_id_clone = node_id.clone();
@@ -310,9 +322,10 @@ impl DHTServer {
                         let socket_v6_clone = socket_v6.clone();
                         let node_addr = node.addr;
                         let node_id_for_target = node.id;
-                        
+
                         tokio::spawn(async move {
-                            let neighbor_id = generate_neighbor_target(&node_id_for_target, &node_id_clone);
+                            let neighbor_id =
+                                generate_neighbor_target(&node_id_for_target, &node_id_clone);
                             let random_target = generate_random_id();
                             let _ = send_find_node_impl(
                                 node_addr,
@@ -321,7 +334,8 @@ impl DHTServer {
                                 &socket_clone,
                                 socket_v6_clone.as_ref(),
                                 netmode,
-                            ).await;
+                            )
+                            .await;
                             drop(permit);
                         });
                     }
@@ -396,7 +410,7 @@ impl DHTServer {
         shutdown: CancellationToken,
     ) {
         let num_workers = senders.len();
-        
+
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];
             let mut next_worker_idx = 0;
@@ -422,7 +436,7 @@ impl DHTServer {
                                     log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
                                     continue;
                                 }
-                                
+
                                 if size == 0 || buf[0] != b'd' {
                                     #[cfg(feature = "metrics")]
                                     counter!("dht_udp_packets_received_total", "status" => "dropped_magic").increment(1);
@@ -465,7 +479,11 @@ impl DHTServer {
     async fn handle_message(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
         if !self.is_addr_allowed(&addr) {
             #[cfg(debug_assertions)]
-            log::trace!("⚠️ 拒绝不匹配的地址类型: {} (当前模式: {:?})", addr, self.options.netmode);
+            log::trace!(
+                "⚠️ 拒绝不匹配的地址类型: {} (当前模式: {:?})",
+                addr,
+                self.options.netmode
+            );
             return Ok(());
         }
 
@@ -475,7 +493,7 @@ impl DHTServer {
                 #[cfg(feature = "metrics")]
                 counter!("dht_messages_parse_error_total").increment(1);
                 return Ok(());
-            },
+            }
         };
 
         #[cfg(feature = "metrics")]
@@ -485,7 +503,7 @@ impl DHTServer {
                 "q" => "q",
                 "r" => "r",
                 "e" => "e",
-                _   => "unknown", // 将所有非法/未知类型归一化
+                _ => "unknown", // 将所有非法/未知类型归一化
             };
             counter!("dht_messages_processed_total", "type" => label).increment(1);
         }
@@ -506,7 +524,12 @@ impl DHTServer {
         Ok(())
     }
 
-    async fn handle_query(&self, msg: &DhtMessage, query_type: &[u8], addr: SocketAddr) -> Result<()> {
+    async fn handle_query(
+        &self,
+        msg: &DhtMessage,
+        query_type: &[u8],
+        addr: SocketAddr,
+    ) -> Result<()> {
         let args = match &msg.a {
             Some(a) => a,
             None => return Ok(()),
@@ -514,12 +537,14 @@ impl DHTServer {
 
         let transaction_id = &msg.t;
         let sender_id: Option<&[u8]> = args.id.as_deref().map(|v| v.as_slice());
-        let target_id_fallback: Option<&[u8]> = args.target.as_deref()
+        let target_id_fallback: Option<&[u8]> = args
+            .target
+            .as_deref()
             .or(args.info_hash.as_deref())
             .map(|v| v.as_slice());
 
         let q_str = std::str::from_utf8(query_type).unwrap_or("");
-        
+
         #[cfg(feature = "metrics")]
         {
             let label = match q_str {
@@ -527,7 +552,7 @@ impl DHTServer {
                 "find_node" => "find_node",
                 "get_peers" => "get_peers",
                 "announce_peer" => "announce_peer",
-                "vote" => "vote", 
+                "vote" => "vote",
                 _ => "other_or_invalid",
             };
             counter!("dht_queries_total", "q" => label).increment(1);
@@ -537,16 +562,18 @@ impl DHTServer {
             self.handle_announce_peer(args, addr).await?;
         }
 
-        self.send_response(transaction_id, addr, q_str, sender_id, target_id_fallback).await?;
+        self.send_response(transaction_id, addr, q_str, sender_id, target_id_fallback)
+            .await?;
         Ok(())
     }
 
     async fn handle_announce_peer(&self, args: &DhtArgs, addr: SocketAddr) -> Result<()> {
         if let Some(token) = &args.token {
-            if !self.validate_token(token, addr) { 
+            if !self.validate_token(token, addr) {
                 #[cfg(feature = "metrics")]
-                counter!("dht_announce_peer_blocked_total", "reason" => "invalid_token").increment(1);
-                return Ok(()); 
+                counter!("dht_announce_peer_blocked_total", "reason" => "invalid_token")
+                    .increment(1);
+                return Ok(());
             }
         } else {
             return Ok(());
@@ -554,17 +581,18 @@ impl DHTServer {
 
         if let Some(info_hash) = &args.info_hash {
             let info_hash_arr: [u8; 20] = match info_hash.as_ref().try_into() {
-                Ok(arr) => arr, Err(_) => return Ok(()),
+                Ok(arr) => arr,
+                Err(_) => return Ok(()),
             };
             let hash_hex = hex::encode(info_hash_arr);
 
             let filter_cb = self.filter.read().unwrap().clone();
-            if let Some(f) = filter_cb {
-                if !f(&hash_hex) { 
-                    #[cfg(feature = "metrics")]
-                    counter!("dht_announce_peer_blocked_total", "reason" => "filtered").increment(1);
-                    return Ok(()); 
-                }
+            if let Some(f) = filter_cb
+                && !f(&hash_hex) {
+                #[cfg(feature = "metrics")]
+                counter!("dht_announce_peer_blocked_total", "reason" => "filtered")
+                    .increment(1);
+                return Ok(());
             }
 
             #[cfg(feature = "metrics")]
@@ -574,7 +602,11 @@ impl DHTServer {
             log::debug!("🔥 新 Hash: {} 来自 {}", hash_hex, addr);
 
             let port = if let Some(implied) = args.implied_port {
-                if implied != 0 { addr.port() } else { args.port.unwrap_or(0) }
+                if implied != 0 {
+                    addr.port()
+                } else {
+                    args.port.unwrap_or(0)
+                }
             } else {
                 args.port.unwrap_or(addr.port())
             };
@@ -586,7 +618,7 @@ impl DHTServer {
                     discovered_at: std::time::Instant::now(),
                 };
 
-                if let Err(_) = self.hash_tx.try_send(event) {
+                if self.hash_tx.try_send(event).is_err() {
                     #[cfg(debug_assertions)]
                     log::debug!("⚠️ Hash 队列满，丢弃 hash");
                 }
@@ -610,15 +642,18 @@ impl DHTServer {
             return;
         }
 
-        if nodes_bytes.len() % 26 != 0 { return; }
+        #[allow(clippy::manual_is_multiple_of)]
+        if nodes_bytes.len() % 26 != 0 {
+            return;
+        }
 
         for chunk in nodes_bytes.chunks(26) {
             let id = chunk[0..20].to_vec();
             let port = u16::from_be_bytes([chunk[24], chunk[25]]);
-            
+
             let ip = std::net::Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-            
+
             #[cfg(feature = "metrics")]
             counter!("dht_nodes_discovered_total", "ip_version" => "v4").increment(1);
 
@@ -631,7 +666,10 @@ impl DHTServer {
             return;
         }
 
-        if nodes_bytes.len() % 38 != 0 { return; }
+        #[allow(clippy::manual_is_multiple_of)]
+        if nodes_bytes.len() % 38 != 0 {
+            return;
+        }
         for chunk in nodes_bytes.chunks(38) {
             let id = chunk[0..20].to_vec();
             let port = u16::from_be_bytes([chunk[36], chunk[37]]);
@@ -679,9 +717,9 @@ impl DHTServer {
                 NetMode::Ipv6Only => Some(true),
                 NetMode::DualStack => Some(requestor_is_ipv6),
             };
-            
+
             let nodes = self.node_queue.get_random_nodes(8, filter_ipv6);
-            
+
             let mut nodes_data = Vec::new();
             let mut nodes6_data = Vec::new();
 
@@ -691,29 +729,40 @@ impl DHTServer {
                         nodes_data.extend_from_slice(&node.id);
                         nodes_data.extend_from_slice(&ip.octets());
                         nodes_data.extend_from_slice(&node.addr.port().to_be_bytes());
-                    },
+                    }
                     IpAddr::V6(ip) => {
                         nodes6_data.extend_from_slice(&node.id);
                         nodes6_data.extend_from_slice(&ip.octets());
                         nodes6_data.extend_from_slice(&node.addr.port().to_be_bytes());
-                    },
+                    }
                 }
             }
-            
+
             if requestor_is_ipv6 {
                 if !nodes6_data.is_empty() {
-                    r_dict.insert(b"nodes6".to_vec(), serde_bencode::value::Value::Bytes(nodes6_data));
+                    r_dict.insert(
+                        b"nodes6".to_vec(),
+                        serde_bencode::value::Value::Bytes(nodes6_data),
+                    );
                 }
-            } else {
-                if !nodes_data.is_empty() {
-                    r_dict.insert(b"nodes".to_vec(), serde_bencode::value::Value::Bytes(nodes_data));
-                }
+            } else if !nodes_data.is_empty() {
+                r_dict.insert(
+                    b"nodes".to_vec(),
+                    serde_bencode::value::Value::Bytes(nodes_data),
+                );
             }
         }
 
-        let mut response: std::collections::HashMap<String, serde_bencode::value::Value> = std::collections::HashMap::new();
-        response.insert("t".to_string(), serde_bencode::value::Value::Bytes(tid.to_vec()));
-        response.insert("y".to_string(), serde_bencode::value::Value::Bytes(b"r".to_vec()));
+        let mut response: std::collections::HashMap<String, serde_bencode::value::Value> =
+            std::collections::HashMap::new();
+        response.insert(
+            "t".to_string(),
+            serde_bencode::value::Value::Bytes(tid.to_vec()),
+        );
+        response.insert(
+            "y".to_string(),
+            serde_bencode::value::Value::Bytes(b"r".to_vec()),
+        );
         response.insert("r".to_string(), serde_bencode::value::Value::Dict(r_dict));
 
         if let Ok(encoded) = serde_bencode::to_bytes(&response) {
@@ -730,28 +779,33 @@ impl DHTServer {
     async fn bootstrap(&self) {
         let target = generate_random_id();
         for node in BOOTSTRAP_NODES {
-            match tokio::net::lookup_host(node).await {
-                Ok(addrs) => {
-                    for addr in addrs {
-                        match self.options.netmode {
-                            NetMode::Ipv4Only => {
-                                if addr.is_ipv6() { continue; }
-                            },
-                            NetMode::Ipv6Only => {
-                                if addr.is_ipv4() { continue; }
-                            },
-                            NetMode::DualStack => {
-                            },
+            if let Ok(addrs) = tokio::net::lookup_host(node).await {
+                for addr in addrs {
+                    match self.options.netmode {
+                        NetMode::Ipv4Only => {
+                            if addr.is_ipv6() {
+                                continue;
+                            }
                         }
-                        let _ = self.send_find_node(addr, &target, &self.node_id).await;
+                        NetMode::Ipv6Only => {
+                            if addr.is_ipv4() {
+                                continue;
+                            }
+                        }
+                        NetMode::DualStack => {}
                     }
+                    let _ = self.send_find_node(addr, &target, &self.node_id).await;
                 }
-                Err(_) => {}
             }
         }
     }
 
-    async fn send_find_node(&self, addr: SocketAddr, target: &[u8], sender_id: &[u8]) -> Result<()> {
+    async fn send_find_node(
+        &self,
+        addr: SocketAddr,
+        target: &[u8],
+        sender_id: &[u8],
+    ) -> Result<()> {
         send_find_node_impl(
             addr,
             target,
@@ -759,24 +813,24 @@ impl DHTServer {
             &self.socket,
             self.socket_v6.as_ref(),
             self.options.netmode,
-        ).await
+        )
+        .await
     }
 
     fn generate_token(&self, addr: SocketAddr) -> Vec<u8> {
-
         let mut hasher = AHasher::default();
-        
+
         match addr.ip() {
             IpAddr::V4(ip) => ip.octets().hash(&mut hasher),
             IpAddr::V6(ip) => ip.octets().hash(&mut hasher),
         }
-        
+
         self.token_secret.hash(&mut hasher);
-        
+
         let hash = hasher.finish();
         hash.to_le_bytes().to_vec()
     }
-    
+
     fn validate_token(&self, token: &[u8], addr: SocketAddr) -> bool {
         if token.len() != 8 {
             return false;
@@ -787,25 +841,25 @@ impl DHTServer {
 }
 
 /// 发送 DHT find_node 查询消息
-/// 
+///
 /// 这是 DHT 协议中的核心操作之一，用于向指定节点查询包含目标 ID 的节点信息。
 /// 该方法构建符合 BEP5 (BitTorrent DHT Protocol) 规范的消息并异步发送。
-/// 
+///
 /// # 参数
-/// 
+///
 /// * `addr` - 目标节点的 Socket 地址
 /// * `target` - 要查找的目标节点 ID (20 字节)
 /// * `sender_id` - 发送者的节点 ID (20 字节)，用于标识自己
 /// * `socket` - IPv4 UDP socket 的引用
 /// * `socket_v6` - IPv6 UDP socket 的可选引用（仅在双栈模式下需要）
 /// * `netmode` - 网络模式：仅 IPv4、仅 IPv6 或双栈模式
-/// 
+///
 /// # 返回值
-/// 
+///
 /// 返回 `Result<()>`，成功时返回 `Ok(())`，失败时返回错误信息
-/// 
+///
 /// # 消息格式
-/// 
+///
 /// 构建的 DHT 消息格式如下：
 /// ```bencode
 /// {
@@ -818,9 +872,9 @@ impl DHTServer {
 ///   }
 /// }
 /// ```
-/// 
+///
 /// # 网络模式处理
-/// 
+///
 /// * `Ipv4Only`: 始终使用 IPv4 socket
 /// * `Ipv6Only`: 始终使用 IPv4 socket（IPv6 模式下 socket 实际是 IPv6）
 /// * `DualStack`: 根据目标地址类型自动选择 IPv4 或 IPv6 socket
@@ -834,14 +888,30 @@ async fn send_find_node_impl(
 ) -> Result<()> {
     // 构建查询参数
     let mut args = std::collections::HashMap::new();
-    args.insert(b"id".to_vec(), serde_bencode::value::Value::Bytes(sender_id.to_vec()));
-    args.insert(b"target".to_vec(), serde_bencode::value::Value::Bytes(target.to_vec()));
+    args.insert(
+        b"id".to_vec(),
+        serde_bencode::value::Value::Bytes(sender_id.to_vec()),
+    );
+    args.insert(
+        b"target".to_vec(),
+        serde_bencode::value::Value::Bytes(target.to_vec()),
+    );
 
     // 构建完整的 DHT 消息
-    let mut msg: std::collections::HashMap<String, serde_bencode::value::Value> = std::collections::HashMap::new();
-    msg.insert("t".to_string(), serde_bencode::value::Value::Bytes(vec![0, 1])); // 事务 ID
-    msg.insert("y".to_string(), serde_bencode::value::Value::Bytes(b"q".to_vec())); // 消息类型：查询
-    msg.insert("q".to_string(), serde_bencode::value::Value::Bytes(b"find_node".to_vec())); // 查询类型
+    let mut msg: std::collections::HashMap<String, serde_bencode::value::Value> =
+        std::collections::HashMap::new();
+    msg.insert(
+        "t".to_string(),
+        serde_bencode::value::Value::Bytes(vec![0, 1]),
+    ); // 事务 ID
+    msg.insert(
+        "y".to_string(),
+        serde_bencode::value::Value::Bytes(b"q".to_vec()),
+    ); // 消息类型：查询
+    msg.insert(
+        "q".to_string(),
+        serde_bencode::value::Value::Bytes(b"find_node".to_vec()),
+    ); // 查询类型
     msg.insert("a".to_string(), serde_bencode::value::Value::Dict(args)); // 参数字典
 
     // 将消息编码为 bencode 格式并发送
@@ -856,7 +926,7 @@ async fn send_find_node_impl(
                 } else {
                     socket
                 }
-            },
+            }
         };
         // 异步发送 UDP 数据包
         #[cfg(feature = "metrics")]
@@ -875,37 +945,37 @@ fn generate_random_id() -> Vec<u8> {
 }
 
 /// 生成邻居目标节点 ID
-/// 
+///
 /// 该方法用于生成一个"看起来像"远程节点 ID 但实际基于本地节点 ID 的邻居节点 ID。
 /// 这是 DHT 协议中的一个重要优化策略，用于提高查询成功率和保护节点 ID 隐私。
-/// 
+///
 /// # 工作原理
-/// 
+///
 /// 1. 取远程节点 ID 的前 6 个字节作为前缀（如果远程 ID 长度足够）
 /// 2. 用本地节点 ID 的剩余部分填充
 /// 3. 如果本地 ID 不够长，用随机字节填充到 20 字节（标准 DHT 节点 ID 长度）
-/// 
+///
 /// 这样生成的 ID 在 ID 空间中既接近远程节点（前 6 字节相同），又基于本地节点
 /// （后续字节来自本地 ID），从而在 DHT 路由时更容易获得相关响应。
-/// 
+///
 /// # 参数
-/// 
+///
 /// * `remote_id` - 远程节点的 ID（通常是查询目标节点或请求方的 ID）
 /// * `local_id` - 本地节点的 ID（通常是自己真实的节点 ID）
-/// 
+///
 /// # 返回值
-/// 
+///
 /// 返回一个 20 字节的节点 ID Vec，其前 6 字节来自 `remote_id`，后续字节来自 `local_id`
-/// 
+///
 /// # 使用场景
-/// 
+///
 /// 1. **发送查询时**：使用邻居 ID 作为发送者 ID，让远程节点认为查询来自一个接近目标 ID 的节点，
 ///    从而返回更相关的节点列表
 /// 2. **发送响应时**：使用邻居 ID 作为响应中的节点 ID，保护真实本地 ID 的隐私，
 ///    同时提高返回节点的相关性
-/// 
+///
 /// # 示例
-/// 
+///
 /// ```
 /// // 假设：
 /// // remote_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, ...]

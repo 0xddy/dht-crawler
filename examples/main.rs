@@ -3,18 +3,16 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use dht_crawler::prelude::*;
-use std::sync::Arc;
-use tracing_subscriber::EnvFilter;
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "metrics")]
 use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "metrics")]
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -35,11 +33,11 @@ async fn main() -> Result<()> {
     let options = DHTOptions {
         port: 12313,
         auto_metadata: true,
-        metadata_timeout: 3,                   // ✅ 快速超时，快速失败
-        max_metadata_queue_size: 100000,       // ✅ 大缓冲区（防止饱和）
-        max_metadata_worker_count: 1000,       // ✅ 激进并发（最大化吞吐）
-        netmode: NetMode::Ipv4Only,      // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
-        ..Default::default()  // 使用默认值填充其他字段（节点队列容量等）
+        metadata_timeout: 3,             // ✅ 快速超时，快速失败
+        max_metadata_queue_size: 100000, // ✅ 大缓冲区（防止饱和）
+        max_metadata_worker_count: 1000, // ✅ 激进并发（最大化吞吐）
+        netmode: NetMode::Ipv4Only, // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
+        ..Default::default()        // 使用默认值填充其他字段（节点队列容量等）
     };
 
     // 统计计数器
@@ -55,7 +53,7 @@ async fn main() -> Result<()> {
     // 设置 torrent 回调
     server.on_torrent(move |_torrent| {
         let _count = torrent_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         // 🔇 取消打印 torrent 信息，减少日志输出
         // let total_size: u64 = torrent.files.iter().map(|f| f.size).sum();
         // let files_display = if torrent.files.len() <= 3 {
@@ -77,9 +75,7 @@ async fn main() -> Result<()> {
     });
 
     // 设置元数据获取前的检查回调
-    server.on_metadata_fetch(|_hash| async move {
-        true
-    });
+    server.on_metadata_fetch(|_hash| async move { true });
 
     // 启动监控任务
     let count_monitor = torrent_count.clone();
@@ -95,7 +91,8 @@ async fn main() -> Result<()> {
             // ✅ 监控：爬虫运行状态
             log::info!(
                 "📊 [监控] 时长: {}s | 成功抓取: ✨ {}",
-                uptime, success_fetch
+                uptime,
+                success_fetch
             );
 
             if uptime > 0 && success_fetch > 0 {
@@ -108,4 +105,3 @@ async fn main() -> Result<()> {
     server.start().await?;
     Ok(())
 }
-

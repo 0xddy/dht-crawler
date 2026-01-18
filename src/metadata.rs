@@ -1,17 +1,17 @@
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::time::Duration;
+use crate::types::FileInfo;
 use bytes::Bytes;
 #[cfg(feature = "metrics")]
 use metrics::{counter, histogram};
-use sha1::{Digest, Sha1};
-use tokio::time::timeout;
-use rbit::{
-    metadata_piece_count, ExtensionHandshake, Message, MetadataMessage,
-    MetadataMessageType, PeerConnection, PeerId,
-};
 use rbit::peer::ExtensionMessage;
-use crate::types::FileInfo;
+use rbit::{
+    ExtensionHandshake, Message, MetadataMessage, MetadataMessageType, PeerConnection, PeerId,
+    metadata_piece_count,
+};
+use sha1::{Digest, Sha1};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 pub struct RbitFetcher {
@@ -38,27 +38,32 @@ impl RbitFetcher {
         let mut conn = match timeout(
             Duration::from_secs(3),
             PeerConnection::connect(peer_addr, *info_hash, *peer_id.as_bytes()),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(c)) => {
                 #[cfg(feature = "metrics")]
-                counter!("dht_metadata_connection_result_total", "result" => "success").increment(1);
+                counter!("dht_metadata_connection_result_total", "result" => "success")
+                    .increment(1);
                 c
-            },
+            }
             Ok(Err(_)) => {
                 #[cfg(feature = "metrics")]
                 counter!("dht_metadata_connection_result_total", "result" => "failed").increment(1);
                 return None;
-            },
+            }
             Err(_) => {
                 #[cfg(feature = "metrics")]
-                counter!("dht_metadata_connection_result_total", "result" => "timeout").increment(1);
+                counter!("dht_metadata_connection_result_total", "result" => "timeout")
+                    .increment(1);
                 return None;
-            },
+            }
         };
 
         if !conn.supports_extension {
             #[cfg(feature = "metrics")]
-            counter!("dht_metadata_handshake_result_total", "result" => "no_extension_support").increment(1);
+            counter!("dht_metadata_handshake_result_total", "result" => "no_extension_support")
+                .increment(1);
             return None;
         }
 
@@ -66,7 +71,12 @@ impl RbitFetcher {
         let handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", my_ut_metadata_id)]);
 
         if let Ok(handshake_bytes) = handshake.encode() {
-            let _ = conn.send(Message::Extended { id: 0, payload: handshake_bytes }).await;
+            let _ = conn
+                .send(Message::Extended {
+                    id: 0,
+                    payload: handshake_bytes,
+                })
+                .await;
         } else {
             return None;
         }
@@ -79,9 +89,8 @@ impl RbitFetcher {
         let result = timeout(self.timeout, async {
             loop {
                 let msg = conn.receive().await.ok()?;
-                match msg {
-                    Message::Extended { id, payload } => {
-                        if id == 0 {
+                if let Message::Extended { id, payload } = msg {
+                    if id == 0 {
                             if let Ok(ExtensionMessage::Handshake(remote_hs)) = ExtensionMessage::decode(id, &payload) {
                                 if let Some(size) = remote_hs.metadata_size {
                                     metadata_size = size as u32;
@@ -91,10 +100,10 @@ impl RbitFetcher {
                                 }
                             }
                             if metadata_size > 0 && remote_ut_metadata_id > 0 && !request_sent {
-                                if metadata_size > 10 * 1024 * 1024 { 
+                                if metadata_size > 10 * 1024 * 1024 {
                                     #[cfg(feature = "metrics")]
                                     counter!("dht_metadata_fetch_fail_total", "reason" => "size_limit").increment(1);
-                                    return None; 
+                                    return None;
                                 }
 
                                 let count = metadata_piece_count(metadata_size as usize);
@@ -107,14 +116,12 @@ impl RbitFetcher {
                                 request_sent = true;
                             }
                         } else if id == my_ut_metadata_id {
-                            if let Ok(meta_msg) = MetadataMessage::decode(&payload) {
-                                if meta_msg.msg_type == MetadataMessageType::Data {
-                                    if let Some(data) = meta_msg.data {
-                                        #[cfg(feature = "metrics")]
-                                        counter!("dht_metadata_bytes_downloaded_total").increment(data.len() as u64);
-                                        pieces.insert(meta_msg.piece, data);
-                                    }
-                                }
+                            if let Ok(meta_msg) = MetadataMessage::decode(&payload)
+                                && meta_msg.msg_type == MetadataMessageType::Data
+                                && let Some(data) = meta_msg.data {
+                                #[cfg(feature = "metrics")]
+                                counter!("dht_metadata_bytes_downloaded_total").increment(data.len() as u64);
+                                pieces.insert(meta_msg.piece, data);
                             }
                             if metadata_size > 0 {
                                 let total_received: usize = pieces.values().map(|p| p.len()).sum();
@@ -152,48 +159,60 @@ impl RbitFetcher {
                             }
                         }
                     }
-                    _ => {}
-                }
             }
         }).await;
 
         match result {
             Ok(Some(info_bytes)) => {
-                if let Ok(value) = rbit::decode(&info_bytes) {
-                    if let Some(dict) = value.as_dict() {
-                        let name = dict.get(&b"name"[..]).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                if let Ok(value) = rbit::decode(&info_bytes)
+                    && let Some(dict) = value.as_dict() {
+                        let name = dict
+                            .get(&b"name"[..])
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown")
+                            .to_string();
                         let mut total_size = 0;
                         let mut file_list = Vec::new();
                         if let Some(files) = dict.get(&b"files"[..]).and_then(|v| v.as_list()) {
                             for file in files {
-                                if let Some(f_dict) = file.as_dict() {
-                                    if let Some(len) = f_dict.get(&b"length"[..]).and_then(|v| v.as_integer()) {
-                                        let len = len as u64;
-                                        total_size += len;
-                                        let mut path_parts = Vec::new();
-                                        if let Some(path_list) = f_dict.get(&b"path"[..]).and_then(|v| v.as_list()) {
-                                            for p in path_list {
-                                                if let Some(p_str) = p.as_str() { path_parts.push(p_str); }
+                                if let Some(f_dict) = file.as_dict()
+                                    && let Some(len) = f_dict.get(&b"length"[..]).and_then(|v| v.as_integer()) {
+                                    let len = len as u64;
+                                    total_size += len;
+                                    let mut path_parts = Vec::new();
+                                    if let Some(path_list) =
+                                        f_dict.get(&b"path"[..]).and_then(|v| v.as_list())
+                                    {
+                                        for p in path_list {
+                                            if let Some(p_str) = p.as_str() {
+                                                path_parts.push(p_str);
                                             }
                                         }
-                                        file_list.push(FileInfo { path: path_parts.join("/"), size: len });
                                     }
+                                    file_list.push(FileInfo {
+                                        path: path_parts.join("/"),
+                                        size: len,
+                                    });
                                 }
                             }
-                        } else if let Some(len) = dict.get(&b"length"[..]).and_then(|v| v.as_integer()) {
+                        } else if let Some(len) =
+                            dict.get(&b"length"[..]).and_then(|v| v.as_integer())
+                        {
                             total_size = len as u64;
-                            file_list.push(FileInfo { path: name.clone(), size: total_size });
+                            file_list.push(FileInfo {
+                                path: name.clone(),
+                                size: total_size,
+                            });
                         }
-                        if total_size > 0 { 
+                        if total_size > 0 {
                             #[cfg(feature = "metrics")]
                             {
                                 counter!("dht_metadata_fetch_success_total").increment(1);
                                 histogram!("dht_metadata_size_bytes").record(total_size as f64);
                             }
-                            return Some((name, total_size, file_list)); 
+                            return Some((name, total_size, file_list));
                         }
                     }
-                }
                 #[cfg(feature = "metrics")]
                 counter!("dht_metadata_fetch_fail_total", "reason" => "parse_error").increment(1);
                 None
@@ -202,7 +221,7 @@ impl RbitFetcher {
                 #[cfg(feature = "metrics")]
                 counter!("dht_metadata_fetch_fail_total", "reason" => "timeout").increment(1);
                 None
-            },
+            }
         }
     }
 }

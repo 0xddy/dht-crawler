@@ -15,3 +15,6 @@ torrents/
 
 # 日志
 *.log
+
+# 个人脚本（不提交到仓库）
+scripts/
