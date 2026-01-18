@@ -1,6 +1,6 @@
 [package]
 name = "dht-crawler"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 authors = ["桥下红药 <1121744186@qq.com>"]
 description = "高性能的 Rust DHT (Distributed Hash Table) 爬虫库 | A high-performance Rust DHT crawler library for fetching torrent information from the BitTorrent DHT network"

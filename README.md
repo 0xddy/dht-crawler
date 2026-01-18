@@ -21,7 +21,7 @@
 
 ```toml
 [dependencies]
-dht-crawler = "0.0.5"
+dht-crawler = "0.0.6"
 ```
 
 或者查看 [crates.io](https://crates.io/crates/dht-crawler) 获取最新版本号。
@@ -32,7 +32,7 @@ dht-crawler = "0.0.5"
 
 ```toml
 [dependencies]
-dht-crawler = { version = "0.0.5", features = ["metrics"] }
+dht-crawler = { version = "0.0.6", features = ["metrics"] }
 ```
 
 ## Features
@@ -110,6 +110,12 @@ cargo build --release --target x86_64-unknown-linux-gnu --examples --features mi
 # target/x86_64-unknown-linux-gnu/release/examples/dht_crawler_example
 ```
 
+> **⚠️ 重要说明：交叉编译特性支持**
+> 
+> - 使用 `cargo build --lib` 编译库时，**仅支持 `metrics` 可选特性**
+> - `mimalloc` feature 仅在编译 examples 时可用（位于 `dev-dependencies`）
+> - 如果需要同时使用 `mimalloc` 和 `metrics`，请使用 `cargo build --examples` 编译示例
+
 ### 运行示例
 
 #### 基本运行（不使用任何 features）
@@ -149,19 +155,23 @@ cargo run --example dht_crawler_example --features mimalloc,metrics
 
 ```toml
 [dependencies]
-dht-crawler = "0.0.4"
+dht-crawler = "0.0.6"
 ```
 
 #### 使用库并启用 metrics feature
 
 ```toml
 [dependencies]
-dht-crawler = { version = "0.0.4", features = ["metrics"] }
+dht-crawler = { version = "0.0.6", features = ["metrics"] }
 ```
 
 这样可以在你的代码中使用库暴露的 metrics 指标。
 
-**注意**：`mimalloc` feature 仅用于 example，库本身不依赖 mimalloc。
+> **⚠️ 重要说明：特性支持限制**
+> 
+> - **`--lib` 编译库时**：**仅支持 `metrics` 可选特性**
+> - **`mimalloc` feature**：仅用于编译 examples（位于 `dev-dependencies`），库本身不依赖 mimalloc
+> - 如果需要同时使用 `mimalloc` 和 `metrics`，请使用 `--examples` 编译示例程序
 
 ## 许可证
 
