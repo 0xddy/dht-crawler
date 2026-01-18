@@ -36,7 +36,10 @@ metrics = { version = "0.24", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
 mimalloc = "0.1"
-metrics-exporter-prometheus = "0.18"
+# 禁用默认 features，只启用 http-listener（不包含 hyper-rustls）
+# 这样可以避免引入 aws-lc-sys
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+
 
 [features]
 default = []
@@ -46,6 +49,7 @@ mimalloc = []
 [[example]]
 name = "dht_crawler_example"
 path = "examples/main.rs"
+
 
 [profile.release]
 opt-level = 3
@@ -57,3 +61,4 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
