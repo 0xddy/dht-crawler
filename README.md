@@ -39,6 +39,14 @@ dht-crawler = { version = "0.0.6", features = ["metrics"] }
 
 本库支持以下可选特性：
 
+
+> **⚠️ 重要说明：特性支持限制**
+> 
+> - **`--lib` 编译库时**：**仅支持 `metrics` 可选特性**
+> - **`mimalloc` feature**：仅用于编译 examples（位于 `dev-dependencies`），库本身不依赖 mimalloc
+> - 如果需要同时使用 `mimalloc` 和 `metrics`，请使用 `--examples` 编译示例程序
+
+
 ### `mimalloc` - 高性能内存分配器
 
 使用 `mimalloc` 作为全局内存分配器，可以显著降低内存占用（通常降低 10-30%），特别适合长时间运行的高并发场景。
@@ -166,12 +174,6 @@ dht-crawler = { version = "0.0.6", features = ["metrics"] }
 ```
 
 这样可以在你的代码中使用库暴露的 metrics 指标。
-
-> **⚠️ 重要说明：特性支持限制**
-> 
-> - **`--lib` 编译库时**：**仅支持 `metrics` 可选特性**
-> - **`mimalloc` feature**：仅用于编译 examples（位于 `dev-dependencies`），库本身不依赖 mimalloc
-> - 如果需要同时使用 `mimalloc` 和 `metrics`，请使用 `--examples` 编译示例程序
 
 ## 许可证
 
