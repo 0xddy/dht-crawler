@@ -21,7 +21,7 @@
 
 ```toml
 [dependencies]
-dht-crawler = "0.0.4"
+dht-crawler = "0.0.5"
 ```
 
 或者查看 [crates.io](https://crates.io/crates/dht-crawler) 获取最新版本号。
@@ -32,7 +32,7 @@ dht-crawler = "0.0.4"
 
 ```toml
 [dependencies]
-dht-crawler = { version = "0.0.4", features = ["metrics"] }
+dht-crawler = { version = "0.0.5", features = ["metrics"] }
 ```
 
 ## Features
