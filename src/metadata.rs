@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use bytes::Bytes;
+#[cfg(feature = "metrics")]
+use metrics::{counter, histogram};
 use sha1::{Digest, Sha1};
 use tokio::time::timeout;
 use rbit::{
@@ -28,18 +30,35 @@ impl RbitFetcher {
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
     ) -> Option<(String, u64, Vec<FileInfo>)> {
+        #[cfg(feature = "metrics")]
+        counter!("dht_metadata_fetch_attempts_total").increment(1);
+
         let peer_id = PeerId::generate();
 
         let mut conn = match timeout(
             Duration::from_secs(3),
             PeerConnection::connect(peer_addr, *info_hash, *peer_id.as_bytes()),
         ).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(_)) => return None,
-            Err(_) => return None,
+            Ok(Ok(c)) => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_connection_result_total", "result" => "success").increment(1);
+                c
+            },
+            Ok(Err(_)) => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_connection_result_total", "result" => "failed").increment(1);
+                return None;
+            },
+            Err(_) => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_connection_result_total", "result" => "timeout").increment(1);
+                return None;
+            },
         };
 
         if !conn.supports_extension {
+            #[cfg(feature = "metrics")]
+            counter!("dht_metadata_handshake_result_total", "result" => "no_extension_support").increment(1);
             return None;
         }
 
@@ -72,7 +91,11 @@ impl RbitFetcher {
                                 }
                             }
                             if metadata_size > 0 && remote_ut_metadata_id > 0 && !request_sent {
-                                if metadata_size > 10 * 1024 * 1024 { return None; }
+                                if metadata_size > 10 * 1024 * 1024 { 
+                                    #[cfg(feature = "metrics")]
+                                    counter!("dht_metadata_fetch_fail_total", "reason" => "size_limit").increment(1);
+                                    return None; 
+                                }
 
                                 let count = metadata_piece_count(metadata_size as usize);
                                 for i in 0..count {
@@ -87,6 +110,8 @@ impl RbitFetcher {
                             if let Ok(meta_msg) = MetadataMessage::decode(&payload) {
                                 if meta_msg.msg_type == MetadataMessageType::Data {
                                     if let Some(data) = meta_msg.data {
+                                        #[cfg(feature = "metrics")]
+                                        counter!("dht_metadata_bytes_downloaded_total").increment(data.len() as u64);
                                         pieces.insert(meta_msg.piece, data);
                                     }
                                 }
@@ -115,8 +140,12 @@ impl RbitFetcher {
                                         }).await.unwrap_or(false);
 
                                         if is_valid {
+                                            #[cfg(feature = "metrics")]
+                                            counter!("dht_metadata_handshake_result_total", "result" => "success").increment(1);
                                             return Some(full_data);
                                         }
+                                        #[cfg(feature = "metrics")]
+                                        counter!("dht_metadata_fetch_fail_total", "reason" => "sha1_mismatch").increment(1);
                                         return None;
                                     }
                                 }
@@ -155,12 +184,25 @@ impl RbitFetcher {
                             total_size = len as u64;
                             file_list.push(FileInfo { path: name.clone(), size: total_size });
                         }
-                        if total_size > 0 { return Some((name, total_size, file_list)); }
+                        if total_size > 0 { 
+                            #[cfg(feature = "metrics")]
+                            {
+                                counter!("dht_metadata_fetch_success_total").increment(1);
+                                histogram!("dht_metadata_size_bytes").record(total_size as f64);
+                            }
+                            return Some((name, total_size, file_list)); 
+                        }
                     }
                 }
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_fetch_fail_total", "reason" => "parse_error").increment(1);
                 None
             }
-            _ => None,
+            _ => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_fetch_fail_total", "reason" => "timeout").increment(1);
+                None
+            },
         }
     }
 }

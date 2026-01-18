@@ -53,6 +53,8 @@ jobs:
         features:
           - ""
           - "mimalloc"
+          - "metrics"
+          - "mimalloc,metrics"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

@@ -15,6 +15,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use socket2::{Socket, Domain, Type, Protocol};
+#[cfg(feature = "metrics")]
+use metrics::{counter, gauge};
 use std::pin::Pin;
 use std::future::Future;
 
@@ -252,6 +254,13 @@ impl DHTServer {
                 let queue_len = server.metadata_queue_len.load(Ordering::Relaxed);
                 let queue_pressure = queue_len as f64 / server.max_metadata_queue_size as f64;
                 
+                #[cfg(feature = "metrics")]
+                {
+                    gauge!("dht_metadata_queue_size").set(queue_len as f64);
+                    gauge!("dht_metadata_worker_pressure").set(queue_pressure);
+                    gauge!("dht_node_queue_size").set(server.node_queue.len() as f64);
+                }
+                
                 let (batch_size, sleep_duration) = if queue_pressure < 0.8 {
                     (200, Duration::from_millis(10))
                 } else if queue_pressure < 0.95 {
@@ -402,13 +411,21 @@ impl DHTServer {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((size, addr)) => {
+                                #[cfg(feature = "metrics")]
+                                counter!("dht_udp_bytes_received_total").increment(size as u64);
+
                                 if size > 8192 {
+                                    #[cfg(feature = "metrics")]
+                                    counter!("dht_udp_packets_received_total", "status" => "dropped_size").increment(1);
+
                                     #[cfg(debug_assertions)]
                                     log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
                                     continue;
                                 }
                                 
                                 if size == 0 || buf[0] != b'd' {
+                                    #[cfg(feature = "metrics")]
+                                    counter!("dht_udp_packets_received_total", "status" => "dropped_magic").increment(1);
                                     continue;
                                 }
 
@@ -418,8 +435,14 @@ impl DHTServer {
                                 next_worker_idx = (next_worker_idx + 1) % num_workers;
 
                                 match tx.try_send((data, addr)) {
-                                    Ok(_) => {},
+                                    Ok(_) => {
+                                        #[cfg(feature = "metrics")]
+                                        counter!("dht_udp_packets_received_total", "status" => "ok").increment(1);
+                                    },
                                     Err(mpsc::error::TrySendError::Full(_)) => {
+                                        #[cfg(feature = "metrics")]
+                                        counter!("dht_udp_packets_received_total", "status" => "queue_full").increment(1);
+
                                         #[cfg(debug_assertions)]
                                         log::trace!("UDP worker queue full, dropping packet");
                                     },
@@ -448,8 +471,24 @@ impl DHTServer {
 
         let msg: DhtMessage = match serde_bencode::from_bytes(data) {
             Ok(m) => m,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_messages_parse_error_total").increment(1);
+                return Ok(());
+            },
         };
+
+        #[cfg(feature = "metrics")]
+        {
+            // 使用 match 映射到静态字符串，避免 clone()，同时防止恶意 tag
+            let label = match msg.y.as_str() {
+                "q" => "q",
+                "r" => "r",
+                "e" => "e",
+                _   => "unknown", // 将所有非法/未知类型归一化
+            };
+            counter!("dht_messages_processed_total", "type" => label).increment(1);
+        }
 
         match msg.y.as_str() {
             "q" => {
@@ -481,6 +520,19 @@ impl DHTServer {
 
         let q_str = std::str::from_utf8(query_type).unwrap_or("");
         
+        #[cfg(feature = "metrics")]
+        {
+            let label = match q_str {
+                "ping" => "ping",
+                "find_node" => "find_node",
+                "get_peers" => "get_peers",
+                "announce_peer" => "announce_peer",
+                "vote" => "vote", 
+                _ => "other_or_invalid",
+            };
+            counter!("dht_queries_total", "q" => label).increment(1);
+        }
+
         if q_str == "announce_peer" {
             self.handle_announce_peer(args, addr).await?;
         }
@@ -491,7 +543,11 @@ impl DHTServer {
 
     async fn handle_announce_peer(&self, args: &DhtArgs, addr: SocketAddr) -> Result<()> {
         if let Some(token) = &args.token {
-            if !self.validate_token(token, addr) { return Ok(()); }
+            if !self.validate_token(token, addr) { 
+                #[cfg(feature = "metrics")]
+                counter!("dht_announce_peer_blocked_total", "reason" => "invalid_token").increment(1);
+                return Ok(()); 
+            }
         } else {
             return Ok(());
         }
@@ -504,8 +560,15 @@ impl DHTServer {
 
             let filter_cb = self.filter.read().unwrap().clone();
             if let Some(f) = filter_cb {
-                if !f(&hash_hex) { return Ok(()); }
+                if !f(&hash_hex) { 
+                    #[cfg(feature = "metrics")]
+                    counter!("dht_announce_peer_blocked_total", "reason" => "filtered").increment(1);
+                    return Ok(()); 
+                }
             }
+
+            #[cfg(feature = "metrics")]
+            counter!("dht_info_hashes_discovered_total").increment(1);
 
             #[cfg(debug_assertions)]
             log::debug!("🔥 新 Hash: {} 来自 {}", hash_hex, addr);
@@ -556,6 +619,9 @@ impl DHTServer {
             let ip = std::net::Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
             
+            #[cfg(feature = "metrics")]
+            counter!("dht_nodes_discovered_total", "ip_version" => "v4").increment(1);
+
             self.node_queue.push(NodeTuple { id, addr });
         }
     }
@@ -576,6 +642,10 @@ impl DHTServer {
             let ip = Ipv6Addr::from(ip_bytes);
             if !ip.is_unspecified() && !ip.is_multicast() {
                 let addr = SocketAddr::new(IpAddr::V6(ip), port);
+
+                #[cfg(feature = "metrics")]
+                counter!("dht_nodes_discovered_total", "ip_version" => "v6").increment(1);
+
                 self.node_queue.push(NodeTuple { id, addr });
             }
         }
@@ -647,6 +717,11 @@ impl DHTServer {
         response.insert("r".to_string(), serde_bencode::value::Value::Dict(r_dict));
 
         if let Ok(encoded) = serde_bencode::to_bytes(&response) {
+            #[cfg(feature = "metrics")]
+            {
+                counter!("dht_udp_bytes_sent_total").increment(encoded.len() as u64);
+                counter!("dht_udp_packets_sent_total", "type" => "response").increment(1);
+            }
             let _ = self.select_socket(&addr).send_to(&encoded, addr).await;
         }
         Ok(())
@@ -711,6 +786,44 @@ impl DHTServer {
     }
 }
 
+/// 发送 DHT find_node 查询消息
+/// 
+/// 这是 DHT 协议中的核心操作之一，用于向指定节点查询包含目标 ID 的节点信息。
+/// 该方法构建符合 BEP5 (BitTorrent DHT Protocol) 规范的消息并异步发送。
+/// 
+/// # 参数
+/// 
+/// * `addr` - 目标节点的 Socket 地址
+/// * `target` - 要查找的目标节点 ID (20 字节)
+/// * `sender_id` - 发送者的节点 ID (20 字节)，用于标识自己
+/// * `socket` - IPv4 UDP socket 的引用
+/// * `socket_v6` - IPv6 UDP socket 的可选引用（仅在双栈模式下需要）
+/// * `netmode` - 网络模式：仅 IPv4、仅 IPv6 或双栈模式
+/// 
+/// # 返回值
+/// 
+/// 返回 `Result<()>`，成功时返回 `Ok(())`，失败时返回错误信息
+/// 
+/// # 消息格式
+/// 
+/// 构建的 DHT 消息格式如下：
+/// ```bencode
+/// {
+///   "t": [0, 1],           // 事务 ID (transaction ID)
+///   "y": "q",              // 消息类型：查询 (query)
+///   "q": "find_node",      // 查询类型：查找节点
+///   "a": {                 // 参数 (arguments)
+///     "id": <sender_id>,   // 发送者节点 ID
+///     "target": <target>   // 目标节点 ID
+///   }
+/// }
+/// ```
+/// 
+/// # 网络模式处理
+/// 
+/// * `Ipv4Only`: 始终使用 IPv4 socket
+/// * `Ipv6Only`: 始终使用 IPv4 socket（IPv6 模式下 socket 实际是 IPv6）
+/// * `DualStack`: 根据目标地址类型自动选择 IPv4 或 IPv6 socket
 async fn send_find_node_impl(
     addr: SocketAddr,
     target: &[u8],
@@ -719,17 +832,21 @@ async fn send_find_node_impl(
     socket_v6: Option<&Arc<UdpSocket>>,
     netmode: NetMode,
 ) -> Result<()> {
+    // 构建查询参数
     let mut args = std::collections::HashMap::new();
     args.insert(b"id".to_vec(), serde_bencode::value::Value::Bytes(sender_id.to_vec()));
     args.insert(b"target".to_vec(), serde_bencode::value::Value::Bytes(target.to_vec()));
 
+    // 构建完整的 DHT 消息
     let mut msg: std::collections::HashMap<String, serde_bencode::value::Value> = std::collections::HashMap::new();
-    msg.insert("t".to_string(), serde_bencode::value::Value::Bytes(vec![0, 1]));
-    msg.insert("y".to_string(), serde_bencode::value::Value::Bytes(b"q".to_vec()));
-    msg.insert("q".to_string(), serde_bencode::value::Value::Bytes(b"find_node".to_vec()));
-    msg.insert("a".to_string(), serde_bencode::value::Value::Dict(args));
+    msg.insert("t".to_string(), serde_bencode::value::Value::Bytes(vec![0, 1])); // 事务 ID
+    msg.insert("y".to_string(), serde_bencode::value::Value::Bytes(b"q".to_vec())); // 消息类型：查询
+    msg.insert("q".to_string(), serde_bencode::value::Value::Bytes(b"find_node".to_vec())); // 查询类型
+    msg.insert("a".to_string(), serde_bencode::value::Value::Dict(args)); // 参数字典
 
+    // 将消息编码为 bencode 格式并发送
     if let Ok(encoded) = serde_bencode::to_bytes(&msg) {
+        // 根据网络模式选择合适的 socket
         let selected_socket = match netmode {
             NetMode::Ipv4Only => socket,
             NetMode::Ipv6Only => socket,
@@ -741,6 +858,12 @@ async fn send_find_node_impl(
                 }
             },
         };
+        // 异步发送 UDP 数据包
+        #[cfg(feature = "metrics")]
+        {
+            counter!("dht_udp_bytes_sent_total").increment(encoded.len() as u64);
+            counter!("dht_udp_packets_sent_total", "type" => "query").increment(1);
+        }
         let _ = selected_socket.send_to(&encoded, addr).await;
     }
     Ok(())
@@ -751,10 +874,50 @@ fn generate_random_id() -> Vec<u8> {
     (0..20).map(|_| rng.r#gen::<u8>()).collect()
 }
 
+/// 生成邻居目标节点 ID
+/// 
+/// 该方法用于生成一个"看起来像"远程节点 ID 但实际基于本地节点 ID 的邻居节点 ID。
+/// 这是 DHT 协议中的一个重要优化策略，用于提高查询成功率和保护节点 ID 隐私。
+/// 
+/// # 工作原理
+/// 
+/// 1. 取远程节点 ID 的前 6 个字节作为前缀（如果远程 ID 长度足够）
+/// 2. 用本地节点 ID 的剩余部分填充
+/// 3. 如果本地 ID 不够长，用随机字节填充到 20 字节（标准 DHT 节点 ID 长度）
+/// 
+/// 这样生成的 ID 在 ID 空间中既接近远程节点（前 6 字节相同），又基于本地节点
+/// （后续字节来自本地 ID），从而在 DHT 路由时更容易获得相关响应。
+/// 
+/// # 参数
+/// 
+/// * `remote_id` - 远程节点的 ID（通常是查询目标节点或请求方的 ID）
+/// * `local_id` - 本地节点的 ID（通常是自己真实的节点 ID）
+/// 
+/// # 返回值
+/// 
+/// 返回一个 20 字节的节点 ID Vec，其前 6 字节来自 `remote_id`，后续字节来自 `local_id`
+/// 
+/// # 使用场景
+/// 
+/// 1. **发送查询时**：使用邻居 ID 作为发送者 ID，让远程节点认为查询来自一个接近目标 ID 的节点，
+///    从而返回更相关的节点列表
+/// 2. **发送响应时**：使用邻居 ID 作为响应中的节点 ID，保护真实本地 ID 的隐私，
+///    同时提高返回节点的相关性
+/// 
+/// # 示例
+/// 
+/// ```
+/// // 假设：
+/// // remote_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, ...]
+/// // local_id  = [0xAA, 0xBB, 0xCC, 0xDD, ...]
+/// // 生成结果 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xCC, 0xDD, ...]
+/// //           (前6字节来自remote_id，后续来自local_id)
+/// ```
 fn generate_neighbor_target(remote_id: &[u8], local_id: &[u8]) -> Vec<u8> {
     let mut id = Vec::with_capacity(20);
     let prefix_len = std::cmp::min(remote_id.len(), 6);
     id.extend_from_slice(&remote_id[..prefix_len]);
+
     if local_id.len() > prefix_len {
         id.extend_from_slice(&local_id[prefix_len..]);
     } else {

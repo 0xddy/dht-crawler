@@ -88,6 +88,24 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross test --target ${{ matrix.target }} --verbose
+          else
+            cargo test --target ${{ matrix.target }} --verbose
+          fi
+        shell: bash
+
+      - name: Run tests with features
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross test --target ${{ matrix.target }} --verbose --features metrics,mimalloc
+          else
+            cargo test --target ${{ matrix.target }} --verbose --features metrics,mimalloc
+          fi
+        shell: bash
+
       - name: Build
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
