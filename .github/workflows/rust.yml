@@ -42,6 +42,10 @@ jobs:
         run: cargo build --examples --verbose
       - name: Build examples with mimalloc
         run: cargo build --examples --verbose --features mimalloc
+      - name: Build examples with metrics
+        run: cargo build --examples --verbose --features metrics
+      - name: Build examples with all features
+        run: cargo build --examples --verbose --features mimalloc,metrics
 
   # 测试不同的 feature 组合
   test-features:

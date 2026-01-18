@@ -6,7 +6,10 @@ use dht_crawler::prelude::*;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
+#[cfg(feature = "metrics")]
+use metrics_exporter_prometheus::PrometheusBuilder;
+#[cfg(feature = "metrics")]
+use std::net::SocketAddr;
 #[tokio::main]
 async fn main() -> Result<()> {
 
@@ -17,6 +20,17 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_ansi(true)
         .init();
+
+    // 初始化 Prometheus metrics 导出器
+    #[cfg(feature = "metrics")]
+    {
+        let addr: SocketAddr = "0.0.0.0:9000".parse().expect("无效的地址");
+        PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .install()
+            .expect("无法安装 Prometheus metrics 导出器");
+        log::info!("📊 Prometheus metrics 导出器已启动，访问 http://localhost:9000/metrics");
+    }
 
     let options = DHTOptions {
         port: 12313,
@@ -64,10 +78,6 @@ async fn main() -> Result<()> {
 
     // 设置元数据获取前的检查回调
     server.on_metadata_fetch(|_hash| async move {
-        true
-    });
-
-    server.set_filter(|_hash| {
         true
     });
 

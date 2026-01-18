@@ -109,9 +109,9 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --examples --features mimalloc
+            cross build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics
           else
-            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc
+            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics
           fi
         shell: bash
 
