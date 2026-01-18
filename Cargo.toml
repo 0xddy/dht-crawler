@@ -1,11 +1,12 @@
 [package]
 name = "dht-crawler"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 authors = ["桥下红药 <1121744186@qq.com>"]
-description = "高性能的 Rust DHT（分布式哈希表）爬虫库，用于爬取 BitTorrent DHT 网络中的种子信息"
+description = "高性能的 Rust DHT (Distributed Hash Table) 爬虫库 | A high-performance Rust DHT crawler library for fetching torrent information from the BitTorrent DHT network"
 license = "MIT"
 documentation = "https://docs.rs/dht-crawler"
+repository = "https://github.com/0xddy/dht-crawler"
 keywords = ["dht", "bittorrent", "crawler", "p2p", "torrent"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
