@@ -138,7 +138,7 @@ impl DHTServer {
 
         let node_queue = ShardedNodeQueue::new(options.node_queue_capacity);
 
-        let (hash_tx, hash_rx) = mpsc::channel::<HashDiscovered>(10000);
+        let (hash_tx, hash_rx) = mpsc::channel::<HashDiscovered>(options.hash_queue_capacity);
 
         let fetcher = Arc::new(RbitFetcher::new(options.metadata_timeout));
 

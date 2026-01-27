@@ -66,6 +66,8 @@ pub struct DHTOptions {
     pub netmode: NetMode,
 
     pub node_queue_capacity: usize,
+
+    pub hash_queue_capacity: usize,
 }
 
 impl Default for DHTOptions {
@@ -78,6 +80,7 @@ impl Default for DHTOptions {
             max_metadata_worker_count: 1000,
             netmode: NetMode::Ipv4Only,
             node_queue_capacity: 100000,
+            hash_queue_capacity: 10000,
         }
     }
 }
