@@ -4,14 +4,14 @@ use crate::protocol::{DhtArgs, DhtMessage, DhtResponse};
 use crate::scheduler::MetadataScheduler;
 use crate::sharded::{NodeTuple, ShardedNodeQueue};
 use crate::types::{DHTOptions, NetMode, TorrentInfo};
-use ahash::AHasher;
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge};
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -29,6 +29,7 @@ const BOOTSTRAP_NODES: &[&str] = &[
 
 pub type BoxedBoolFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 pub type MetadataFetchCallback = Arc<dyn Fn(String) -> BoxedBoolFuture + Send + Sync>;
+type WorkerHandle = mpsc::Sender<(Box<[u8]>, SocketAddr, SocketAddr)>;
 
 #[derive(Debug, Clone)]
 pub struct HashDiscovered {
@@ -45,8 +46,7 @@ pub struct DHTServer {
     #[allow(dead_code)]
     options: DHTOptions,
     node_id: Vec<u8>,
-    socket: Arc<UdpSocket>,
-    socket_v6: Option<Arc<UdpSocket>>,
+    socket_providers: Arc<HashMap<SocketAddr, Arc<UdpSocket>>>,
     token_secret: Vec<u8>,
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     filter: Arc<RwLock<Option<FilterCallback>>>,
@@ -58,77 +58,55 @@ pub struct DHTServer {
     shutdown: CancellationToken,
 }
 
+fn create_udp_sock(domain: Domain, ty: Type, addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = Socket::new(domain, ty, Some(Protocol::UDP))?;
+    #[cfg(not(windows))]
+    {
+        sock.set_reuse_port(true)?;
+        if addr.is_ipv6() {
+            sock.set_only_v6(true)?;
+        }
+    }
+    let _ = sock.set_reuse_address(true);
+    sock.set_nonblocking(true)?;
+
+    let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
 impl DHTServer {
     pub async fn new(options: DHTOptions) -> Result<Self> {
-        let (socket, socket_v6) = match options.netmode {
+        const ANY_V4_ADDR: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080);
+        const ANY_V6_ADDR: SocketAddr =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 8080);
+        let mut socket_providers = HashMap::new();
+        // TODO: Check address reachability
+        match options.netmode {
             NetMode::Ipv4Only => {
-                let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-                #[cfg(not(windows))]
-                {
-                    let _ = sock.set_reuse_port(true);
-                }
-                let _ = sock.set_reuse_address(true);
-                sock.set_nonblocking(true)?;
-
-                let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
-                let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
-
-                let addr: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
-                sock.bind(&addr.into())?;
-                (Arc::new(UdpSocket::from_std(sock.into())?), None)
+                let mut addr = ANY_V4_ADDR;
+                addr.set_port(options.port);
+                let sock = create_udp_sock(Domain::IPV4, Type::DGRAM, addr)?;
+                socket_providers.insert(addr, Arc::new(sock));
             }
             NetMode::Ipv6Only => {
-                let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-                #[cfg(not(windows))]
-                {
-                    let _ = sock.set_reuse_port(true);
-                }
-                let _ = sock.set_reuse_address(true);
-                #[cfg(not(windows))]
-                {
-                    let _ = sock.set_only_v6(true);
-                }
-                sock.set_nonblocking(true)?;
-
-                let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
-                let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
-
-                let addr: SocketAddr = format!("[::]:{}", options.port).parse().unwrap();
-                sock.bind(&addr.into())?;
-                (Arc::new(UdpSocket::from_std(sock.into())?), None)
+                let mut addr = ANY_V6_ADDR;
+                addr.set_port(options.port);
+                let sock = create_udp_sock(Domain::IPV6, Type::DGRAM, addr)?;
+                socket_providers.insert(addr, Arc::new(sock));
             }
             NetMode::DualStack => {
-                let sock_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-                #[cfg(not(windows))]
-                {
-                    let _ = sock_v4.set_reuse_port(true);
-                }
-                let _ = sock_v4.set_reuse_address(true);
-                sock_v4.set_nonblocking(true)?;
-                let _ = sock_v4.set_recv_buffer_size(32 * 1024 * 1024);
-                let _ = sock_v4.set_send_buffer_size(8 * 1024 * 1024);
-                let addr_v4: SocketAddr = format!("0.0.0.0:{}", options.port).parse().unwrap();
-                sock_v4.bind(&addr_v4.into())?;
-                let socket = Arc::new(UdpSocket::from_std(sock_v4.into())?);
-
-                let sock_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-                #[cfg(not(windows))]
-                {
-                    let _ = sock_v6.set_reuse_port(true);
-                }
-                let _ = sock_v6.set_reuse_address(true);
-                #[cfg(not(windows))]
-                {
-                    let _ = sock_v6.set_only_v6(true);
-                }
-                sock_v6.set_nonblocking(true)?;
-                let _ = sock_v6.set_recv_buffer_size(32 * 1024 * 1024);
-                let _ = sock_v6.set_send_buffer_size(8 * 1024 * 1024);
-                let addr_v6: SocketAddr = format!("[::]:{}", options.port).parse().unwrap();
-                sock_v6.bind(&addr_v6.into())?;
-                let socket_v6 = Some(Arc::new(UdpSocket::from_std(sock_v6.into())?));
-
-                (socket, socket_v6)
+                let mut addr = ANY_V4_ADDR;
+                addr.set_port(options.port);
+                let sock = create_udp_sock(Domain::IPV4, Type::DGRAM, addr)?;
+                socket_providers.insert(addr, Arc::new(sock));
+                let mut addr = ANY_V6_ADDR;
+                addr.set_port(options.port);
+                let sock = create_udp_sock(Domain::IPV6, Type::DGRAM, addr)?;
+                socket_providers.insert(addr, Arc::new(sock));
             }
         };
 
@@ -169,8 +147,7 @@ impl DHTServer {
         let server = Self {
             options,
             node_id: node_id.clone(),
-            socket,
-            socket_v6,
+            socket_providers: Arc::new(socket_providers),
             token_secret,
             callback,
             on_metadata_fetch,
@@ -183,32 +160,6 @@ impl DHTServer {
         };
 
         Ok(server)
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.socket.local_addr()?)
-    }
-
-    fn is_addr_allowed(&self, addr: &SocketAddr) -> bool {
-        match self.options.netmode {
-            NetMode::Ipv4Only => addr.is_ipv4(),
-            NetMode::Ipv6Only => addr.is_ipv6(),
-            NetMode::DualStack => true,
-        }
-    }
-
-    fn select_socket(&self, addr: &SocketAddr) -> &Arc<UdpSocket> {
-        match self.options.netmode {
-            NetMode::Ipv4Only => &self.socket,
-            NetMode::Ipv6Only => &self.socket,
-            NetMode::DualStack => {
-                if addr.is_ipv6() {
-                    self.socket_v6.as_ref().unwrap_or(&self.socket)
-                } else {
-                    &self.socket
-                }
-            }
-        }
     }
 
     pub fn on_metadata_fetch<F, Fut>(&self, callback: F)
@@ -245,7 +196,7 @@ impl DHTServer {
             return Err(crate::error::DHTError::Other("服务器已关闭".to_string()));
         }
 
-        self.start_receiver();
+        self.spawn_receivers();
         self.bootstrap().await;
 
         let server = self.clone();
@@ -311,15 +262,18 @@ impl DHTServer {
 
                 if let Some(nodes) = nodes_batch {
                     let node_id = server.node_id.clone();
-                    let socket = server.socket.clone();
-                    let socket_v6 = server.socket_v6.clone();
-                    let netmode = server.options.netmode;
 
                     for node in nodes {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let node_id_clone = node_id.clone();
-                        let socket_clone = socket.clone();
-                        let socket_v6_clone = socket_v6.clone();
+                        // Pick a random avaliable socket
+                        let socket = match server.socket_providers.values().next().cloned() {
+                            Some(sock) => sock,
+                            None => {
+                                log::warn!("未绑定任何地址");
+                                break;
+                            }
+                        };
                         let node_addr = node.addr;
                         let node_id_for_target = node.id;
 
@@ -328,12 +282,10 @@ impl DHTServer {
                                 generate_neighbor_target(&node_id_for_target, &node_id_clone);
                             let random_target = generate_random_id();
                             let _ = send_find_node_impl(
-                                node_addr,
+                                &node_addr,
                                 &random_target,
                                 &neighbor_id,
-                                &socket_clone,
-                                socket_v6_clone.as_ref(),
-                                netmode,
+                                socket,
                             )
                             .await;
                             drop(permit);
@@ -356,9 +308,7 @@ impl DHTServer {
         self.shutdown.cancel();
     }
 
-    fn start_receiver(&self) {
-        let socket = self.socket.clone();
-        let socket_v6 = self.socket_v6.clone();
+    fn spawn_receivers(&self) {
         let server = self.clone();
         let shutdown = self.shutdown.clone();
 
@@ -368,9 +318,9 @@ impl DHTServer {
 
         let queue_size = 5000;
 
-        let mut senders = Vec::with_capacity(num_workers);
+        let mut senders: Vec<WorkerHandle> = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(queue_size);
+            let (tx, mut rx) = mpsc::channel(queue_size);
             senders.push(tx);
 
             let server_clone = server.clone();
@@ -386,8 +336,8 @@ impl DHTServer {
                         }
                         msg = rx.recv() => {
                             match msg {
-                                Some((data, addr)) => {
-                                    let _ = server_clone.handle_message(&data, addr).await;
+                                Some((data, remote_addr, local_addr)) => {
+                                    let _ = server_clone.handle_message(data.as_ref(), remote_addr, local_addr).await;
                                 }
                                 None => break,
                             }
@@ -397,91 +347,22 @@ impl DHTServer {
             });
         }
 
-        Self::spawn_udp_reader(socket, senders.clone(), shutdown.clone());
-
-        if let Some(socket_v6) = socket_v6 {
-            Self::spawn_udp_reader(socket_v6, senders, shutdown);
+        for sock in self.socket_providers.values().cloned() {
+            spawn_udp_reader(sock, senders.clone(), shutdown.clone());
         }
     }
 
-    fn spawn_udp_reader(
-        socket: Arc<UdpSocket>,
-        senders: Vec<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
-        shutdown: CancellationToken,
-    ) {
-        let num_workers = senders.len();
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 65536];
-            let mut next_worker_idx = 0;
-
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        #[cfg(debug_assertions)]
-                        log::trace!("UDP 读取循环收到关闭信号，退出");
-                        break;
-                    }
-                    result = socket.recv_from(&mut buf) => {
-                        match result {
-                            Ok((size, addr)) => {
-                                #[cfg(feature = "metrics")]
-                                counter!("dht_udp_bytes_received_total").increment(size as u64);
-
-                                if size > 8192 {
-                                    #[cfg(feature = "metrics")]
-                                    counter!("dht_udp_packets_received_total", "status" => "dropped_size").increment(1);
-
-                                    #[cfg(debug_assertions)]
-                                    log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, addr);
-                                    continue;
-                                }
-
-                                if size == 0 || buf[0] != b'd' {
-                                    #[cfg(feature = "metrics")]
-                                    counter!("dht_udp_packets_received_total", "status" => "dropped_magic").increment(1);
-                                    continue;
-                                }
-
-                                let data = buf[..size].to_vec();
-
-                                let tx = &senders[next_worker_idx];
-                                next_worker_idx = (next_worker_idx + 1) % num_workers;
-
-                                match tx.try_send((data, addr)) {
-                                    Ok(_) => {
-                                        #[cfg(feature = "metrics")]
-                                        counter!("dht_udp_packets_received_total", "status" => "ok").increment(1);
-                                    },
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        #[cfg(feature = "metrics")]
-                                        counter!("dht_udp_packets_received_total", "status" => "queue_full").increment(1);
-
-                                        #[cfg(debug_assertions)]
-                                        log::trace!("UDP worker queue full, dropping packet");
-                                    },
-                                    Err(_) => { break; }
-                                }
-                            }
-                            Err(_e) => {
-                                tokio::select! {
-                                    _ = shutdown.cancelled() => break,
-                                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    async fn handle_message(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
-        if !self.is_addr_allowed(&addr) {
+    async fn handle_message(
+        &self,
+        data: &[u8],
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> Result<()> {
+        if self.socket_providers.get(&local_addr).is_none() {
             #[cfg(debug_assertions)]
             log::trace!(
-                "⚠️ 拒绝不匹配的地址类型: {} (当前模式: {:?})",
-                addr,
+                "⚠️ 拒绝未绑定的地址: {} (当前模式: {:?})",
+                remote_addr,
                 self.options.netmode
             );
             return Ok(());
@@ -511,7 +392,8 @@ impl DHTServer {
         match msg.y.as_str() {
             "q" => {
                 if let Some(q_type) = &msg.q {
-                    self.handle_query(&msg, q_type.as_bytes(), addr).await?;
+                    self.handle_query(&msg, q_type.as_bytes(), remote_addr, local_addr)
+                        .await?;
                 }
             }
             "r" => {
@@ -528,7 +410,8 @@ impl DHTServer {
         &self,
         msg: &DhtMessage,
         query_type: &[u8],
-        addr: SocketAddr,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
     ) -> Result<()> {
         let args = match &msg.a {
             Some(a) => a,
@@ -559,11 +442,18 @@ impl DHTServer {
         }
 
         if q_str == "announce_peer" {
-            self.handle_announce_peer(args, addr).await?;
+            self.handle_announce_peer(args, remote_addr).await?;
         }
 
-        self.send_response(transaction_id, addr, q_str, sender_id, target_id_fallback)
-            .await?;
+        self.send_response(
+            transaction_id,
+            remote_addr,
+            local_addr,
+            q_str,
+            sender_id,
+            target_id_fallback,
+        )
+        .await?;
         Ok(())
     }
 
@@ -588,10 +478,10 @@ impl DHTServer {
 
             let filter_cb = self.filter.read().unwrap().clone();
             if let Some(f) = filter_cb
-                && !f(&hash_hex) {
+                && !f(&hash_hex)
+            {
                 #[cfg(feature = "metrics")]
-                counter!("dht_announce_peer_blocked_total", "reason" => "filtered")
-                    .increment(1);
+                counter!("dht_announce_peer_blocked_total", "reason" => "filtered").increment(1);
                 return Ok(());
             }
 
@@ -692,11 +582,17 @@ impl DHTServer {
     async fn send_response(
         &self,
         tid: &[u8],
-        addr: SocketAddr,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         query_type: &str,
         sender_id: Option<&[u8]>,
         target_id_fallback: Option<&[u8]>,
     ) -> Result<()> {
+        let socket = match self.socket_providers.get(&local_addr) {
+            Some(sock) => sock,
+            None => return Ok(()), // Silent failure when the socket is not present
+        };
+
         let mut r_dict = std::collections::HashMap::new();
 
         let reference_id = sender_id.or(target_id_fallback);
@@ -707,11 +603,11 @@ impl DHTServer {
         };
 
         r_dict.insert(b"id".to_vec(), serde_bencode::value::Value::Bytes(my_id));
-        let token = self.generate_token(addr);
+        let token = self.generate_token(remote_addr);
         r_dict.insert(b"token".to_vec(), serde_bencode::value::Value::Bytes(token));
 
         if query_type == "get_peers" || query_type == "find_node" {
-            let requestor_is_ipv6 = addr.is_ipv6();
+            let requestor_is_ipv6 = remote_addr.is_ipv6();
             let filter_ipv6 = match self.options.netmode {
                 NetMode::Ipv4Only => Some(false),
                 NetMode::Ipv6Only => Some(true),
@@ -766,12 +662,14 @@ impl DHTServer {
         response.insert("r".to_string(), serde_bencode::value::Value::Dict(r_dict));
 
         if let Ok(encoded) = serde_bencode::to_bytes(&response) {
-            #[cfg(feature = "metrics")]
-            {
-                counter!("dht_udp_bytes_sent_total").increment(encoded.len() as u64);
-                counter!("dht_udp_packets_sent_total", "type" => "response").increment(1);
+            #[allow(unused)]
+            if let Ok(len) = socket.send_to(&encoded, remote_addr).await {
+                #[cfg(feature = "metrics")]
+                {
+                    counter!("dht_udp_bytes_sent_total").increment(len as u64);
+                    counter!("dht_udp_packets_sent_total", "type" => "response").increment(1);
+                }
             }
-            let _ = self.select_socket(&addr).send_to(&encoded, addr).await;
         }
         Ok(())
     }
@@ -794,31 +692,20 @@ impl DHTServer {
                         }
                         NetMode::DualStack => {}
                     }
-                    let _ = self.send_find_node(addr, &target, &self.node_id).await;
+                    let _ = self.send_find_node(&addr, &target, &self.node_id).await;
                 }
             }
         }
     }
 
-    async fn send_find_node(
-        &self,
-        addr: SocketAddr,
-        target: &[u8],
-        sender_id: &[u8],
-    ) -> Result<()> {
-        send_find_node_impl(
-            addr,
-            target,
-            sender_id,
-            &self.socket,
-            self.socket_v6.as_ref(),
-            self.options.netmode,
-        )
-        .await
+    async fn send_find_node(&self, target_addr: &SocketAddr, target: &[u8], sender_id: &[u8]) {
+        if let Some(sock) = self.socket_providers.values().next().cloned() {
+            send_find_node_impl(target_addr, target, sender_id, sock).await
+        }
     }
 
     fn generate_token(&self, addr: SocketAddr) -> Vec<u8> {
-        let mut hasher = AHasher::default();
+        let mut hasher = ahash::AHasher::default();
 
         match addr.ip() {
             IpAddr::V4(ip) => ip.octets().hash(&mut hasher),
@@ -879,13 +766,11 @@ impl DHTServer {
 /// * `Ipv6Only`: 始终使用 IPv4 socket（IPv6 模式下 socket 实际是 IPv6）
 /// * `DualStack`: 根据目标地址类型自动选择 IPv4 或 IPv6 socket
 async fn send_find_node_impl(
-    addr: SocketAddr,
+    addr: &SocketAddr,
     target: &[u8],
     sender_id: &[u8],
-    socket: &Arc<UdpSocket>,
-    socket_v6: Option<&Arc<UdpSocket>>,
-    netmode: NetMode,
-) -> Result<()> {
+    socket: Arc<UdpSocket>,
+) {
     // 构建查询参数
     let mut args = std::collections::HashMap::new();
     args.insert(
@@ -916,27 +801,14 @@ async fn send_find_node_impl(
 
     // 将消息编码为 bencode 格式并发送
     if let Ok(encoded) = serde_bencode::to_bytes(&msg) {
-        // 根据网络模式选择合适的 socket
-        let selected_socket = match netmode {
-            NetMode::Ipv4Only => socket,
-            NetMode::Ipv6Only => socket,
-            NetMode::DualStack => {
-                if addr.is_ipv6() {
-                    socket_v6.unwrap_or(socket)
-                } else {
-                    socket
-                }
-            }
-        };
         // 异步发送 UDP 数据包
         #[cfg(feature = "metrics")]
         {
             counter!("dht_udp_bytes_sent_total").increment(encoded.len() as u64);
             counter!("dht_udp_packets_sent_total", "type" => "query").increment(1);
         }
-        let _ = selected_socket.send_to(&encoded, addr).await;
+        let _ = socket.send_to(&encoded, addr).await;
     }
-    Ok(())
 }
 
 fn generate_random_id() -> Vec<u8> {
@@ -996,4 +868,123 @@ fn generate_neighbor_target(remote_id: &[u8], local_id: &[u8]) -> Vec<u8> {
         }
     }
     id
+}
+
+fn spawn_udp_reader(
+    socket: Arc<UdpSocket>,
+    mut workers: Vec<WorkerHandle>,
+    shutdown: CancellationToken,
+) {
+    let local_addr = socket.local_addr().expect("socket to have IP address");
+    if workers.is_empty() {
+        panic!("No worker supplied for UDP reader")
+    }
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 65536];
+        let mut worker_index = 0;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    #[cfg(debug_assertions)]
+                    log::trace!("UDP 读取循环收到关闭信号，退出");
+                    break;
+                }
+                result = socket.recv_from(&mut buffer) => {
+                    match result {
+                        Ok((size, origin_addr)) => {
+                            if let Err(ProcessUdpPacketError::NoLiveWorkers) = process_udp_packet(size, origin_addr, local_addr, &buffer, &mut workers, &mut worker_index){
+                                log::warn!("Socket {socket:?} is closing because no worker can process packets.");
+                                // TODO: Remove the dead socket, or find a way to supply workers.
+                                break
+                            }
+                        },
+                        Err(_e) => {
+                            tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+enum ProcessUdpPacketError {
+    PacketTooLarge,
+    InvalidPacket,
+    ChokedWorkers,
+    NoLiveWorkers,
+}
+
+fn process_udp_packet(
+    size: usize,
+    origin_addr: SocketAddr,
+    local_addr: SocketAddr,
+    buffer: &[u8],
+    workers: &mut Vec<WorkerHandle>,
+    worker_index: &mut usize,
+) -> std::result::Result<(), ProcessUdpPacketError> {
+    #[cfg(feature = "metrics")]
+    counter!("dht_udp_bytes_received_total").increment(size as u64);
+
+    if size > 8192 {
+        #[cfg(feature = "metrics")]
+        counter!("dht_udp_packets_received_total", "status" => "dropped_size").increment(1);
+
+        #[cfg(debug_assertions)]
+        log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, origin_addr);
+        return Err(ProcessUdpPacketError::PacketTooLarge);
+    }
+
+    if size == 0 || buffer[0] != b'd' {
+        #[cfg(feature = "metrics")]
+        counter!("dht_udp_packets_received_total", "status" => "dropped_magic").increment(1);
+        return Err(ProcessUdpPacketError::InvalidPacket);
+    }
+    let mut data = Some(buffer[..size].to_owned().into_boxed_slice());
+    let mut choked_count = 0;
+
+    while let Some(packet) = data.take() {
+        let worker = &workers[*worker_index];
+        match worker.try_send((packet, origin_addr, local_addr)) {
+            Ok(_) => {
+                #[cfg(feature = "metrics")]
+                counter!("dht_udp_packets_received_total", "status" => "ok").increment(1);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Full((packet, _, _))) => {
+                choked_count += 1;
+                if *worker_index == 0 {
+                    if choked_count >= workers.len() {
+                        // all workers choked
+                        #[cfg(feature = "metrics")]
+                        counter!("dht_udp_packets_received_total", "status" => "queue_full")
+                            .increment(1);
+
+                        #[cfg(debug_assertions)]
+                        log::trace!("UDP worker queue full, dropping packet");
+                        return Err(ProcessUdpPacketError::ChokedWorkers);
+                    }
+                    choked_count = 0
+                }
+                let _ = data.insert(packet); // choose the next worker
+            }
+            Err(mpsc::error::TrySendError::Closed((packet, _, _))) => {
+                log::warn!("UDP worker dropped.");
+                workers.swap_remove(*worker_index); // remove the dead worker. faster but does not retain ordering.
+                let _ = data.insert(packet); // choose the next worker
+            }
+        }
+        if workers.is_empty() {
+            // no live workers
+            return Err(ProcessUdpPacketError::NoLiveWorkers);
+        }
+        // dispatch messages to workers in round-robin style
+        *worker_index = (*worker_index + 1) % workers.len(); // note: a dead worker may be removed
+    }
+
+    Ok(())
 }

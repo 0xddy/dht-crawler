@@ -76,7 +76,8 @@ impl NodeQueueShard {
         }
 
         if self.queue.len() >= self.capacity
-            && let Some(removed) = self.queue.pop_front() {
+            && let Some(removed) = self.queue.pop_front()
+        {
             self.index.remove(&removed.addr);
         }
 

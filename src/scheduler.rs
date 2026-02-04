@@ -217,7 +217,8 @@ impl MetadataScheduler {
         };
 
         if let Some(f) = maybe_check_fn
-            && !f(info_hash.clone()).await {
+            && !f(info_hash.clone()).await
+        {
             return;
         }
 
