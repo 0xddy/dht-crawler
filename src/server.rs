@@ -196,7 +196,10 @@ impl DHTServer {
             return Err(crate::error::DHTError::Other("服务器已关闭".to_string()));
         }
 
-        self.spawn_receivers();
+        let workers = self.spawn_workers();
+        for sock in self.socket_providers.values().cloned() {
+            spawn_udp_listener(sock, workers.clone(), self.shutdown.clone());
+        }
         self.bootstrap().await;
 
         let server = self.clone();
@@ -308,7 +311,7 @@ impl DHTServer {
         self.shutdown.cancel();
     }
 
-    fn spawn_receivers(&self) {
+    fn spawn_workers(&self) -> Vec<WorkerHandle> {
         let server = self.clone();
         let shutdown = self.shutdown.clone();
 
@@ -318,18 +321,18 @@ impl DHTServer {
 
         let queue_size = 5000;
 
-        let mut senders: Vec<WorkerHandle> = Vec::with_capacity(num_workers);
+        let mut workers: Vec<WorkerHandle> = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let (tx, mut rx) = mpsc::channel(queue_size);
-            senders.push(tx);
+            workers.push(tx);
 
             let server_clone = server.clone();
-            let shutdown_worker = shutdown.clone();
+            let cancellation_token = shutdown.clone();
 
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = shutdown_worker.cancelled() => {
+                        _ = cancellation_token.cancelled() => {
                             #[cfg(debug_assertions)]
                             log::trace!("Worker 收到关闭信号，退出");
                             break;
@@ -346,10 +349,7 @@ impl DHTServer {
                 }
             });
         }
-
-        for sock in self.socket_providers.values().cloned() {
-            spawn_udp_reader(sock, senders.clone(), shutdown.clone());
-        }
+        workers
     }
 
     async fn handle_message(
@@ -870,7 +870,7 @@ fn generate_neighbor_target(remote_id: &[u8], local_id: &[u8]) -> Vec<u8> {
     id
 }
 
-fn spawn_udp_reader(
+fn spawn_udp_listener(
     socket: Arc<UdpSocket>,
     mut workers: Vec<WorkerHandle>,
     shutdown: CancellationToken,
