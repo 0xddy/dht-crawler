@@ -165,54 +165,56 @@ impl RbitFetcher {
         match result {
             Ok(Some(info_bytes)) => {
                 if let Ok(value) = rbit::decode(&info_bytes)
-                    && let Some(dict) = value.as_dict() {
-                        let name = dict
-                            .get(&b"name"[..])
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown")
-                            .to_string();
-                        let mut total_size = 0;
-                        let mut file_list = Vec::new();
-                        if let Some(files) = dict.get(&b"files"[..]).and_then(|v| v.as_list()) {
-                            for file in files {
-                                if let Some(f_dict) = file.as_dict()
-                                    && let Some(len) = f_dict.get(&b"length"[..]).and_then(|v| v.as_integer()) {
-                                    let len = len as u64;
-                                    total_size += len;
-                                    let mut path_parts = Vec::new();
-                                    if let Some(path_list) =
-                                        f_dict.get(&b"path"[..]).and_then(|v| v.as_list())
-                                    {
-                                        for p in path_list {
-                                            if let Some(p_str) = p.as_str() {
-                                                path_parts.push(p_str);
-                                            }
+                    && let Some(dict) = value.as_dict()
+                {
+                    let name = dict
+                        .get(&b"name"[..])
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let mut total_size = 0;
+                    let mut file_list = Vec::new();
+                    if let Some(files) = dict.get(&b"files"[..]).and_then(|v| v.as_list()) {
+                        for file in files {
+                            if let Some(f_dict) = file.as_dict()
+                                && let Some(len) =
+                                    f_dict.get(&b"length"[..]).and_then(|v| v.as_integer())
+                            {
+                                let len = len as u64;
+                                total_size += len;
+                                let mut path_parts = Vec::new();
+                                if let Some(path_list) =
+                                    f_dict.get(&b"path"[..]).and_then(|v| v.as_list())
+                                {
+                                    for p in path_list {
+                                        if let Some(p_str) = p.as_str() {
+                                            path_parts.push(p_str);
                                         }
                                     }
-                                    file_list.push(FileInfo {
-                                        path: path_parts.join("/"),
-                                        size: len,
-                                    });
                                 }
+                                file_list.push(FileInfo {
+                                    path: path_parts.join("/"),
+                                    size: len,
+                                });
                             }
-                        } else if let Some(len) =
-                            dict.get(&b"length"[..]).and_then(|v| v.as_integer())
-                        {
-                            total_size = len as u64;
-                            file_list.push(FileInfo {
-                                path: name.clone(),
-                                size: total_size,
-                            });
                         }
-                        if total_size > 0 {
-                            #[cfg(feature = "metrics")]
-                            {
-                                counter!("dht_metadata_fetch_success_total").increment(1);
-                                histogram!("dht_metadata_size_bytes").record(total_size as f64);
-                            }
-                            return Some((name, total_size, file_list));
-                        }
+                    } else if let Some(len) = dict.get(&b"length"[..]).and_then(|v| v.as_integer())
+                    {
+                        total_size = len as u64;
+                        file_list.push(FileInfo {
+                            path: name.clone(),
+                            size: total_size,
+                        });
                     }
+                    if total_size > 0 {
+                        #[cfg(feature = "metrics")]
+                        {
+                            counter!("dht_metadata_fetch_success_total").increment(1);
+                            histogram!("dht_metadata_size_bytes").record(total_size as f64);
+                        }
+                        return Some((name, total_size, file_list));
+                    }
+                }
                 #[cfg(feature = "metrics")]
                 counter!("dht_metadata_fetch_fail_total", "reason" => "parse_error").increment(1);
                 None
