@@ -77,10 +77,10 @@ jobs:
             platform: linux
             jni_lib: libdht_crawler.so
 
-          # Windows x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            use_cross: false
+          # Windows x86_64 (GNU/MinGW，与 Linux/macOS 一致用 GNU 工具链，无需 VC++ 运行库)
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            use_cross: true
             platform: windows
             jni_lib: dht_crawler.dll
 
@@ -160,26 +160,25 @@ jobs:
 
       # ────────── example 产物打包 ──────────
 
-      - name: Prepare example artifacts (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare example artifacts (Linux/macOS)
+        if: "!contains(matrix.target, 'windows')"
         run: |
           cd target/${{ matrix.target }}/release/examples
           tar czf dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz dht_crawler_example
           mv dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
         shell: bash
 
-      - name: Prepare example artifacts (Windows)
-        if: runner.os == 'Windows'
+      - name: Prepare example artifacts (Windows GNU)
+        if: contains(matrix.target, 'windows')
         run: |
           cd target/${{ matrix.target }}/release/examples
-          7z a dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler_example.exe
-          Move-Item dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
-        shell: pwsh
+          zip dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler_example.exe
+          mv dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
+        shell: bash
 
       # ────────── JNI 动态库打包（仅含单个 so/dll/dylib，体积最小）──────────
 
-      - name: Prepare JNI artifacts (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare JNI artifacts
         run: |
           VERSION=${{ steps.get_version.outputs.version }}
           TARGET=${{ matrix.target }}
@@ -190,18 +189,6 @@ jobs:
           zip dht_crawler_jni-${VERSION}-${TARGET}.zip ${LIB}
           mv dht_crawler_jni-${VERSION}-${TARGET}.zip ${{ github.workspace }}/
         shell: bash
-
-      - name: Prepare JNI artifacts (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          $VERSION = "${{ steps.get_version.outputs.version }}"
-          $TARGET  = "${{ matrix.target }}"
-          $LIB     = "${{ matrix.jni_lib }}"
-          $SRC     = "target\$TARGET\release\$LIB"
-          $OUT     = "dht_crawler_jni-$VERSION-$TARGET.zip"
-          7z a $OUT $SRC
-          Move-Item $OUT ${{ github.workspace }}\
-        shell: pwsh
 
       # ────────── 上传到 Release ──────────
 
