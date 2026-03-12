@@ -1,53 +1,8 @@
-use bloomfilter::Bloom;
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-const BLOOM_SHARD_COUNT: usize = 32;
 const QUEUE_SHARD_COUNT: usize = 16;
-
-pub struct ShardedBloom {
-    shards: Vec<Mutex<Bloom<[u8; 20]>>>,
-    count: AtomicUsize,
-}
-
-impl ShardedBloom {
-    pub fn new_for_fp_rate(expected_items: usize, fp_rate: f64) -> Self {
-        #[allow(clippy::manual_div_ceil)]
-        let items_per_shard = (expected_items + BLOOM_SHARD_COUNT - 1) / BLOOM_SHARD_COUNT;
-
-        let shards = (0..BLOOM_SHARD_COUNT)
-            .map(|_| Mutex::new(Bloom::new_for_fp_rate(items_per_shard, fp_rate)))
-            .collect();
-
-        Self {
-            shards,
-            count: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn check_and_set(&self, hash: &[u8; 20]) -> bool {
-        let shard_idx = self.hash_to_shard(hash);
-        let mut shard = self.shards[shard_idx].lock().unwrap();
-        let present = shard.check_and_set(hash);
-
-        if !present {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
-        present
-    }
-
-    pub fn number_of_bits(&self) -> u64 {
-        self.count.load(Ordering::Relaxed) as u64
-    }
-
-    #[inline]
-    fn hash_to_shard(&self, hash: &[u8; 20]) -> usize {
-        let idx = (hash[0] as usize) | ((hash[1] as usize) << 8);
-        idx % BLOOM_SHARD_COUNT
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct NodeTuple {

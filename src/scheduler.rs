@@ -3,9 +3,7 @@ use crate::server::HashDiscovered;
 use crate::types::TorrentInfo;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-#[cfg(debug_assertions)]
-use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
@@ -69,8 +67,7 @@ impl MetadataScheduler {
     }
 
     pub async fn run(mut self) {
-        let (task_tx, task_rx) = mpsc::channel::<HashDiscovered>(self.max_queue_size);
-        let task_rx = Arc::new(Mutex::new(task_rx));
+        let (task_tx, task_rx) = async_channel::bounded::<HashDiscovered>(self.max_queue_size);
 
         let shutdown = self.shutdown.clone();
         #[cfg_attr(not(debug_assertions), allow(unused_variables))]
@@ -94,20 +91,13 @@ impl MetadataScheduler {
                             log::trace!("Worker {} 收到关闭信号，退出", worker_id);
                             break;
                         }
-                        result = async {
-                            let mut rx = task_rx.lock().await;
-                            rx.recv().await
-                        } => {
-                            let hash = {
-                                if result.is_some() {
+                        result = task_rx.recv() => {
+                            let hash = match result {
+                                Ok(h) => {
                                     queue_len.fetch_sub(1, Ordering::Relaxed);
+                                    h
                                 }
-                                result
-                            };
-
-                            let hash = match hash {
-                                Some(h) => h,
-                                None => break,
+                                Err(_) => break,
                             };
 
                             total_dispatched.fetch_add(1, Ordering::Relaxed);
@@ -127,74 +117,52 @@ impl MetadataScheduler {
             });
         }
 
-        #[cfg(debug_assertions)]
-        let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
-        #[cfg(debug_assertions)]
-        stats_interval.tick().await;
+        let mut stats_interval = if cfg!(debug_assertions) {
+            Some(tokio::time::interval(std::time::Duration::from_secs(60)))
+        } else {
+            None
+        };
+        if let Some(ref mut interval) = stats_interval {
+            interval.tick().await;
+        }
 
         let shutdown = self.shutdown.clone();
         loop {
-            #[cfg(debug_assertions)]
-            {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        #[cfg(debug_assertions)]
-                        log::trace!("MetadataScheduler 主循环收到关闭信号，退出");
-                        break;
-                    }
-                    Some(hash) = self.hash_rx.recv() => {
-                        self.total_received.fetch_add(1, Ordering::Relaxed);
-
-                        match task_tx.try_send(hash) {
-                            Ok(_) => {
-                                self.queue_len.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    _ = stats_interval.tick() => {
-                        self.print_stats(&task_tx);
-                    }
-
-                    else => break,
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    #[cfg(debug_assertions)]
+                    log::trace!("MetadataScheduler 主循环收到关闭信号，退出");
+                    break;
                 }
-            }
+                result = self.hash_rx.recv() => {
+                    match result {
+                        Some(hash) => {
+                            self.total_received.fetch_add(1, Ordering::Relaxed);
 
-            #[cfg(not(debug_assertions))]
-            {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        #[cfg(debug_assertions)]
-                        log::trace!("MetadataScheduler 主循环收到关闭信号，退出");
-                        break;
-                    }
-                    result = self.hash_rx.recv() => {
-                        match result {
-                            Some(hash) => {
-                                self.total_received.fetch_add(1, Ordering::Relaxed);
-
-                                match task_tx.try_send(hash) {
-                                    Ok(_) => {
-                                        self.queue_len.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(_) => break,
+                            match task_tx.try_send(hash) {
+                                Ok(_) => {
+                                    self.queue_len.fetch_add(1, Ordering::Relaxed);
                                 }
+                                Err(async_channel::TrySendError::Full(_)) => {
+                                    self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(_) => break,
                             }
-                            None => break,
                         }
+                        None => break,
                     }
+                }
+                _ = async {
+                    match stats_interval.as_mut() {
+                        Some(interval) => interval.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.print_stats_inline();
                 }
             }
         }
 
-        // 显式关闭 task_tx，让所有 worker 任务能够退出
         drop(task_tx);
         #[cfg(debug_assertions)]
         log::trace!("MetadataScheduler 主循环退出，等待 worker 任务完成");
@@ -231,7 +199,9 @@ impl MetadataScheduler {
             _ => return,
         };
 
-        if let Some((name, total_size, files)) = fetcher.fetch(&info_hash_bytes, peer_addr).await {
+        if let Some((name, total_size, files, piece_length)) =
+            fetcher.fetch(&info_hash_bytes, peer_addr).await
+        {
             let metadata = TorrentInfo {
                 info_hash,
                 name,
@@ -239,10 +209,10 @@ impl MetadataScheduler {
                 files,
                 magnet_link: format!("magnet:?xt=urn:btih:{}", hash.info_hash),
                 peers: vec![peer_addr.to_string()],
-                piece_length: 0,
+                piece_length,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
             };
 
@@ -259,43 +229,45 @@ impl MetadataScheduler {
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn print_stats(&self, task_tx: &mpsc::Sender<HashDiscovered>) {
-        let received = self.total_received.load(Ordering::Relaxed);
-        let dropped = self.total_dropped.load(Ordering::Relaxed);
-        let dispatched = self.total_dispatched.load(Ordering::Relaxed);
+    fn print_stats_inline(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let received = self.total_received.load(Ordering::Relaxed);
+            let dropped = self.total_dropped.load(Ordering::Relaxed);
+            let dispatched = self.total_dispatched.load(Ordering::Relaxed);
 
-        let drop_rate = if received > 0 {
-            dropped as f64 / received as f64 * 100.0
-        } else {
-            0.0
-        };
+            let drop_rate = if received > 0 {
+                dropped as f64 / received as f64 * 100.0
+            } else {
+                0.0
+            };
 
-        let queue_size = self.max_queue_size - task_tx.capacity();
-        let queue_pressure = (queue_size as f64 / self.max_queue_size as f64) * 100.0;
+            let queue_len = self.queue_len.load(Ordering::Relaxed);
+            let queue_pressure = (queue_len as f64 / self.max_queue_size as f64) * 100.0;
 
-        if queue_pressure > 80.0 {
-            log::warn!(
-                "⚠️ Metadata 队列高压：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",
-                queue_size,
-                self.max_queue_size,
-                queue_pressure,
-                received,
-                dispatched,
-                dropped,
-                drop_rate
-            );
-        } else {
-            log::info!(
-                "📊 Metadata 调度器统计：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",
-                queue_size,
-                self.max_queue_size,
-                queue_pressure,
-                received,
-                dispatched,
-                dropped,
-                drop_rate
-            );
+            if queue_pressure > 80.0 {
+                log::warn!(
+                    "Metadata 队列高压：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",
+                    queue_len,
+                    self.max_queue_size,
+                    queue_pressure,
+                    received,
+                    dispatched,
+                    dropped,
+                    drop_rate
+                );
+            } else {
+                log::info!(
+                    "Metadata 调度器统计：队列={}/{}({:.1}%), 接收={}, 调度={}, 丢弃={}({:.2}%)",
+                    queue_len,
+                    self.max_queue_size,
+                    queue_pressure,
+                    received,
+                    dispatched,
+                    dropped,
+                    drop_rate
+                );
+            }
         }
     }
 }

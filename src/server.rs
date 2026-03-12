@@ -45,9 +45,9 @@ type FilterCallback = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct DHTServer {
     #[allow(dead_code)]
     options: DHTOptions,
-    node_id: Vec<u8>,
+    node_id: [u8; 20],
     socket_providers: Arc<HashMap<SocketAddr, Arc<UdpSocket>>>,
-    token_secret: Vec<u8>,
+    token_secret: [u8; 10],
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     filter: Arc<RwLock<Option<FilterCallback>>>,
     on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
@@ -111,8 +111,8 @@ impl DHTServer {
         };
 
         let node_id = generate_random_id();
-        let mut rng = rand::thread_rng();
-        let token_secret: Vec<u8> = (0..10).map(|_| rng.r#gen::<u8>()).collect();
+        let mut token_secret = [0u8; 10];
+        rand::thread_rng().fill(&mut token_secret);
 
         let node_queue = ShardedNodeQueue::new(options.node_queue_capacity);
 
@@ -146,7 +146,7 @@ impl DHTServer {
         let max_metadata_queue_size = options.max_metadata_queue_size;
         let server = Self {
             options,
-            node_id: node_id.clone(),
+            node_id,
             socket_providers: Arc::new(socket_providers),
             token_secret,
             callback,
@@ -264,13 +264,15 @@ impl DHTServer {
                 }
 
                 if let Some(nodes) = nodes_batch {
-                    let node_id = server.node_id.clone();
+                    let node_id = server.node_id;
 
                     for node in nodes {
-                        let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        let node_id_clone = node_id.clone();
-                        // Pick a random avaliable socket
-                        let socket = match server.socket_providers.values().next().cloned() {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        let node_id_clone = node_id;
+                        let socket = match server.socket_for_addr(&node.addr) {
                             Some(sock) => sock,
                             None => {
                                 log::warn!("未绑定任何地址");
@@ -599,12 +601,15 @@ impl DHTServer {
         let my_id = if let Some(target) = reference_id {
             generate_neighbor_target(target, &self.node_id)
         } else {
-            self.node_id.clone()
+            self.node_id.to_vec()
         };
 
         r_dict.insert(b"id".to_vec(), serde_bencode::value::Value::Bytes(my_id));
         let token = self.generate_token(remote_addr);
-        r_dict.insert(b"token".to_vec(), serde_bencode::value::Value::Bytes(token));
+        r_dict.insert(
+            b"token".to_vec(),
+            serde_bencode::value::Value::Bytes(token.to_vec()),
+        );
 
         if query_type == "get_peers" || query_type == "find_node" {
             let requestor_is_ipv6 = remote_addr.is_ipv6();
@@ -698,13 +703,20 @@ impl DHTServer {
         }
     }
 
+    fn socket_for_addr(&self, addr: &SocketAddr) -> Option<Arc<UdpSocket>> {
+        self.socket_providers
+            .iter()
+            .find(|(bind_addr, _)| bind_addr.is_ipv4() == addr.is_ipv4())
+            .map(|(_, sock)| sock.clone())
+    }
+
     async fn send_find_node(&self, target_addr: &SocketAddr, target: &[u8], sender_id: &[u8]) {
-        if let Some(sock) = self.socket_providers.values().next().cloned() {
+        if let Some(sock) = self.socket_for_addr(target_addr) {
             send_find_node_impl(target_addr, target, sender_id, sock).await
         }
     }
 
-    fn generate_token(&self, addr: SocketAddr) -> Vec<u8> {
+    fn generate_token(&self, addr: SocketAddr) -> [u8; 8] {
         let mut hasher = ahash::AHasher::default();
 
         match addr.ip() {
@@ -714,8 +726,7 @@ impl DHTServer {
 
         self.token_secret.hash(&mut hasher);
 
-        let hash = hasher.finish();
-        hash.to_le_bytes().to_vec()
+        hasher.finish().to_le_bytes()
     }
 
     fn validate_token(&self, token: &[u8], addr: SocketAddr) -> bool {
@@ -723,7 +734,7 @@ impl DHTServer {
             return false;
         }
         let expected = self.generate_token(addr);
-        token == expected.as_slice()
+        token == expected
     }
 }
 
@@ -811,9 +822,10 @@ async fn send_find_node_impl(
     }
 }
 
-fn generate_random_id() -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-    (0..20).map(|_| rng.r#gen::<u8>()).collect()
+fn generate_random_id() -> [u8; 20] {
+    let mut id = [0u8; 20];
+    rand::thread_rng().fill(&mut id);
+    id
 }
 
 /// 生成邻居目标节点 ID
@@ -945,7 +957,8 @@ fn process_udp_packet(
         return Err(ProcessUdpPacketError::InvalidPacket);
     }
     let mut data = Some(buffer[..size].to_owned().into_boxed_slice());
-    let mut choked_count = 0;
+    let mut attempts = 0;
+    let max_attempts = workers.len();
 
     while let Some(packet) = data.take() {
         let worker = &workers[*worker_index];
@@ -956,34 +969,28 @@ fn process_udp_packet(
                 break;
             }
             Err(mpsc::error::TrySendError::Full((packet, _, _))) => {
-                choked_count += 1;
-                if *worker_index == 0 {
-                    if choked_count >= workers.len() {
-                        // all workers choked
-                        #[cfg(feature = "metrics")]
-                        counter!("dht_udp_packets_received_total", "status" => "queue_full")
-                            .increment(1);
+                attempts += 1;
+                if attempts >= max_attempts {
+                    #[cfg(feature = "metrics")]
+                    counter!("dht_udp_packets_received_total", "status" => "queue_full")
+                        .increment(1);
 
-                        #[cfg(debug_assertions)]
-                        log::trace!("UDP worker queue full, dropping packet");
-                        return Err(ProcessUdpPacketError::ChokedWorkers);
-                    }
-                    choked_count = 0
+                    #[cfg(debug_assertions)]
+                    log::trace!("UDP worker queue full, dropping packet");
+                    return Err(ProcessUdpPacketError::ChokedWorkers);
                 }
-                let _ = data.insert(packet); // choose the next worker
+                let _ = data.insert(packet);
             }
             Err(mpsc::error::TrySendError::Closed((packet, _, _))) => {
                 log::warn!("UDP worker dropped.");
-                workers.swap_remove(*worker_index); // remove the dead worker. faster but does not retain ordering.
-                let _ = data.insert(packet); // choose the next worker
+                workers.swap_remove(*worker_index);
+                let _ = data.insert(packet);
             }
         }
         if workers.is_empty() {
-            // no live workers
             return Err(ProcessUdpPacketError::NoLiveWorkers);
         }
-        // dispatch messages to workers in round-robin style
-        *worker_index = (*worker_index + 1) % workers.len(); // note: a dead worker may be removed
+        *worker_index = (*worker_index + 1) % workers.len();
     }
 
     Ok(())

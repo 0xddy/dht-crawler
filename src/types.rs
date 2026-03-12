@@ -55,8 +55,6 @@ fn format_bytes(bytes: u64) -> String {
 pub struct DHTOptions {
     pub port: u16,
 
-    pub auto_metadata: bool,
-
     pub metadata_timeout: u64,
 
     pub max_metadata_queue_size: usize,
@@ -74,7 +72,6 @@ impl Default for DHTOptions {
     fn default() -> Self {
         Self {
             port: 6881,
-            auto_metadata: true,
             metadata_timeout: 3,
             max_metadata_queue_size: 100000,
             max_metadata_worker_count: 1000,

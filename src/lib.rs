@@ -9,7 +9,7 @@ pub mod types;
 pub use error::{DHTError, Result};
 pub use scheduler::MetadataScheduler;
 pub use server::{DHTServer, HashDiscovered};
-pub use sharded::{NodeTuple, ShardedBloom, ShardedNodeQueue};
+pub use sharded::{NodeTuple, ShardedNodeQueue};
 pub use types::{DHTOptions, FileInfo, NetMode, TorrentInfo};
 
 pub mod prelude {

@@ -29,7 +29,7 @@ impl RbitFetcher {
         &self,
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
-    ) -> Option<(String, u64, Vec<FileInfo>)> {
+    ) -> Option<(String, u64, Vec<FileInfo>, u64)> {
         #[cfg(feature = "metrics")]
         counter!("dht_metadata_fetch_attempts_total").increment(1);
 
@@ -138,18 +138,21 @@ impl RbitFetcher {
                                     }
                                     if success {
                                         let info_hash_copy = *info_hash;
-                                        let full_data_clone = full_data.clone();
-                                        let is_valid = tokio::task::spawn_blocking(move || {
+                                        let validated = tokio::task::spawn_blocking(move || {
                                             let mut hasher = Sha1::new();
-                                            hasher.update(&full_data_clone);
+                                            hasher.update(&full_data);
                                             let digest: [u8; 20] = hasher.finalize().into();
-                                            digest == info_hash_copy
-                                        }).await.unwrap_or(false);
+                                            if digest == info_hash_copy {
+                                                Some(full_data)
+                                            } else {
+                                                None
+                                            }
+                                        }).await.unwrap_or(None);
 
-                                        if is_valid {
+                                        if validated.is_some() {
                                             #[cfg(feature = "metrics")]
                                             counter!("dht_metadata_handshake_result_total", "result" => "success").increment(1);
-                                            return Some(full_data);
+                                            return validated;
                                         }
                                         #[cfg(feature = "metrics")]
                                         counter!("dht_metadata_fetch_fail_total", "reason" => "sha1_mismatch").increment(1);
@@ -172,6 +175,10 @@ impl RbitFetcher {
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown")
                         .to_string();
+                    let piece_length = dict
+                        .get(&b"piece length"[..])
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(0) as u64;
                     let mut total_size = 0;
                     let mut file_list = Vec::new();
                     if let Some(files) = dict.get(&b"files"[..]).and_then(|v| v.as_list()) {
@@ -212,7 +219,7 @@ impl RbitFetcher {
                             counter!("dht_metadata_fetch_success_total").increment(1);
                             histogram!("dht_metadata_size_bytes").record(total_size as f64);
                         }
-                        return Some((name, total_size, file_list));
+                        return Some((name, total_size, file_list, piece_length));
                     }
                 }
                 #[cfg(feature = "metrics")]

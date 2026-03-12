@@ -32,7 +32,6 @@ async fn main() -> Result<()> {
 
     let options = DHTOptions {
         port: 12313,
-        auto_metadata: true,
         metadata_timeout: 3,             // ✅ 快速超时，快速失败
         max_metadata_queue_size: 100000, // ✅ 大缓冲区（防止饱和）
         max_metadata_worker_count: 1000, // ✅ 激进并发（最大化吞吐）
