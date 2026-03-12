@@ -142,12 +142,12 @@ jobs:
           fi
         shell: bash
 
-      - name: Build (example + JNI cdylib)
+      - name: Build (lib cdylib + examples)
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics,jni
+            cross build --release --target ${{ matrix.target }} --lib --examples --features mimalloc,metrics,jni
           else
-            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics,jni
+            cargo build --release --target ${{ matrix.target }} --lib --examples --features mimalloc,metrics,jni
           fi
         shell: bash
 
