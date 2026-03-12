@@ -14,9 +14,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>在仓库根目录编译 Rust JNI 产物：
  *       <pre>cargo build --release --features jni</pre>
  *   </li>
- *   <li>在 {@code jni/java/} 目录下运行（{@code lib.path} 指向 so/dll/dylib 所在目录）：
- *       <pre>gradle run -Plib.path=../../target/release</pre>
- *       或直接用默认路径（{@code ../../../target/release}）：
+ *   <li>在 {@code examples-jni/} 目录下运行（{@code lib.path} 指向 so/dll/dylib 所在目录）：
+ *       <pre>gradle run -Plib.path=../target/release</pre>
+ *       或直接用默认路径（{@code ../target/release}）：
  *       <pre>gradle run</pre>
  *   </li>
  * </ol>

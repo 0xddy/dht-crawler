@@ -5,7 +5,7 @@
 ## 项目结构
 
 ```
-java/
+examples-jni/
 ├── build.gradle                        # Gradle 构建脚本
 ├── settings.gradle
 └── src/main/java/cn/lmcw/dht/
@@ -52,10 +52,10 @@ cargo build --release --features jni
 
 #### 2. 运行 Java 示例
 
-在本目录（`jni/java/`）执行：
+在本目录（`examples-jni/`）执行：
 
 ```bash
-# 使用默认库路径（../../../target/release）
+# 使用默认库路径（../target/release）
 gradle run
 
 # 自定义库路径

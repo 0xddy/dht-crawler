@@ -32,7 +32,7 @@ jobs:
           java-version: '11'
 
       - name: Build fat JAR
-        working-directory: jni/java
+        working-directory: examples-jni
         run: |
           chmod +x gradlew 2>/dev/null || true
           gradle shadowJar -PprojectVersion=${{ github.event.inputs.version }} --no-daemon
@@ -42,7 +42,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.event.inputs.version }}
-          files: jni/java/build/libs/dht-crawler-jni-example-${{ github.event.inputs.version }}.jar
+          files: examples-jni/build/libs/dht-crawler-jni-example-${{ github.event.inputs.version }}.jar
 
   # ──────────────────────────────────────────────────────────────────
   # 各平台 Rust 构建（example 可执行 + JNI so/dll/dylib）

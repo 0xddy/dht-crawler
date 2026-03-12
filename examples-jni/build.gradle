@@ -22,17 +22,17 @@ repositories {
     mavenCentral()
 }
 
-// 运行时将 native 库路径传入 JVM
+// 运行时将 native 库路径传入 JVM（默认指向仓库根 target/release）
 tasks.withType(JavaExec).configureEach {
-    def libPath = project.findProperty('lib.path') ?: '../../../target/release'
+    def libPath = project.findProperty('lib.path') ?: '../target/release'
     jvmArgs "-Djava.library.path=${libPath}"
 }
 
 // Fat JAR（含所有依赖 + Main-Class）：执行 `gradle shadowJar` 生成
 shadowJar {
-    archiveBaseName  = 'dht-crawler-jni-example'
+    archiveBaseName   = 'dht-crawler-jni-example'
     archiveClassifier = ''
-    archiveVersion   = version
+    archiveVersion    = version
     manifest {
         attributes 'Main-Class': 'cn.lmcw.dht.DhtCrawlerExample'
     }
