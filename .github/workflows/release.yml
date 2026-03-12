@@ -34,8 +34,8 @@ jobs:
       - name: Build fat JAR
         working-directory: examples-jni
         run: |
-          chmod +x gradlew 2>/dev/null || true
-          gradle shadowJar -PprojectVersion=${{ github.event.inputs.version }} --no-daemon
+          chmod +x gradlew
+          ./gradlew shadowJar -PprojectVersion=${{ github.event.inputs.version }} --no-daemon
         shell: bash
 
       - name: Upload JAR to Release
@@ -62,6 +62,7 @@ jobs:
             use_cross: false
             platform: linux
             jni_lib: libdht_crawler.so
+            build_features: mimalloc,metrics,jni
 
           # Linux x86_64 (MUSL - 静态链接，无依赖)
           - target: x86_64-unknown-linux-musl
@@ -69,6 +70,7 @@ jobs:
             use_cross: true
             platform: linux
             jni_lib: libdht_crawler.so
+            build_features: mimalloc,metrics,jni
 
           # Linux ARM64
           - target: aarch64-unknown-linux-gnu
@@ -76,13 +78,15 @@ jobs:
             use_cross: true
             platform: linux
             jni_lib: libdht_crawler.so
+            build_features: mimalloc,metrics,jni
 
-          # Windows x86_64 (GNU/MinGW，与 Linux/macOS 一致用 GNU 工具链，无需 VC++ 运行库)
+          # Windows x86_64 (GNU/MinGW，在 Windows 上原生构建，无需交叉编译)
           - target: x86_64-pc-windows-gnu
-            os: ubuntu-latest
-            use_cross: true
+            os: windows-latest
+            use_cross: false
             platform: windows
             jni_lib: dht_crawler.dll
+            build_features: mimalloc,metrics,jni
 
           # macOS x86_64
           - target: x86_64-apple-darwin
@@ -90,6 +94,7 @@ jobs:
             use_cross: false
             platform: macos
             jni_lib: libdht_crawler.dylib
+            build_features: mimalloc,metrics,jni
 
           # macOS ARM64 (Apple Silicon)
           - target: aarch64-apple-darwin
@@ -97,6 +102,7 @@ jobs:
             use_cross: false
             platform: macos
             jni_lib: libdht_crawler.dylib
+            build_features: mimalloc,metrics,jni
 
     steps:
       - name: Checkout code
@@ -110,6 +116,18 @@ jobs:
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Setup MSYS2 MinGW (Windows GNU)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH (Windows GNU)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+        shell: pwsh
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -136,18 +154,18 @@ jobs:
       - name: Run tests with features
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross test --target ${{ matrix.target }} --verbose --features metrics,mimalloc
+            cross test --target ${{ matrix.target }} --verbose --features ${{ matrix.build_features }}
           else
-            cargo test --target ${{ matrix.target }} --verbose --features metrics,mimalloc
+            cargo test --target ${{ matrix.target }} --verbose --features ${{ matrix.build_features }}
           fi
         shell: bash
 
       - name: Build (lib cdylib + examples)
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --lib --examples --features mimalloc,metrics,jni
+            cross build --release --target ${{ matrix.target }} --lib --examples --features ${{ matrix.build_features }}
           else
-            cargo build --release --target ${{ matrix.target }} --lib --examples --features mimalloc,metrics,jni
+            cargo build --release --target ${{ matrix.target }} --lib --examples --features ${{ matrix.build_features }}
           fi
         shell: bash
 
