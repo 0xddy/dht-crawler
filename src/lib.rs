@@ -18,3 +18,7 @@ pub mod prelude {
     pub use crate::server::DHTServer;
     pub use crate::types::{DHTOptions, FileInfo, NetMode, TorrentInfo};
 }
+
+#[cfg(feature = "jni")]
+#[path = "../jni/mod.rs"]
+pub mod jni_bindings;

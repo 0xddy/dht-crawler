@@ -40,6 +40,7 @@ pub struct HashDiscovered {
 
 type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
 type FilterCallback = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type ErrorCallback = Arc<dyn Fn(crate::error::DHTError) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct DHTServer {
@@ -51,6 +52,7 @@ pub struct DHTServer {
     callback: Arc<RwLock<Option<TorrentCallback>>>,
     filter: Arc<RwLock<Option<FilterCallback>>>,
     on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
+    on_error_cb: Arc<RwLock<Option<ErrorCallback>>>,
     node_queue: Arc<ShardedNodeQueue>,
     hash_tx: mpsc::Sender<HashDiscovered>,
     metadata_queue_len: Arc<AtomicUsize>,
@@ -153,6 +155,7 @@ impl DHTServer {
             on_metadata_fetch,
             node_queue: Arc::new(node_queue),
             filter: Arc::new(RwLock::new(None)),
+            on_error_cb: Arc::new(RwLock::new(None)),
             hash_tx,
             metadata_queue_len,
             max_metadata_queue_size,
@@ -167,7 +170,7 @@ impl DHTServer {
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        *self.on_metadata_fetch.write().unwrap() =
+        *self.on_metadata_fetch.write().unwrap_or_else(|e| e.into_inner()) =
             Some(Arc::new(move |hash| Box::pin(callback(hash))));
     }
 
@@ -175,14 +178,29 @@ impl DHTServer {
     where
         F: Fn(TorrentInfo) + Send + Sync + 'static,
     {
-        *self.callback.write().unwrap() = Some(Arc::new(callback));
+        *self.callback.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
     }
 
     pub fn set_filter<F>(&self, filter: F)
     where
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
-        *self.filter.write().unwrap() = Some(Arc::new(filter));
+        *self.filter.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(filter));
+    }
+
+    pub fn on_error<F>(&self, callback: F)
+    where
+        F: Fn(crate::error::DHTError) + Send + Sync + 'static,
+    {
+        *self.on_error_cb.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
+    }
+
+    fn emit_error(&self, error: crate::error::DHTError) {
+        if let Ok(cb) = self.on_error_cb.read() {
+            if let Some(f) = cb.as_ref() {
+                f(error);
+            }
+        }
     }
 
     pub fn get_node_pool_size(&self) -> usize {
@@ -198,7 +216,7 @@ impl DHTServer {
 
         let workers = self.spawn_workers();
         for sock in self.socket_providers.values().cloned() {
-            spawn_udp_listener(sock, workers.clone(), self.shutdown.clone());
+            spawn_udp_listener(sock, workers.clone(), self.shutdown.clone())?;
         }
         self.bootstrap().await;
 
@@ -342,7 +360,9 @@ impl DHTServer {
                         msg = rx.recv() => {
                             match msg {
                                 Some((data, remote_addr, local_addr)) => {
-                                    let _ = server_clone.handle_message(data.as_ref(), remote_addr, local_addr).await;
+                                    if let Err(e) = server_clone.handle_message(data.as_ref(), remote_addr, local_addr).await {
+                                        server_clone.emit_error(e);
+                                    }
                                 }
                                 None => break,
                             }
@@ -478,7 +498,7 @@ impl DHTServer {
             };
             let hash_hex = hex::encode(info_hash_arr);
 
-            let filter_cb = self.filter.read().unwrap().clone();
+            let filter_cb = self.filter.read().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(f) = filter_cb
                 && !f(&hash_hex)
             {
@@ -886,10 +906,14 @@ fn spawn_udp_listener(
     socket: Arc<UdpSocket>,
     mut workers: Vec<WorkerHandle>,
     shutdown: CancellationToken,
-) {
-    let local_addr = socket.local_addr().expect("socket to have IP address");
+) -> crate::error::Result<()> {
+    let local_addr = socket
+        .local_addr()
+        .map_err(|e| crate::error::DHTError::Init(format!("socket 无法获取本地地址: {e}")))?;
     if workers.is_empty() {
-        panic!("No worker supplied for UDP reader")
+        return Err(crate::error::DHTError::Init(
+            "spawn_udp_listener: 未提供任何 worker".to_string(),
+        ));
     }
     tokio::spawn(async move {
         let mut buffer = [0u8; 65536];
@@ -922,6 +946,7 @@ fn spawn_udp_listener(
             }
         }
     });
+    Ok(())
 }
 
 enum ProcessUdpPacketError {

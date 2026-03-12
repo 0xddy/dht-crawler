@@ -22,11 +22,13 @@ async fn main() -> Result<()> {
     // 初始化 Prometheus metrics 导出器
     #[cfg(feature = "metrics")]
     {
-        let addr: SocketAddr = "0.0.0.0:9000".parse().expect("无效的地址");
+        let addr: SocketAddr = "0.0.0.0:9000"
+            .parse()
+            .map_err(|e| DHTError::Init(format!("无效的 metrics 监听地址: {e}")))?;
         PrometheusBuilder::new()
             .with_http_listener(addr)
             .install()
-            .expect("无法安装 Prometheus metrics 导出器");
+            .map_err(|e| DHTError::Init(format!("无法安装 Prometheus metrics 导出器: {e}")))?;
         log::info!("📊 Prometheus metrics 导出器已启动，访问 http://localhost:9000/metrics");
     }
 
@@ -48,6 +50,11 @@ async fn main() -> Result<()> {
     let server = DHTServer::new(options.clone()).await?;
 
     log::info!("🚀 DHT Server 启动，监听端口: {}", options.port);
+
+    // 注册错误回调，将运行时错误输出而不是 panic
+    server.on_error(|err| {
+        log::error!("DHT 运行时错误: {}", err);
+    });
 
     // 设置 torrent 回调
     server.on_torrent(move |_torrent| {

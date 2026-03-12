@@ -1,6 +1,6 @@
 [package]
 name = "dht-crawler"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["桥下红药 <1121744186@qq.com>"]
 description = "高性能的 Rust DHT (Distributed Hash Table) 爬虫库 | A high-performance Rust DHT crawler library for fetching torrent information from the BitTorrent DHT network"
@@ -14,6 +14,7 @@ readme = "README.md"
 [lib]
 name = "dht_crawler"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
@@ -32,6 +33,7 @@ ahash = "0.8"
 serde_bytes = "0.11.19"
 metrics = { version = "0.24", optional = true }
 async-channel = "2.5.0"
+jni = { version = "0.21", optional = true }
 
 [dev-dependencies]
 tracing = "0.1"
@@ -46,6 +48,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 default = []
 metrics = ["dep:metrics"]
 mimalloc = []
+jni = ["dep:jni"]
 
 [[example]]
 name = "dht_crawler_example"

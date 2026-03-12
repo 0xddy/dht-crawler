@@ -12,6 +12,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Java fat JAR（平台无关，只需构建一次）
+  # 运行方式：java -Djava.library.path=<so/dll 目录> -jar dht-crawler-jni-example-<ver>.jar
+  # ──────────────────────────────────────────────────────────────────
+  build-java-jar:
+    name: Build Java Example JAR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Build fat JAR
+        working-directory: jni/java
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          gradle shadowJar -PprojectVersion=${{ github.event.inputs.version }} --no-daemon
+        shell: bash
+
+      - name: Upload JAR to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          files: jni/java/build/libs/dht-crawler-jni-example-${{ github.event.inputs.version }}.jar
+
+  # ──────────────────────────────────────────────────────────────────
+  # 各平台 Rust 构建（example 可执行 + JNI so/dll/dylib）
+  # ──────────────────────────────────────────────────────────────────
   build-and-release:
     name: Build and Release for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -26,36 +61,42 @@ jobs:
             os: ubuntu-latest
             use_cross: false
             platform: linux
-            
+            jni_lib: libdht_crawler.so
+
           # Linux x86_64 (MUSL - 静态链接，无依赖)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             platform: linux
-            
+            jni_lib: libdht_crawler.so
+
           # Linux ARM64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
             platform: linux
-            
+            jni_lib: libdht_crawler.so
+
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
             platform: windows
-            
+            jni_lib: dht_crawler.dll
+
           # macOS x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
             use_cross: false
             platform: macos
-            
+            jni_lib: libdht_crawler.dylib
+
           # macOS ARM64 (Apple Silicon)
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
             platform: macos
+            jni_lib: libdht_crawler.dylib
 
     steps:
       - name: Checkout code
@@ -82,12 +123,7 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
-
+      # release 构建不缓存 target 目录，避免占用 GitHub 缓存配额
       - name: Run tests
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
@@ -106,24 +142,25 @@ jobs:
           fi
         shell: bash
 
-      - name: Build
+      - name: Build (example + JNI cdylib)
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics
+            cross build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics,jni
           else
-            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics
+            cargo build --release --target ${{ matrix.target }} --examples --features mimalloc,metrics,jni
           fi
         shell: bash
 
       - name: Get version
         id: get_version
         run: |
-          # 使用用户输入的版本号
           VERSION="${{ github.event.inputs.version }}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
         shell: bash
 
-      - name: Prepare artifacts (Unix)
+      # ────────── example 产物打包 ──────────
+
+      - name: Prepare example artifacts (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release/examples
@@ -131,7 +168,7 @@ jobs:
           mv dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
         shell: bash
 
-      - name: Prepare artifacts (Windows)
+      - name: Prepare example artifacts (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release/examples
@@ -139,9 +176,39 @@ jobs:
           Move-Item dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
         shell: pwsh
 
+      # ────────── JNI 动态库打包（仅含单个 so/dll/dylib，体积最小）──────────
+
+      - name: Prepare JNI artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION=${{ steps.get_version.outputs.version }}
+          TARGET=${{ matrix.target }}
+          LIB=${{ matrix.jni_lib }}
+          WORKDIR=$(mktemp -d)
+          cp target/${TARGET}/release/${LIB} ${WORKDIR}/
+          cd ${WORKDIR}
+          zip dht_crawler_jni-${VERSION}-${TARGET}.zip ${LIB}
+          mv dht_crawler_jni-${VERSION}-${TARGET}.zip ${{ github.workspace }}/
+        shell: bash
+
+      - name: Prepare JNI artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $VERSION = "${{ steps.get_version.outputs.version }}"
+          $TARGET  = "${{ matrix.target }}"
+          $LIB     = "${{ matrix.jni_lib }}"
+          $SRC     = "target\$TARGET\release\$LIB"
+          $OUT     = "dht_crawler_jni-$VERSION-$TARGET.zip"
+          7z a $OUT $SRC
+          Move-Item $OUT ${{ github.workspace }}\
+        shell: pwsh
+
+      # ────────── 上传到 Release ──────────
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.event.inputs.version }}
           files: |
             dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.*
+            dht_crawler_jni-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip

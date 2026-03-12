@@ -90,10 +90,10 @@ impl ShardedNodeQueue {
         let shard_idx = self.addr_to_shard(&node.addr);
 
         if node.addr.is_ipv6() {
-            let mut shard = self.shards_v6[shard_idx].lock().unwrap();
+            let mut shard = self.shards_v6[shard_idx].lock().unwrap_or_else(|e| e.into_inner());
             shard.push(node);
         } else {
-            let mut shard = self.shards_v4[shard_idx].lock().unwrap();
+            let mut shard = self.shards_v4[shard_idx].lock().unwrap_or_else(|e| e.into_inner());
             shard.push(node);
         }
     }
@@ -109,7 +109,7 @@ impl ShardedNodeQueue {
                     if result.len() >= count {
                         break;
                     }
-                    let mut s = shard.lock().unwrap();
+                    let mut s = shard.lock().unwrap_or_else(|e| e.into_inner());
                     let nodes = s.pop_batch(per_shard);
                     result.extend(nodes);
                 }
@@ -119,7 +119,7 @@ impl ShardedNodeQueue {
                     if result.len() >= count {
                         break;
                     }
-                    let mut s = shard.lock().unwrap();
+                    let mut s = shard.lock().unwrap_or_else(|e| e.into_inner());
                     let nodes = s.pop_batch(per_shard);
                     result.extend(nodes);
                 }
@@ -130,7 +130,7 @@ impl ShardedNodeQueue {
                         break;
                     }
 
-                    let mut s4 = self.shards_v4[i].lock().unwrap();
+                    let mut s4 = self.shards_v4[i].lock().unwrap_or_else(|e| e.into_inner());
                     let nodes4 = s4.pop_batch(per_shard / 2);
                     result.extend(nodes4);
                     drop(s4);
@@ -139,7 +139,7 @@ impl ShardedNodeQueue {
                         break;
                     }
 
-                    let mut s6 = self.shards_v6[i].lock().unwrap();
+                    let mut s6 = self.shards_v6[i].lock().unwrap_or_else(|e| e.into_inner());
                     let nodes6 = s6.pop_batch(per_shard / 2);
                     result.extend(nodes6);
                     drop(s6);
@@ -185,7 +185,7 @@ impl ShardedNodeQueue {
                     break;
                 }
 
-                let s = shard.lock().unwrap();
+                let s = shard.lock().unwrap_or_else(|e| e.into_inner());
                 let shard_len = s.queue.len();
 
                 if shard_len == 0 {
@@ -214,7 +214,7 @@ impl ShardedNodeQueue {
             let mut seen = 0usize;
 
             for shard in shards {
-                let s = shard.lock().unwrap();
+                let s = shard.lock().unwrap_or_else(|e| e.into_inner());
 
                 for node in s.queue.iter() {
                     seen += 1;
@@ -238,12 +238,12 @@ impl ShardedNodeQueue {
         let len_v4: usize = self
             .shards_v4
             .iter()
-            .map(|shard| shard.lock().unwrap().len())
+            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).len())
             .sum();
         let len_v6: usize = self
             .shards_v6
             .iter()
-            .map(|shard| shard.lock().unwrap().len())
+            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).len())
             .sum();
         len_v4 + len_v6
     }
@@ -252,11 +252,11 @@ impl ShardedNodeQueue {
         let empty_v4 = self
             .shards_v4
             .iter()
-            .all(|shard| shard.lock().unwrap().is_empty());
+            .all(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         let empty_v6 = self
             .shards_v6
             .iter()
-            .all(|shard| shard.lock().unwrap().is_empty());
+            .all(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         empty_v4 && empty_v6
     }
 
@@ -265,11 +265,11 @@ impl ShardedNodeQueue {
             Some(true) => self
                 .shards_v6
                 .iter()
-                .all(|shard| shard.lock().unwrap().is_empty()),
+                .all(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).is_empty()),
             Some(false) => self
                 .shards_v4
                 .iter()
-                .all(|shard| shard.lock().unwrap().is_empty()),
+                .all(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).is_empty()),
             None => self.is_empty(),
         }
     }
