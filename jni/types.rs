@@ -8,7 +8,6 @@ use jni::sys::jlong;
 // ──────────────────────────────────────────────────────────────────────────────
 const CLASS_TORRENT_INFO: &str = "cn/lmcw/dht/model/TorrentInfo";
 const CLASS_FILE_INFO: &str = "cn/lmcw/dht/model/FileInfo";
-const CLASS_DHT_OPTIONS: &str = "cn/lmcw/dht/model/DHTOptions";
 const CLASS_ARRAY_LIST: &str = "java/util/ArrayList";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -22,12 +21,6 @@ pub fn rust_str_to_jstring<'local>(
 ) -> jni::errors::Result<JObject<'local>> {
     let js: JString<'local> = env.new_string(s)?;
     Ok(js.into())
-}
-
-/// Java String（JObject）→ Rust String
-pub fn jstring_to_rust(env: &mut JNIEnv, obj: &JObject) -> jni::errors::Result<String> {
-    let jstr = JString::from(env.new_local_ref(obj)?);
-    Ok(env.get_string(&jstr)?.into())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

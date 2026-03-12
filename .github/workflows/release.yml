@@ -64,14 +64,6 @@ jobs:
             jni_lib: libdht_crawler.so
             build_features: mimalloc,metrics,jni
 
-          # Linux x86_64 (MUSL - 静态链接，无依赖)
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            platform: linux
-            jni_lib: libdht_crawler.so
-            build_features: mimalloc,metrics,jni
-
           # Linux ARM64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
@@ -190,13 +182,14 @@ jobs:
         if: contains(matrix.target, 'windows')
         run: |
           cd target/${{ matrix.target }}/release/examples
-          zip dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip dht_crawler_example.exe
-          mv dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip ${{ github.workspace }}/
-        shell: bash
+          Compress-Archive -Path dht_crawler_example.exe -DestinationPath dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip
+          Move-Item -Path dht_crawler_example-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip -Destination ${{ github.workspace }}/
+        shell: pwsh
 
       # ────────── JNI 动态库打包（仅含单个 so/dll/dylib，体积最小）──────────
 
-      - name: Prepare JNI artifacts
+      - name: Prepare JNI artifacts (Linux/macOS)
+        if: "!contains(matrix.target, 'windows')"
         run: |
           VERSION=${{ steps.get_version.outputs.version }}
           TARGET=${{ matrix.target }}
@@ -207,6 +200,19 @@ jobs:
           zip dht_crawler_jni-${VERSION}-${TARGET}.zip ${LIB}
           mv dht_crawler_jni-${VERSION}-${TARGET}.zip ${{ github.workspace }}/
         shell: bash
+
+      - name: Prepare JNI artifacts (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          $VERSION = "${{ steps.get_version.outputs.version }}"
+          $TARGET = "${{ matrix.target }}"
+          $LIB = "${{ matrix.jni_lib }}"
+          $WORKDIR = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path $_.FullName }
+          Copy-Item "target/$TARGET/release/$LIB" -Destination $WORKDIR.FullName
+          Set-Location $WORKDIR.FullName
+          Compress-Archive -Path $LIB -DestinationPath "dht_crawler_jni-$VERSION-$TARGET.zip"
+          Move-Item -Path "dht_crawler_jni-$VERSION-$TARGET.zip" -Destination "${{ github.workspace }}/"
+        shell: pwsh
 
       # ────────── 上传到 Release ──────────
 

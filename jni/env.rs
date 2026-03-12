@@ -1,5 +1,5 @@
 use jni::{JavaVM, JNIEnv};
-use jni::objects::{JObject, JValue};
+use jni::objects::JObject;
 use std::sync::{Arc, Mutex};
 
 /// 跨线程安全的 Java 回调持有者。
@@ -39,19 +39,6 @@ impl JavaCallback {
             }
         }
         result
-    }
-
-    /// 调用 Java listener 的方法（用于简单通知）。
-    pub fn call_void_method(
-        &self,
-        method_name: &str,
-        sig: &str,
-        args: &[JValue],
-    ) -> jni::errors::Result<()> {
-        self.with_env(|env, obj| {
-            env.call_method(obj, method_name, sig, args)?;
-            Ok(())
-        })
     }
 }
 
