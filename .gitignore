@@ -18,3 +18,7 @@ torrents/
 
 # 个人脚本（不提交到仓库）
 scripts/
+
+# Java / Gradle（examples-jni）
+examples-jni/build/
+examples-jni/.gradle/

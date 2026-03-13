@@ -24,10 +24,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public class DhtCrawlerExample {
 
     public static void main(String[] args) throws InterruptedException {
-        // 1. 构造配置
         DHTOptions options = new DHTOptions()
                 .setPort(6881)
-                .setNetMode(0)              // 0 = IPv4 Only
+                .setNetMode(0)
                 .setMetadataTimeout(5L)
                 .setMaxMetadataQueueSize(50_000)
                 .setMaxMetadataWorkerCount(500);
@@ -35,7 +34,6 @@ public class DhtCrawlerExample {
         AtomicLong torrentCount = new AtomicLong();
         CountDownLatch shutdown = new CountDownLatch(1);
 
-        // 2. 实现回调
         DhtListener listener = new DhtListener() {
             @Override
             public void onTorrent(TorrentInfo info) {
@@ -49,34 +47,29 @@ public class DhtCrawlerExample {
             public void onError(String message) {
                 System.err.println("[ERROR] " + message);
             }
+
+            @Override
+            public boolean onMetadataFetch(String infoHash) {
+                return true;
+            }
         };
 
-        // 3. 创建并启动服务器
-        long handle = DhtCrawlerJni.createServer(options, listener);
-        if (handle == 0) {
-            System.err.println("创建服务器失败");
-            return;
-        }
-        System.out.println("DHT 服务器已创建，正在启动...");
-        DhtCrawlerJni.startServer(handle);
-        System.out.println("DHT 服务器已启动，端口 " + options.getPort());
+        final DhtCrawler crawler = DhtCrawler.createServer(options, listener);
+        crawler.start();
+        System.out.println("DHT 已启动，端口 " + options.getPort());
 
-        // 4. 注册 JVM 关闭钩子，确保资源释放
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\n收到退出信号，正在停止...");
-            DhtCrawlerJni.stopServer(handle);
-            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-            DhtCrawlerJni.destroyServer(handle);
-            System.out.println("服务器已销毁，共发现种子：" + torrentCount.get());
+            crawler.stop();
+            System.out.println("已关闭，共发现种子：" + torrentCount.get());
             shutdown.countDown();
         }));
 
-        // 5. 定期打印节点池大小
         System.out.println("按 Ctrl+C 退出。每 10 秒打印一次节点池大小...");
         while (true) {
             Thread.sleep(10_000);
-            int poolSize = DhtCrawlerJni.getNodePoolSize(handle);
-            System.out.println("节点池大小: " + poolSize + "  已发现种子: " + torrentCount.get());
+            System.out.println("节点池: " + crawler.getNodePoolSize()
+                    + "  已发现种子: " + torrentCount.get());
         }
     }
 }

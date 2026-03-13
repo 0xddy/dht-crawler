@@ -6,16 +6,14 @@
 
 ```
 examples-jni/
-├── build.gradle                        # Gradle 构建脚本
+├── build.gradle
 ├── settings.gradle
 └── src/main/java/cn/lmcw/dht/
-    ├── model/
-    │   ├── TorrentInfo.java            # 与 Rust TorrentInfo 一一对应
-    │   ├── FileInfo.java               # 与 Rust FileInfo 一一对应
-    │   └── DHTOptions.java             # 与 Rust DHTOptions 一一对应
-    ├── DhtListener.java                # 事件回调接口
-    ├── DhtCrawlerJni.java              # JNI 绑定类（native 方法声明）
-    └── DhtCrawlerExample.java          # 可运行示例
+    ├── model/          # DHTOptions, TorrentInfo, FileInfo
+    ├── DhtCrawler.java      # 面向对象入口（推荐）
+    ├── DhtCrawlerJni.java # 包内 native 绑定
+    ├── DhtListener.java
+    └── DhtCrawlerExample.java
 ```
 
 ## 快速开始
@@ -33,8 +31,8 @@ examples-jni/
 # Linux / macOS
 java -Djava.library.path=. -jar dht-crawler-jni-example-<version>.jar
 
-# Windows（将 dht_crawler.dll 放在同目录）
-java -Djava.library.path=. -jar dht-crawler-jni-example-<version>.jar
+# Windows（PowerShell/CMD 需对 -D 参数加引号，否则会报找不到主类）
+java "-Djava.library.path=." -jar dht-crawler-jni-example-<version>.jar
 ```
 
 ### 方式二：从源码编译并运行
@@ -44,7 +42,6 @@ java -Djava.library.path=. -jar dht-crawler-jni-example-<version>.jar
 在仓库**根目录**执行：
 
 ```bash
-# 本机（Linux 产出 libdht_crawler.so，Windows 产出 dht_crawler.dll，macOS 产出 libdht_crawler.dylib）
 cargo build --release --features jni
 ```
 
@@ -55,10 +52,7 @@ cargo build --release --features jni
 在本目录（`examples-jni/`）执行：
 
 ```bash
-# 使用默认库路径（../target/release）
 gradle run
-
-# 自定义库路径
 gradle run -Plib.path=/path/to/your/lib
 ```
 
@@ -66,28 +60,28 @@ gradle run -Plib.path=/path/to/your/lib
 
 ```bash
 gradle shadowJar
-# 产物：build/libs/dht-crawler-jni-example-<version>.jar
 ```
 
 ## 在自己的项目中集成
 
-1. 将 `src/main/java/cn/lmcw/dht/` 下的文件复制到你的项目。
-2. 将对应平台的 so/dll/dylib 放入 `java.library.path` 可访问的目录。
-3. 确保 JVM 启动时加了 `-Djava.library.path=<路径>`。
+1. 复制 `cn/lmcw/dht/` 下源码（含 `model/`、`DhtCrawler`、`DhtCrawlerJni`、`DhtListener`）。
+2. 将对应平台的 so/dll/dylib 放入 `java.library.path`。
 
-## JNI 生命周期
+## API（面向对象）
 
 ```java
-DHTOptions options = new DHTOptions().setPort(6881);
-long handle = DhtCrawlerJni.createServer(options, listener);
-DhtCrawlerJni.startServer(handle);
-// ... 运行 ...
-DhtCrawlerJni.stopServer(handle);
-DhtCrawlerJni.destroyServer(handle); // 必须调用，释放 Rust 资源
+DhtCrawler crawler = DhtCrawler.createServer(options, listener);
+crawler.start();
+// ...
+crawler.stop();   // 或 try-with-resources
 ```
+
+- **`DhtCrawler.createServer(options, listener)`**：创建会话（未启动 DHT；Java 不能用方法名 `new`，故不用 `open`）。
+- **`start()`**：后台启动 DHT，非阻塞；同一会话多次 `start()` 仅首次生效。
+- **`stop()` / `close()`**：停止并释放 Rust 资源，幂等。
+- **`getNodePoolSize()`**：routing table 节点数。
 
 ## 注意事项
 
-- `destroyServer` 必须在不再使用后调用，否则 Rust 侧的 tokio runtime 和连接不会释放。
-- 回调方法（`onTorrent`、`onError`）在 Rust 的 tokio 工作线程中触发，请确保实现是线程安全的。
-- 同一个句柄不要在多个线程中并发调用 `destroyServer`。
+- 回调在 Rust 工作线程触发，实现需线程安全。
+- `onMetadataFetch` 在阻塞线程池调用，宜快速返回。

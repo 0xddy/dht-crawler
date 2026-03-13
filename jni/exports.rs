@@ -83,7 +83,8 @@ pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_startServer(
     });
 }
 
-/// 停止 DHTServer（发送关闭信号，不释放资源）。
+/// 停止并销毁 DHTServer：发关闭信号后释放 tokio runtime 等全部 Rust 资源。
+/// 调用后句柄失效，勿再传入任何 native 方法。
 ///
 /// Java 签名：`native void stopServer(long handle);`
 #[unsafe(no_mangle)]
@@ -92,38 +93,21 @@ pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_stopServer(
     _class: JClass,
     handle: jlong,
 ) {
-    crate::jni_catch!(&mut env, (), {
-        let h = unsafe {
+    jni_shutdown_and_release(&mut env, handle);
+}
+
+fn jni_shutdown_and_release(env: &mut JNIEnv, handle: jlong) {
+    crate::jni_catch!(env, (), {
+        if handle == 0 {
+            return;
+        }
+        unsafe {
             match handle_ref(handle) {
-                Some(h) => h,
+                Some(h) => h.stop(),
                 None => {
                     let _ = env.throw_new("java/lang/IllegalArgumentException", "无效的服务器句柄");
                     return;
                 }
-            }
-        };
-        h.stop();
-    });
-}
-
-/// 销毁 DHTServer：停止并释放所有 Rust 资源（包括 tokio runtime）。
-/// 调用后 Java 侧不得再使用该句柄。
-///
-/// Java 签名：`native void destroyServer(long handle);`
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_destroyServer(
-    mut env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-) {
-    crate::jni_catch!(&mut env, (), {
-        if handle == 0 {
-            return;
-        }
-        // 先停止，再释放
-        unsafe {
-            if let Some(h) = handle_ref(handle) {
-                h.stop();
             }
             destroy_handle(handle);
         }
