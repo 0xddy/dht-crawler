@@ -34,9 +34,29 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// 发送关闭信号（非阻塞）。
+    /// 发送关闭信号（非阻塞）。仅供单独使用，通常应调用 `shutdown_and_destroy_in_background`。
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.server.shutdown();
+    }
+
+    /// 在专用后台线程中 drop 整个 handle（含 Runtime），
+    /// 避免 Runtime::drop 阻塞 JNI 调用线程。
+    /// 先发关闭信号，然后把 handle 所有权移入后台线程；
+    /// 后台线程等待 tokio runtime 中所有任务退出后统一释放资源。
+    pub fn shutdown_and_destroy_in_background(self) {
+        self.server.shutdown();
+        if let Err(e) = std::thread::Builder::new()
+            .name("dht-jni-shutdown".to_owned())
+            .spawn(move || {
+                // drop(self) 在此发生：Runtime::drop 阻塞等待所有 tokio 任务退出
+                // 但此时已在独立线程，不会卡 JNI 调用线程
+                drop(self);
+            })
+        {
+            // 线程创建失败（极罕见），fallback 在当前线程同步释放，保底不泄漏
+            log::error!("dht-jni-shutdown 线程创建失败，在当前线程同步释放: {e}");
+        }
     }
 
     /// 返回节点池大小。
@@ -65,10 +85,25 @@ pub unsafe fn handle_ref<'a>(ptr: i64) -> Option<&'a ServerHandle> {
     Some(unsafe { &*(ptr as *const ServerHandle) })
 }
 
+/// 消费句柄：从裸指针重建 Box 并返回 `ServerHandle` 所有权。
+/// 调用后 Java 侧不得再使用该句柄。
+///
+/// # Safety
+/// 只能调用一次；ptr 必须是由 `into_handle_ptr` 生成的合法指针。
+pub unsafe fn take_handle(ptr: i64) -> Option<ServerHandle> {
+    if ptr == 0 {
+        return None;
+    }
+    Some(*unsafe { Box::from_raw(ptr as *mut ServerHandle) })
+}
+
 /// 消费句柄：从裸指针重建 Box 并 drop，释放所有资源（包括 runtime）。
+/// 注意：会阻塞当前线程直到 Runtime 中所有任务退出。
+/// 通常应优先使用 `take_handle` + `shutdown_and_destroy_in_background`。
 ///
 /// # Safety
 /// 只能调用一次，调用后 Java 侧不得再使用该句柄。
+#[allow(dead_code)]
 pub unsafe fn destroy_handle(ptr: i64) {
     if ptr != 0 {
         drop(unsafe { Box::from_raw(ptr as *mut ServerHandle) });

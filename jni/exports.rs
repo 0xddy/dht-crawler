@@ -1,6 +1,6 @@
 use crate::jni_bindings::callbacks::register_callbacks;
 use crate::jni_bindings::env::JavaCallback;
-use crate::jni_bindings::server::{destroy_handle, handle_ref, into_handle_ptr, ServerHandle};
+use crate::jni_bindings::server::{handle_ref, into_handle_ptr, take_handle, ServerHandle};
 use crate::jni_bindings::types::java_to_dht_options_or_default;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject};
@@ -102,14 +102,12 @@ fn jni_shutdown_and_release(env: &mut JNIEnv, handle: jlong) {
             return;
         }
         unsafe {
-            match handle_ref(handle) {
-                Some(h) => h.stop(),
+            match take_handle(handle) {
+                Some(h) => h.shutdown_and_destroy_in_background(),
                 None => {
                     let _ = env.throw_new("java/lang/IllegalArgumentException", "无效的服务器句柄");
-                    return;
                 }
             }
-            destroy_handle(handle);
         }
     });
 }
