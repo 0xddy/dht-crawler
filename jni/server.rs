@@ -1,4 +1,4 @@
-use crate::{DHTServer, DHTOptions};
+use crate::{DHTOptions, DHTServer};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 

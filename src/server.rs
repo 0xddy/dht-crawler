@@ -1,62 +1,261 @@
+use crate::addr::is_valid_node_addr;
+use crate::budget::RateBucket;
+use crate::crawl_config::ResolvedCrawlConfig;
+use crate::crawl_engine::CrawlEngine;
 use crate::error::Result;
+use crate::krpc::encode_response;
 use crate::metadata::RbitFetcher;
-use crate::protocol::{DhtArgs, DhtMessage, DhtResponse};
-use crate::scheduler::MetadataScheduler;
-use crate::sharded::{NodeTuple, ShardedNodeQueue};
-use crate::types::{DHTOptions, NetMode, TorrentInfo};
+use crate::node_id::{neighbor_node_id, random_node_id, transaction_id_from_bytes};
+use crate::protocol::{DhtArgs, DhtMessage};
+use crate::runtime_stats::{DhtRuntimeLimits, DhtRuntimeStats};
+use crate::scheduler::{
+    MetadataCompletionCallback, MetadataFetchCallback, MetadataScheduler,
+    MetadataSchedulerCallbacks, MetadataSchedulerLimits, TorrentAckCallback,
+};
+use crate::types::{DHTOptions, MetadataFetchCompletion, NetMode, NodeTuple, TorrentInfo};
+use crate::udp_buffer::UdpBufferPool;
+use crate::udp_ingress::{WorkerHandle, spawn_udp_listener};
+use ahash::AHashMap;
+use arc_swap::ArcSwapOption;
+use bytes::BytesMut;
 #[cfg(feature = "metrics")]
-use metrics::{counter, gauge};
+use metrics::counter;
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const BOOTSTRAP_NODES: &[&str] = &[
-    "router.bittorrent.com:6881",
-    "dht.transmissionbt.com:6881",
-    "router.utorrent.com:6881",
-    "dht.aelitis.com:6881",
-];
+type FilterCallback = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+type ErrorCallback = Box<dyn Fn(crate::error::DHTError) + Send + Sync + 'static>;
 
-pub type BoxedBoolFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
-pub type MetadataFetchCallback = Arc<dyn Fn(String) -> BoxedBoolFuture + Send + Sync>;
-type WorkerHandle = mpsc::Sender<(Box<[u8]>, SocketAddr, SocketAddr)>;
+struct QueryResponse<'a> {
+    transaction_id: &'a [u8],
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+    query_type: &'a str,
+    sender_id: Option<&'a [u8]>,
+    target_id: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceResponseWindow {
+    started_at: Instant,
+    last_seen: Instant,
+    count: u32,
+}
+
+struct WorkerResponseLimiter {
+    regular_packets: RateBucket,
+    regular_bytes: RateBucket,
+    priority_packets: RateBucket,
+    priority_bytes: RateBucket,
+    per_source_rate: u32,
+    sources: AHashMap<SocketAddr, SourceResponseWindow>,
+    source_expiry: VecDeque<(Instant, SocketAddr)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsePermit {
+    Regular,
+    PriorityReserve,
+    Rejected,
+}
+
+fn reserve_quota(total: u32) -> u32 {
+    if total == 0 {
+        0
+    } else {
+        total.div_ceil(10).min(total)
+    }
+}
+
+impl WorkerResponseLimiter {
+    fn new(packet_rate: u32, byte_rate: u64, per_source_rate: u32, now: Instant) -> Self {
+        let byte_rate = byte_rate.min(u32::MAX as u64) as u32;
+        let priority_packet_rate = reserve_quota(packet_rate);
+        let priority_byte_rate = reserve_quota(byte_rate);
+        let packet_rate = packet_rate.saturating_sub(priority_packet_rate);
+        let byte_rate = byte_rate.saturating_sub(priority_byte_rate);
+        Self {
+            regular_packets: RateBucket::per_second(
+                packet_rate,
+                packet_rate.div_ceil(5).max(1),
+                true,
+                now,
+            ),
+            regular_bytes: RateBucket::per_second(
+                byte_rate,
+                byte_rate.div_ceil(5).max(512),
+                true,
+                now,
+            ),
+            priority_packets: RateBucket::per_second(
+                priority_packet_rate,
+                priority_packet_rate.div_ceil(5).max(1),
+                true,
+                now,
+            ),
+            priority_bytes: RateBucket::per_second(
+                priority_byte_rate,
+                priority_byte_rate.div_ceil(5).max(512),
+                true,
+                now,
+            ),
+            per_source_rate,
+            sources: AHashMap::new(),
+            source_expiry: VecDeque::new(),
+        }
+    }
+
+    fn acquire(
+        &mut self,
+        addr: SocketAddr,
+        encoded_len: usize,
+        is_priority: bool,
+        now: Instant,
+    ) -> ResponsePermit {
+        self.expire_sources(now);
+        if Self::take_budget(
+            &mut self.regular_packets,
+            &mut self.regular_bytes,
+            encoded_len,
+            now,
+        ) {
+            if self.acquire_source_slot(addr, now) {
+                return ResponsePermit::Regular;
+            }
+            Self::refund_budget(
+                &mut self.regular_packets,
+                &mut self.regular_bytes,
+                encoded_len,
+            );
+            return ResponsePermit::Rejected;
+        }
+
+        if is_priority
+            && Self::take_budget(
+                &mut self.priority_packets,
+                &mut self.priority_bytes,
+                encoded_len,
+                now,
+            )
+        {
+            if self.acquire_source_slot(addr, now) {
+                return ResponsePermit::PriorityReserve;
+            }
+            Self::refund_budget(
+                &mut self.priority_packets,
+                &mut self.priority_bytes,
+                encoded_len,
+            );
+        }
+
+        ResponsePermit::Rejected
+    }
+
+    fn take_budget(
+        packets: &mut RateBucket,
+        bytes: &mut RateBucket,
+        encoded_len: usize,
+        now: Instant,
+    ) -> bool {
+        if !packets.try_take_one(now) {
+            return false;
+        }
+        if !bytes.try_take_exact(encoded_len, now) {
+            packets.refund_one();
+            return false;
+        }
+        true
+    }
+
+    fn refund_budget(packets: &mut RateBucket, bytes: &mut RateBucket, encoded_len: usize) {
+        packets.refund_one();
+        bytes.refund(encoded_len);
+    }
+
+    fn acquire_source_slot(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        if self.per_source_rate == 0 {
+            return false;
+        }
+
+        let entry = self.sources.entry(addr).or_insert(SourceResponseWindow {
+            started_at: now,
+            last_seen: now,
+            count: 0,
+        });
+        if now
+            .checked_duration_since(entry.started_at)
+            .unwrap_or_default()
+            >= Duration::from_secs(1)
+        {
+            entry.started_at = now;
+            entry.count = 0;
+        }
+        if entry.count >= self.per_source_rate {
+            return false;
+        }
+        entry.count += 1;
+        entry.last_seen = now;
+        self.source_expiry
+            .push_back((now + Duration::from_secs(60), addr));
+        true
+    }
+
+    fn expire_sources(&mut self, now: Instant) {
+        while let Some((deadline, addr)) = self.source_expiry.front().copied() {
+            if deadline > now {
+                break;
+            }
+            self.source_expiry.pop_front();
+            if self.sources.get(&addr).is_some_and(|entry| {
+                now.checked_duration_since(entry.last_seen)
+                    .unwrap_or_default()
+                    >= Duration::from_secs(60)
+            }) {
+                self.sources.remove(&addr);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
+/// InfoHash and announcing Peer submitted to the Metadata scheduler.
 pub struct HashDiscovered {
+    /// Lowercase hexadecimal InfoHash.
     pub info_hash: String,
+    /// Peer endpoint derived from announce `port`/`implied_port`.
     pub peer_addr: SocketAddr,
+    /// Monotonic discovery time used for freshness and queue ordering.
     pub discovered_at: std::time::Instant,
 }
 
-type TorrentCallback = Arc<dyn Fn(TorrentInfo) + Send + Sync>;
-type FilterCallback = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-type ErrorCallback = Arc<dyn Fn(crate::error::DHTError) + Send + Sync>;
-
 #[derive(Clone)]
+/// Cloneable BEP-5 server handle and primary crate entry point.
 pub struct DHTServer {
-    #[allow(dead_code)]
     options: DHTOptions,
+    crawl_config: ResolvedCrawlConfig,
     node_id: [u8; 20],
-    socket_providers: Arc<HashMap<SocketAddr, Arc<UdpSocket>>>,
+    sockets_by_bind_addr: Arc<HashMap<SocketAddr, Arc<UdpSocket>>>,
     token_secret: [u8; 10],
-    callback: Arc<RwLock<Option<TorrentCallback>>>,
-    filter: Arc<RwLock<Option<FilterCallback>>>,
-    on_metadata_fetch: Arc<RwLock<Option<MetadataFetchCallback>>>,
-    on_error_cb: Arc<RwLock<Option<ErrorCallback>>>,
-    node_queue: Arc<ShardedNodeQueue>,
-    hash_tx: mpsc::Sender<HashDiscovered>,
+    torrent_callback: Arc<ArcSwapOption<TorrentAckCallback>>,
+    hash_filter: Arc<ArcSwapOption<FilterCallback>>,
+    on_metadata_fetch: Arc<ArcSwapOption<MetadataFetchCallback>>,
+    metadata_completion_callback: Arc<ArcSwapOption<MetadataCompletionCallback>>,
+    error_callback: Arc<ArcSwapOption<ErrorCallback>>,
+    crawl_engine: Arc<CrawlEngine>,
+    hash_events_tx: mpsc::Sender<HashDiscovered>,
     metadata_queue_len: Arc<AtomicUsize>,
     max_metadata_queue_size: usize,
+    runtime_stats: DhtRuntimeStats,
     shutdown: CancellationToken,
 }
 
@@ -71,298 +270,325 @@ fn create_udp_sock(domain: Domain, ty: Type, addr: SocketAddr) -> std::io::Resul
     }
     let _ = sock.set_reuse_address(true);
     sock.set_nonblocking(true)?;
-
     let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
     let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
-
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
 }
 
+fn split_u32_quota(total: u32, workers: usize, worker: usize) -> u32 {
+    let workers = workers.max(1) as u32;
+    total / workers + u32::from((worker as u32) < total % workers)
+}
+
+fn split_u64_quota(total: u64, workers: usize, worker: usize) -> u64 {
+    let workers = workers.max(1) as u64;
+    total / workers + u64::from((worker as u64) < total % workers)
+}
+
 impl DHTServer {
+    /// Validates options, binds configured UDP sockets and constructs bounded pipelines.
+    ///
+    /// Background Metadata scheduling begins during construction. Active crawling and UDP receive
+    /// loops begin when [`Self::start`] is awaited.
     pub async fn new(options: DHTOptions) -> Result<Self> {
+        let crawl_config = ResolvedCrawlConfig::from_options(&options.crawl);
+        let runtime_stats = DhtRuntimeStats::with_limits(DhtRuntimeLimits {
+            metadata_queue: options.metadata.max_queue_size.max(1),
+            node_pool: crawl_config.pool_capacity,
+            node_pool_low_watermark: crawl_config.low_watermark,
+            find_node_in_flight: crawl_config.max_in_flight,
+            initial_find_node_rate: crawl_config.max_find_node_rate_per_sec,
+            hash_ingress_queue: options.hash_queue_capacity,
+            crawl_priority_queue: crawl_config.priority_event_channel_capacity,
+            crawl_discovery_queue: crawl_config.discovery_event_channel_capacity,
+        });
         const ANY_V4_ADDR: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080);
         const ANY_V6_ADDR: SocketAddr =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 8080);
-        let mut socket_providers = HashMap::new();
-        // TODO: Check address reachability
+
+        let mut sockets_by_bind_addr = HashMap::new();
         match options.netmode {
             NetMode::Ipv4Only => {
                 let mut addr = ANY_V4_ADDR;
                 addr.set_port(options.port);
                 let sock = create_udp_sock(Domain::IPV4, Type::DGRAM, addr)?;
-                socket_providers.insert(addr, Arc::new(sock));
+                sockets_by_bind_addr.insert(addr, Arc::new(sock));
             }
             NetMode::Ipv6Only => {
                 let mut addr = ANY_V6_ADDR;
                 addr.set_port(options.port);
                 let sock = create_udp_sock(Domain::IPV6, Type::DGRAM, addr)?;
-                socket_providers.insert(addr, Arc::new(sock));
+                sockets_by_bind_addr.insert(addr, Arc::new(sock));
             }
             NetMode::DualStack => {
-                let mut addr = ANY_V4_ADDR;
-                addr.set_port(options.port);
-                let sock = create_udp_sock(Domain::IPV4, Type::DGRAM, addr)?;
-                socket_providers.insert(addr, Arc::new(sock));
-                let mut addr = ANY_V6_ADDR;
-                addr.set_port(options.port);
-                let sock = create_udp_sock(Domain::IPV6, Type::DGRAM, addr)?;
-                socket_providers.insert(addr, Arc::new(sock));
-            }
-        };
+                let mut addr_v4 = ANY_V4_ADDR;
+                addr_v4.set_port(options.port);
+                let sock_v4 = create_udp_sock(Domain::IPV4, Type::DGRAM, addr_v4)?;
+                sockets_by_bind_addr.insert(addr_v4, Arc::new(sock_v4));
 
-        let node_id = generate_random_id();
+                let mut addr_v6 = ANY_V6_ADDR;
+                addr_v6.set_port(options.port);
+                let sock_v6 = create_udp_sock(Domain::IPV6, Type::DGRAM, addr_v6)?;
+                sockets_by_bind_addr.insert(addr_v6, Arc::new(sock_v6));
+            }
+        }
+
+        let node_id = random_node_id();
         let mut token_secret = [0u8; 10];
         rand::thread_rng().fill(&mut token_secret);
 
-        let node_queue = ShardedNodeQueue::new(options.node_queue_capacity);
-
-        let (hash_tx, hash_rx) = mpsc::channel::<HashDiscovered>(options.hash_queue_capacity);
-
-        let fetcher = Arc::new(RbitFetcher::new(options.metadata_timeout));
-
-        let callback = Arc::new(RwLock::new(None));
-        let on_metadata_fetch = Arc::new(RwLock::new(None));
-
+        let (hash_events_tx, hash_rx) =
+            mpsc::channel::<HashDiscovered>(options.hash_queue_capacity);
+        let fetcher = Arc::new(RbitFetcher::new_with_runtime_stats(
+            options.metadata.timeout_secs,
+            options.metadata.peer_failure_cache_capacity,
+            options.metadata.peer_failure_ttl_secs,
+            runtime_stats.clone(),
+        ));
+        let torrent_callback = Arc::new(ArcSwapOption::empty());
+        let on_metadata_fetch = Arc::new(ArcSwapOption::empty());
+        let metadata_completion_callback = Arc::new(ArcSwapOption::empty());
         let metadata_queue_len = Arc::new(AtomicUsize::new(0));
-
         let shutdown = CancellationToken::new();
-        let shutdown_for_scheduler = shutdown.clone();
 
-        let scheduler = MetadataScheduler::new(
+        let scheduler = MetadataScheduler::new_with_runtime_stats(
             hash_rx,
             fetcher,
-            options.max_metadata_queue_size,
-            options.max_metadata_worker_count,
-            callback.clone(),
-            on_metadata_fetch.clone(),
+            MetadataSchedulerLimits {
+                queue_size: options.metadata.max_queue_size,
+                concurrency: options.metadata.max_worker_count,
+            },
+            MetadataSchedulerCallbacks {
+                torrent: torrent_callback.clone(),
+                fetch_gate: on_metadata_fetch.clone(),
+                completion: metadata_completion_callback.clone(),
+            },
             metadata_queue_len.clone(),
-            shutdown_for_scheduler,
+            shutdown.clone(),
+            runtime_stats.clone(),
         );
+        tokio::spawn(scheduler.run());
 
-        tokio::spawn(async move {
-            scheduler.run().await;
-        });
-
-        let max_metadata_queue_size = options.max_metadata_queue_size;
-        let server = Self {
+        let max_metadata_queue_size = options.metadata.max_queue_size;
+        Ok(Self {
             options,
+            crawl_config: crawl_config.clone(),
             node_id,
-            socket_providers: Arc::new(socket_providers),
+            sockets_by_bind_addr: Arc::new(sockets_by_bind_addr),
             token_secret,
-            callback,
+            torrent_callback,
+            hash_filter: Arc::new(ArcSwapOption::empty()),
             on_metadata_fetch,
-            node_queue: Arc::new(node_queue),
-            filter: Arc::new(RwLock::new(None)),
-            on_error_cb: Arc::new(RwLock::new(None)),
-            hash_tx,
+            metadata_completion_callback,
+            error_callback: Arc::new(ArcSwapOption::empty()),
+            crawl_engine: Arc::new(CrawlEngine::new(crawl_config, runtime_stats.clone())),
+            hash_events_tx,
             metadata_queue_len,
             max_metadata_queue_size,
+            runtime_stats,
             shutdown,
-        };
-
-        Ok(server)
+        })
     }
 
+    /// Registers the asynchronous admission gate invoked before the first real Peer attempt.
+    ///
+    /// Returning `false` rejects the job without downloading Metadata and without emitting a
+    /// [`MetadataFetchCompletion`]. If no gate is registered, jobs are admitted.
     pub fn on_metadata_fetch<F, Fut>(&self, callback: F)
     where
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        *self.on_metadata_fetch.write().unwrap_or_else(|e| e.into_inner()) =
-            Some(Arc::new(move |hash| Box::pin(callback(hash))));
+        let callback: Arc<MetadataFetchCallback> =
+            Arc::new(Box::new(move |hash| Box::pin(callback(hash))));
+        self.on_metadata_fetch.store(Some(callback));
     }
 
+    /// Registers a torrent callback whose return is implicitly treated as accepted delivery.
+    ///
+    /// Registering a new torrent callback replaces the previous one.
     pub fn on_torrent<F>(&self, callback: F)
     where
         F: Fn(TorrentInfo) + Send + Sync + 'static,
     {
-        *self.callback.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
+        let callback: Arc<TorrentAckCallback> = Arc::new(Box::new(move |torrent| {
+            callback(torrent);
+            true
+        }));
+        self.torrent_callback.store(Some(callback));
     }
 
+    /// Registers a torrent callback that acknowledges application delivery.
+    ///
+    /// Returning `true` produces [`crate::MetadataFetchCompletionStatus::Accepted`]. Returning
+    /// `false` produces [`crate::MetadataFetchCompletionStatus::DeliveryRejected`]: the Metadata
+    /// download was
+    /// valid, but the application did not accept it. A callback panic is caught and treated as
+    /// rejected delivery. Registering this callback replaces any previous torrent callback.
+    pub fn on_torrent_with_ack<F>(&self, callback: F)
+    where
+        F: Fn(TorrentInfo) -> bool + Send + Sync + 'static,
+    {
+        let callback: Arc<TorrentAckCallback> = Arc::new(Box::new(callback));
+        self.torrent_callback.store(Some(callback));
+    }
+
+    /// Registers a callback invoked exactly once when an admitted Metadata job terminates.
+    ///
+    /// Gate rejection does not emit a completion. `attempts` counts real Peer network attempts;
+    /// failure-cache skips are excluded. Registering a new callback replaces the previous one.
+    pub fn on_metadata_fetch_complete<F>(&self, callback: F)
+    where
+        F: Fn(MetadataFetchCompletion) + Send + Sync + 'static,
+    {
+        let callback: Arc<MetadataCompletionCallback> = Arc::new(Box::new(callback));
+        self.metadata_completion_callback.store(Some(callback));
+    }
+
+    /// Registers an early synchronous InfoHash filter for valid `announce_peer` queries.
+    ///
+    /// Returning `false` prevents the Hash from entering the bounded ingress queue. Registering a
+    /// new filter replaces the previous one.
+    pub fn filter<F>(&self, filter: F)
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        let filter: Arc<FilterCallback> = Arc::new(Box::new(filter));
+        self.hash_filter.store(Some(filter));
+    }
+
+    /// Alias for [`Self::filter`].
     pub fn set_filter<F>(&self, filter: F)
     where
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
-        *self.filter.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(filter));
+        self.filter(filter);
     }
 
+    /// Registers a runtime error callback, replacing any previous callback.
+    ///
+    /// Initialization and `start` errors are still returned through [`Result`].
     pub fn on_error<F>(&self, callback: F)
     where
         F: Fn(crate::error::DHTError) + Send + Sync + 'static,
     {
-        *self.on_error_cb.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
+        let callback: Arc<ErrorCallback> = Arc::new(Box::new(callback));
+        self.error_callback.store(Some(callback));
     }
 
     fn emit_error(&self, error: crate::error::DHTError) {
-        if let Ok(cb) = self.on_error_cb.read() {
-            if let Some(f) = cb.as_ref() {
-                f(error);
-            }
+        if let Some(callback) = self.error_callback.load_full() {
+            callback(error);
         }
     }
 
+    /// Returns the current strict FIFO crawl-pool size.
     pub fn get_node_pool_size(&self) -> usize {
-        self.node_queue.len()
+        self.crawl_engine.node_count.load(Ordering::Relaxed)
     }
 
+    /// Returns a cheap cloneable handle to transport-neutral atomic runtime statistics.
+    pub fn runtime_stats(&self) -> DhtRuntimeStats {
+        self.runtime_stats.clone()
+    }
+
+    /// Starts crawl and UDP background tasks, then waits until [`Self::shutdown`] is called.
+    ///
+    /// A shut-down server cannot be restarted. Construct a new [`DHTServer`] for another run.
     pub async fn start(&self) -> Result<()> {
-        // 检查是否已经被关闭
         if self.shutdown.is_cancelled() {
-            log::warn!("⚠️ 尝试启动已关闭的服务器");
-            return Err(crate::error::DHTError::Other("服务器已关闭".to_string()));
+            return Err(crate::error::DHTError::Other(
+                "DHT server is already shut down".to_string(),
+            ));
         }
 
-        let workers = self.spawn_workers();
-        for sock in self.socket_providers.values().cloned() {
-            spawn_udp_listener(sock, workers.clone(), self.shutdown.clone())?;
+        self.crawl_engine.spawn(
+            self.options.netmode,
+            self.node_id,
+            &self.sockets_by_bind_addr,
+            self.metadata_queue_len.clone(),
+            self.max_metadata_queue_size,
+            self.shutdown.clone(),
+        );
+
+        let buffer_pool = UdpBufferPool::new();
+        let workers = self.spawn_workers(buffer_pool.clone());
+        for sock in self.sockets_by_bind_addr.values().cloned() {
+            spawn_udp_listener(
+                sock,
+                workers.clone(),
+                self.shutdown.clone(),
+                buffer_pool.clone(),
+                self.runtime_stats.clone(),
+            )?;
         }
-        self.bootstrap().await;
 
-        let server = self.clone();
-        let shutdown = self.shutdown.clone();
-
-        tokio::spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(2000));
-            let mut loop_tick = 0;
-
-            loop {
-                // 检查关闭信号
-                if shutdown.is_cancelled() {
-                    #[cfg(debug_assertions)]
-                    log::trace!("主循环收到关闭信号，退出");
-                    break;
-                }
-
-                let queue_len = server.metadata_queue_len.load(Ordering::Relaxed);
-                let queue_pressure = queue_len as f64 / server.max_metadata_queue_size as f64;
-
-                #[cfg(feature = "metrics")]
-                {
-                    gauge!("dht_metadata_queue_size").set(queue_len as f64);
-                    gauge!("dht_metadata_worker_pressure").set(queue_pressure);
-                    gauge!("dht_node_queue_size").set(server.node_queue.len() as f64);
-                }
-
-                let (batch_size, sleep_duration) = if queue_pressure < 0.8 {
-                    (200, Duration::from_millis(10))
-                } else if queue_pressure < 0.95 {
-                    (20, Duration::from_millis(500))
-                } else {
-                    (0, Duration::from_millis(1000))
-                };
-
-                let filter_ipv6 = match server.options.netmode {
-                    NetMode::Ipv4Only => Some(false),
-                    NetMode::Ipv6Only => Some(true),
-                    NetMode::DualStack => None,
-                };
-
-                let queue_empty = server.node_queue.is_empty_for(filter_ipv6);
-
-                let nodes_batch = {
-                    if queue_empty || batch_size == 0 {
-                        None
-                    } else {
-                        Some(server.node_queue.pop_batch(batch_size, filter_ipv6))
-                    }
-                };
-
-                loop_tick += 1;
-                if nodes_batch.is_none() || loop_tick % 50 == 0 {
-                    server.bootstrap().await;
-                    if nodes_batch.is_none() {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => break,
-                            _ = tokio::time::sleep(sleep_duration) => {},
-                        }
-                        continue;
-                    }
-                }
-
-                if let Some(nodes) = nodes_batch {
-                    let node_id = server.node_id;
-
-                    for node in nodes {
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        };
-                        let node_id_clone = node_id;
-                        let socket = match server.socket_for_addr(&node.addr) {
-                            Some(sock) => sock,
-                            None => {
-                                log::warn!("未绑定任何地址");
-                                break;
-                            }
-                        };
-                        let node_addr = node.addr;
-                        let node_id_for_target = node.id;
-
-                        tokio::spawn(async move {
-                            let neighbor_id =
-                                generate_neighbor_target(&node_id_for_target, &node_id_clone);
-                            let random_target = generate_random_id();
-                            let _ = send_find_node_impl(
-                                &node_addr,
-                                &random_target,
-                                &neighbor_id,
-                                socket,
-                            )
-                            .await;
-                            drop(permit);
-                        });
-                    }
-                }
-
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(sleep_duration) => {},
-                }
-            }
-        });
         self.shutdown.cancelled().await;
         Ok(())
     }
 
-    /// 显式关闭服务器，停止所有后台任务
+    /// Cancels UDP, crawl and Metadata tasks. This method is safe to call more than once.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
 
-    fn spawn_workers(&self) -> Vec<WorkerHandle> {
+    fn spawn_workers(&self, buffer_pool: UdpBufferPool) -> Vec<WorkerHandle> {
         let server = self.clone();
         let shutdown = self.shutdown.clone();
-
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-
-        let queue_size = 5000;
+        let queue_size = 5_000;
 
         let mut workers: Vec<WorkerHandle> = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+        for worker_id in 0..num_workers {
             let (tx, mut rx) = mpsc::channel(queue_size);
             workers.push(tx);
 
             let server_clone = server.clone();
             let cancellation_token = shutdown.clone();
+            let pool = buffer_pool.clone();
+            let packet_rate = split_u32_quota(
+                self.crawl_config.max_response_rate_per_sec,
+                num_workers,
+                worker_id,
+            );
+            let byte_rate = split_u64_quota(
+                self.crawl_config.max_response_bytes_per_sec,
+                num_workers,
+                worker_id,
+            );
+            let per_source_rate = self.crawl_config.max_response_rate_per_source;
 
             tokio::spawn(async move {
+                let mut response_limiter = WorkerResponseLimiter::new(
+                    packet_rate,
+                    byte_rate,
+                    per_source_rate,
+                    Instant::now(),
+                );
+                let mut response_buffer = BytesMut::with_capacity(512);
                 loop {
                     tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            #[cfg(debug_assertions)]
-                            log::trace!("Worker 收到关闭信号，退出");
-                            break;
-                        }
+                        _ = cancellation_token.cancelled() => break,
                         msg = rx.recv() => {
                             match msg {
-                                Some((data, remote_addr, local_addr)) => {
-                                    if let Err(e) = server_clone.handle_message(data.as_ref(), remote_addr, local_addr).await {
+                                Some((packet, remote_addr, local_addr)) => {
+                                    if let Err(e) = server_clone
+                                        .handle_message(
+                                            packet.payload(),
+                                            remote_addr,
+                                            local_addr,
+                                            &mut response_limiter,
+                                            &mut response_buffer,
+                                        )
+                                        .await
+                                    {
                                         server_clone.emit_error(e);
                                     }
+                                    pool.release(packet.buf);
                                 }
                                 None => break,
                             }
@@ -379,14 +605,10 @@ impl DHTServer {
         data: &[u8],
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
+        response_limiter: &mut WorkerResponseLimiter,
+        response_buffer: &mut BytesMut,
     ) -> Result<()> {
-        if self.socket_providers.get(&local_addr).is_none() {
-            #[cfg(debug_assertions)]
-            log::trace!(
-                "⚠️ 拒绝未绑定的地址: {} (当前模式: {:?})",
-                remote_addr,
-                self.options.netmode
-            );
+        if self.sockets_by_bind_addr.get(&local_addr).is_none() {
             return Ok(());
         }
 
@@ -401,12 +623,11 @@ impl DHTServer {
 
         #[cfg(feature = "metrics")]
         {
-            // 使用 match 映射到静态字符串，避免 clone()，同时防止恶意 tag
             let label = match msg.y.as_str() {
                 "q" => "q",
                 "r" => "r",
                 "e" => "e",
-                _ => "unknown", // 将所有非法/未知类型归一化
+                _ => "unknown",
             };
             counter!("dht_messages_processed_total", "type" => label).increment(1);
         }
@@ -414,13 +635,22 @@ impl DHTServer {
         match msg.y.as_str() {
             "q" => {
                 if let Some(q_type) = &msg.q {
-                    self.handle_query(&msg, q_type.as_bytes(), remote_addr, local_addr)
-                        .await?;
+                    self.handle_query(
+                        &msg,
+                        q_type.as_bytes(),
+                        remote_addr,
+                        local_addr,
+                        response_limiter,
+                        response_buffer,
+                    )
+                    .await?;
                 }
             }
             "r" => {
-                if let Some(response) = &msg.r {
-                    self.handle_response(response).await?;
+                if let Some(response) = msg.r
+                    && let Some(tid) = transaction_id_from_bytes(&msg.t)
+                {
+                    self.crawl_engine.route_response(remote_addr, tid, response);
                 }
             }
             _ => {}
@@ -434,6 +664,8 @@ impl DHTServer {
         query_type: &[u8],
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
+        response_limiter: &mut WorkerResponseLimiter,
+        response_buffer: &mut BytesMut,
     ) -> Result<()> {
         let args = match &msg.a {
             Some(a) => a,
@@ -447,8 +679,20 @@ impl DHTServer {
             .as_deref()
             .or(args.info_hash.as_deref())
             .map(|v| v.as_slice());
-
         let q_str = std::str::from_utf8(query_type).unwrap_or("");
+        self.runtime_stats.inbound_query(q_str);
+
+        if let Some(sender_id) = sender_id
+            && sender_id.len() == 20
+            && is_valid_node_addr(&remote_addr)
+        {
+            self.crawl_engine.route_discovered(NodeTuple {
+                id: sender_id
+                    .try_into()
+                    .expect("validated DHT sender id contains 20 bytes"),
+                addr: remote_addr,
+            });
+        }
 
         #[cfg(feature = "metrics")]
         {
@@ -468,12 +712,16 @@ impl DHTServer {
         }
 
         self.send_response(
-            transaction_id,
-            remote_addr,
-            local_addr,
-            q_str,
-            sender_id,
-            target_id_fallback,
+            QueryResponse {
+                transaction_id,
+                remote_addr,
+                local_addr,
+                query_type: q_str,
+                sender_id,
+                target_id: target_id_fallback,
+            },
+            response_limiter,
+            response_buffer,
         )
         .await?;
         Ok(())
@@ -482,26 +730,31 @@ impl DHTServer {
     async fn handle_announce_peer(&self, args: &DhtArgs, addr: SocketAddr) -> Result<()> {
         if let Some(token) = &args.token {
             if !self.validate_token(token, addr) {
+                self.runtime_stats.announce_invalid_token();
                 #[cfg(feature = "metrics")]
                 counter!("dht_announce_peer_blocked_total", "reason" => "invalid_token")
                     .increment(1);
                 return Ok(());
             }
         } else {
+            self.runtime_stats.announce_invalid_token();
             return Ok(());
         }
 
         if let Some(info_hash) = &args.info_hash {
             let info_hash_arr: [u8; 20] = match info_hash.as_ref().try_into() {
                 Ok(arr) => arr,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    self.runtime_stats.announce_invalid_token();
+                    return Ok(());
+                }
             };
             let hash_hex = hex::encode(info_hash_arr);
 
-            let filter_cb = self.filter.read().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(f) = filter_cb
-                && !f(&hash_hex)
+            if let Some(filter) = self.hash_filter.load_full()
+                && !filter(&hash_hex)
             {
+                self.runtime_stats.announce_filtered();
                 #[cfg(feature = "metrics")]
                 counter!("dht_announce_peer_blocked_total", "reason" => "filtered").increment(1);
                 return Ok(());
@@ -509,9 +762,6 @@ impl DHTServer {
 
             #[cfg(feature = "metrics")]
             counter!("dht_info_hashes_discovered_total").increment(1);
-
-            #[cfg(debug_assertions)]
-            log::debug!("🔥 新 Hash: {} 来自 {}", hash_hex, addr);
 
             let port = if let Some(implied) = args.implied_port {
                 if implied != 0 {
@@ -524,228 +774,119 @@ impl DHTServer {
             };
 
             if port > 0 {
+                self.runtime_stats.announce_accepted();
+                self.runtime_stats.hash_received();
                 let event = HashDiscovered {
                     info_hash: hash_hex,
                     peer_addr: SocketAddr::new(addr.ip(), port),
                     discovered_at: std::time::Instant::now(),
                 };
 
-                if self.hash_tx.try_send(event).is_err() {
+                let enqueue_result = self.hash_events_tx.try_send(event);
+                self.runtime_stats.set_hash_ingress_queue_depth(
+                    self.hash_events_tx
+                        .max_capacity()
+                        .saturating_sub(self.hash_events_tx.capacity()),
+                );
+                if enqueue_result.is_err() {
+                    self.runtime_stats.hash_ingress_dropped();
+                    #[cfg(feature = "metrics")]
+                    counter!("dht_metadata_ingress_dropped_total", "reason" => "queue_full")
+                        .increment(1);
                     #[cfg(debug_assertions)]
-                    log::debug!("⚠️ Hash 队列满，丢弃 hash");
+                    log::debug!("Hash queue is full; dropping hash");
                 }
             }
         }
         Ok(())
     }
 
-    async fn handle_response(&self, response: &DhtResponse) -> Result<()> {
-        if let Some(nodes_bytes) = &response.nodes {
-            self.process_compact_nodes(nodes_bytes);
-        }
-        if let Some(nodes6_bytes) = &response.nodes6 {
-            self.process_compact_nodes_v6(nodes6_bytes);
-        }
-        Ok(())
-    }
-
-    fn process_compact_nodes(&self, nodes_bytes: &[u8]) {
-        if self.options.netmode == NetMode::Ipv6Only {
-            return;
-        }
-
-        #[allow(clippy::manual_is_multiple_of)]
-        if nodes_bytes.len() % 26 != 0 {
-            return;
-        }
-
-        for chunk in nodes_bytes.chunks(26) {
-            let id = chunk[0..20].to_vec();
-            let port = u16::from_be_bytes([chunk[24], chunk[25]]);
-
-            let ip = std::net::Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
-            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-
-            #[cfg(feature = "metrics")]
-            counter!("dht_nodes_discovered_total", "ip_version" => "v4").increment(1);
-
-            self.node_queue.push(NodeTuple { id, addr });
-        }
-    }
-
-    fn process_compact_nodes_v6(&self, nodes_bytes: &[u8]) {
-        if self.options.netmode == NetMode::Ipv4Only {
-            return;
-        }
-
-        #[allow(clippy::manual_is_multiple_of)]
-        if nodes_bytes.len() % 38 != 0 {
-            return;
-        }
-        for chunk in nodes_bytes.chunks(38) {
-            let id = chunk[0..20].to_vec();
-            let port = u16::from_be_bytes([chunk[36], chunk[37]]);
-            let ip_bytes: [u8; 16] = match chunk[20..36].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let ip = Ipv6Addr::from(ip_bytes);
-            if !ip.is_unspecified() && !ip.is_multicast() {
-                let addr = SocketAddr::new(IpAddr::V6(ip), port);
-
-                #[cfg(feature = "metrics")]
-                counter!("dht_nodes_discovered_total", "ip_version" => "v6").increment(1);
-
-                self.node_queue.push(NodeTuple { id, addr });
-            }
-        }
-    }
-
     async fn send_response(
         &self,
-        tid: &[u8],
-        remote_addr: SocketAddr,
-        local_addr: SocketAddr,
-        query_type: &str,
-        sender_id: Option<&[u8]>,
-        target_id_fallback: Option<&[u8]>,
+        response: QueryResponse<'_>,
+        response_limiter: &mut WorkerResponseLimiter,
+        response_buffer: &mut BytesMut,
     ) -> Result<()> {
-        let socket = match self.socket_providers.get(&local_addr) {
+        let socket = match self.sockets_by_bind_addr.get(&response.local_addr) {
             Some(sock) => sock,
-            None => return Ok(()), // Silent failure when the socket is not present
+            None => return Ok(()),
         };
 
-        let mut r_dict = std::collections::HashMap::new();
-
-        let reference_id = sender_id.or(target_id_fallback);
+        let reference_id = response.sender_id.or(response.target_id);
         let my_id = if let Some(target) = reference_id {
-            generate_neighbor_target(target, &self.node_id)
+            let generated = neighbor_node_id(target, &self.node_id);
+            <[u8; 20]>::try_from(generated.as_slice()).expect("neighbor id is always 20 bytes")
         } else {
-            self.node_id.to_vec()
+            self.node_id
         };
-
-        r_dict.insert(b"id".to_vec(), serde_bencode::value::Value::Bytes(my_id));
-        let token = self.generate_token(remote_addr);
-        r_dict.insert(
-            b"token".to_vec(),
-            serde_bencode::value::Value::Bytes(token.to_vec()),
-        );
-
-        if query_type == "get_peers" || query_type == "find_node" {
-            let requestor_is_ipv6 = remote_addr.is_ipv6();
+        let token = self.generate_token(response.remote_addr);
+        let include_nodes =
+            response.query_type == "get_peers" || response.query_type == "find_node";
+        let requestor_is_ipv6 = response.remote_addr.is_ipv6();
+        let nodes = if include_nodes {
             let filter_ipv6 = match self.options.netmode {
                 NetMode::Ipv4Only => Some(false),
                 NetMode::Ipv6Only => Some(true),
                 NetMode::DualStack => Some(requestor_is_ipv6),
             };
-
-            let nodes = self.node_queue.get_random_nodes(8, filter_ipv6);
-
-            let mut nodes_data = Vec::new();
-            let mut nodes6_data = Vec::new();
-
-            for node in nodes {
-                match node.addr.ip() {
-                    IpAddr::V4(ip) => {
-                        nodes_data.extend_from_slice(&node.id);
-                        nodes_data.extend_from_slice(&ip.octets());
-                        nodes_data.extend_from_slice(&node.addr.port().to_be_bytes());
-                    }
-                    IpAddr::V6(ip) => {
-                        nodes6_data.extend_from_slice(&node.id);
-                        nodes6_data.extend_from_slice(&ip.octets());
-                        nodes6_data.extend_from_slice(&node.addr.port().to_be_bytes());
-                    }
-                }
+            let snapshot = self.crawl_engine.snapshot.load();
+            snapshot.random_nodes(8, filter_ipv6)
+        } else {
+            Vec::new()
+        };
+        encode_response(
+            response_buffer,
+            response.transaction_id,
+            &my_id,
+            &token,
+            &nodes,
+            requestor_is_ipv6,
+        );
+        let is_priority = response.query_type == "ping" || response.query_type == "get_peers";
+        match response_limiter.acquire(
+            response.remote_addr,
+            response_buffer.len(),
+            is_priority,
+            Instant::now(),
+        ) {
+            ResponsePermit::Regular => self.runtime_stats.response_normal(),
+            ResponsePermit::PriorityReserve => {
+                self.runtime_stats.udp_response_priority_reserved();
+                #[cfg(feature = "metrics")]
+                counter!(
+                    "dht_udp_responses_priority_reserved_total",
+                    "query" => if response.query_type == "ping" { "ping" } else { "get_peers" }
+                )
+                .increment(1);
             }
-
-            if requestor_is_ipv6 {
-                if !nodes6_data.is_empty() {
-                    r_dict.insert(
-                        b"nodes6".to_vec(),
-                        serde_bencode::value::Value::Bytes(nodes6_data),
-                    );
-                }
-            } else if !nodes_data.is_empty() {
-                r_dict.insert(
-                    b"nodes".to_vec(),
-                    serde_bencode::value::Value::Bytes(nodes_data),
-                );
+            ResponsePermit::Rejected => {
+                self.runtime_stats.udp_response_rate_limited();
+                #[cfg(feature = "metrics")]
+                counter!("dht_udp_responses_dropped_total", "reason" => "rate_limit").increment(1);
+                return Ok(());
             }
         }
-
-        let mut response: std::collections::HashMap<String, serde_bencode::value::Value> =
-            std::collections::HashMap::new();
-        response.insert(
-            "t".to_string(),
-            serde_bencode::value::Value::Bytes(tid.to_vec()),
-        );
-        response.insert(
-            "y".to_string(),
-            serde_bencode::value::Value::Bytes(b"r".to_vec()),
-        );
-        response.insert("r".to_string(), serde_bencode::value::Value::Dict(r_dict));
-
-        if let Ok(encoded) = serde_bencode::to_bytes(&response) {
-            #[allow(unused)]
-            if let Ok(len) = socket.send_to(&encoded, remote_addr).await {
+        match socket.send_to(response_buffer, response.remote_addr).await {
+            Ok(len) => {
+                self.runtime_stats.udp_sent(len);
                 #[cfg(feature = "metrics")]
                 {
                     counter!("dht_udp_bytes_sent_total").increment(len as u64);
                     counter!("dht_udp_packets_sent_total", "type" => "response").increment(1);
                 }
             }
+            Err(_) => self.runtime_stats.response_send_failed(),
         }
         Ok(())
     }
 
-    async fn bootstrap(&self) {
-        let target = generate_random_id();
-        for node in BOOTSTRAP_NODES {
-            if let Ok(addrs) = tokio::net::lookup_host(node).await {
-                for addr in addrs {
-                    match self.options.netmode {
-                        NetMode::Ipv4Only => {
-                            if addr.is_ipv6() {
-                                continue;
-                            }
-                        }
-                        NetMode::Ipv6Only => {
-                            if addr.is_ipv4() {
-                                continue;
-                            }
-                        }
-                        NetMode::DualStack => {}
-                    }
-                    let _ = self.send_find_node(&addr, &target, &self.node_id).await;
-                }
-            }
-        }
-    }
-
-    fn socket_for_addr(&self, addr: &SocketAddr) -> Option<Arc<UdpSocket>> {
-        self.socket_providers
-            .iter()
-            .find(|(bind_addr, _)| bind_addr.is_ipv4() == addr.is_ipv4())
-            .map(|(_, sock)| sock.clone())
-    }
-
-    async fn send_find_node(&self, target_addr: &SocketAddr, target: &[u8], sender_id: &[u8]) {
-        if let Some(sock) = self.socket_for_addr(target_addr) {
-            send_find_node_impl(target_addr, target, sender_id, sock).await
-        }
-    }
-
     fn generate_token(&self, addr: SocketAddr) -> [u8; 8] {
         let mut hasher = ahash::AHasher::default();
-
         match addr.ip() {
             IpAddr::V4(ip) => ip.octets().hash(&mut hasher),
             IpAddr::V6(ip) => ip.octets().hash(&mut hasher),
         }
-
         self.token_secret.hash(&mut hasher);
-
         hasher.finish().to_le_bytes()
     }
 
@@ -758,265 +899,65 @@ impl DHTServer {
     }
 }
 
-/// 发送 DHT find_node 查询消息
-///
-/// 这是 DHT 协议中的核心操作之一，用于向指定节点查询包含目标 ID 的节点信息。
-/// 该方法构建符合 BEP5 (BitTorrent DHT Protocol) 规范的消息并异步发送。
-///
-/// # 参数
-///
-/// * `addr` - 目标节点的 Socket 地址
-/// * `target` - 要查找的目标节点 ID (20 字节)
-/// * `sender_id` - 发送者的节点 ID (20 字节)，用于标识自己
-/// * `socket` - IPv4 UDP socket 的引用
-/// * `socket_v6` - IPv6 UDP socket 的可选引用（仅在双栈模式下需要）
-/// * `netmode` - 网络模式：仅 IPv4、仅 IPv6 或双栈模式
-///
-/// # 返回值
-///
-/// 返回 `Result<()>`，成功时返回 `Ok(())`，失败时返回错误信息
-///
-/// # 消息格式
-///
-/// 构建的 DHT 消息格式如下：
-/// ```bencode
-/// {
-///   "t": [0, 1],           // 事务 ID (transaction ID)
-///   "y": "q",              // 消息类型：查询 (query)
-///   "q": "find_node",      // 查询类型：查找节点
-///   "a": {                 // 参数 (arguments)
-///     "id": <sender_id>,   // 发送者节点 ID
-///     "target": <target>   // 目标节点 ID
-///   }
-/// }
-/// ```
-///
-/// # 网络模式处理
-///
-/// * `Ipv4Only`: 始终使用 IPv4 socket
-/// * `Ipv6Only`: 始终使用 IPv4 socket（IPv6 模式下 socket 实际是 IPv6）
-/// * `DualStack`: 根据目标地址类型自动选择 IPv4 或 IPv6 socket
-async fn send_find_node_impl(
-    addr: &SocketAddr,
-    target: &[u8],
-    sender_id: &[u8],
-    socket: Arc<UdpSocket>,
-) {
-    // 构建查询参数
-    let mut args = std::collections::HashMap::new();
-    args.insert(
-        b"id".to_vec(),
-        serde_bencode::value::Value::Bytes(sender_id.to_vec()),
-    );
-    args.insert(
-        b"target".to_vec(),
-        serde_bencode::value::Value::Bytes(target.to_vec()),
-    );
+#[cfg(test)]
+mod response_limiter_tests {
+    use super::*;
 
-    // 构建完整的 DHT 消息
-    let mut msg: std::collections::HashMap<String, serde_bencode::value::Value> =
-        std::collections::HashMap::new();
-    msg.insert(
-        "t".to_string(),
-        serde_bencode::value::Value::Bytes(vec![0, 1]),
-    ); // 事务 ID
-    msg.insert(
-        "y".to_string(),
-        serde_bencode::value::Value::Bytes(b"q".to_vec()),
-    ); // 消息类型：查询
-    msg.insert(
-        "q".to_string(),
-        serde_bencode::value::Value::Bytes(b"find_node".to_vec()),
-    ); // 查询类型
-    msg.insert("a".to_string(), serde_bencode::value::Value::Dict(args)); // 参数字典
-
-    // 将消息编码为 bencode 格式并发送
-    if let Ok(encoded) = serde_bencode::to_bytes(&msg) {
-        // 异步发送 UDP 数据包
-        #[cfg(feature = "metrics")]
-        {
-            counter!("dht_udp_bytes_sent_total").increment(encoded.len() as u64);
-            counter!("dht_udp_packets_sent_total", "type" => "query").increment(1);
-        }
-        let _ = socket.send_to(&encoded, addr).await;
-    }
-}
-
-fn generate_random_id() -> [u8; 20] {
-    let mut id = [0u8; 20];
-    rand::thread_rng().fill(&mut id);
-    id
-}
-
-/// 生成邻居目标节点 ID
-///
-/// 该方法用于生成一个"看起来像"远程节点 ID 但实际基于本地节点 ID 的邻居节点 ID。
-/// 这是 DHT 协议中的一个重要优化策略，用于提高查询成功率和保护节点 ID 隐私。
-///
-/// # 工作原理
-///
-/// 1. 取远程节点 ID 的前 6 个字节作为前缀（如果远程 ID 长度足够）
-/// 2. 用本地节点 ID 的剩余部分填充
-/// 3. 如果本地 ID 不够长，用随机字节填充到 20 字节（标准 DHT 节点 ID 长度）
-///
-/// 这样生成的 ID 在 ID 空间中既接近远程节点（前 6 字节相同），又基于本地节点
-/// （后续字节来自本地 ID），从而在 DHT 路由时更容易获得相关响应。
-///
-/// # 参数
-///
-/// * `remote_id` - 远程节点的 ID（通常是查询目标节点或请求方的 ID）
-/// * `local_id` - 本地节点的 ID（通常是自己真实的节点 ID）
-///
-/// # 返回值
-///
-/// 返回一个 20 字节的节点 ID Vec，其前 6 字节来自 `remote_id`，后续字节来自 `local_id`
-///
-/// # 使用场景
-///
-/// 1. **发送查询时**：使用邻居 ID 作为发送者 ID，让远程节点认为查询来自一个接近目标 ID 的节点，
-///    从而返回更相关的节点列表
-/// 2. **发送响应时**：使用邻居 ID 作为响应中的节点 ID，保护真实本地 ID 的隐私，
-///    同时提高返回节点的相关性
-///
-/// # 示例
-///
-/// ```
-/// // 假设：
-/// // remote_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, ...]
-/// // local_id  = [0xAA, 0xBB, 0xCC, 0xDD, ...]
-/// // 生成结果 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xCC, 0xDD, ...]
-/// //           (前6字节来自remote_id，后续来自local_id)
-/// ```
-fn generate_neighbor_target(remote_id: &[u8], local_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(20);
-    let prefix_len = std::cmp::min(remote_id.len(), 6);
-    id.extend_from_slice(&remote_id[..prefix_len]);
-
-    if local_id.len() > prefix_len {
-        id.extend_from_slice(&local_id[prefix_len..]);
-    } else {
-        while id.len() < 20 {
-            id.push(rand::random());
-        }
-    }
-    id
-}
-
-fn spawn_udp_listener(
-    socket: Arc<UdpSocket>,
-    mut workers: Vec<WorkerHandle>,
-    shutdown: CancellationToken,
-) -> crate::error::Result<()> {
-    let local_addr = socket
-        .local_addr()
-        .map_err(|e| crate::error::DHTError::Init(format!("socket 无法获取本地地址: {e}")))?;
-    if workers.is_empty() {
-        return Err(crate::error::DHTError::Init(
-            "spawn_udp_listener: 未提供任何 worker".to_string(),
-        ));
-    }
-    tokio::spawn(async move {
-        let mut buffer = [0u8; 65536];
-        let mut worker_index = 0;
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    #[cfg(debug_assertions)]
-                    log::trace!("UDP 读取循环收到关闭信号，退出");
-                    break;
-                }
-                result = socket.recv_from(&mut buffer) => {
-                    match result {
-                        Ok((size, origin_addr)) => {
-                            if let Err(ProcessUdpPacketError::NoLiveWorkers) = process_udp_packet(size, origin_addr, local_addr, &buffer, &mut workers, &mut worker_index){
-                                log::warn!("Socket {socket:?} is closing because no worker can process packets.");
-                                // TODO: Remove the dead socket, or find a way to supply workers.
-                                break
-                            }
-                        },
-                        Err(_e) => {
-                            tokio::select! {
-                                _ = shutdown.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-    Ok(())
-}
-
-enum ProcessUdpPacketError {
-    PacketTooLarge,
-    InvalidPacket,
-    ChokedWorkers,
-    NoLiveWorkers,
-}
-
-fn process_udp_packet(
-    size: usize,
-    origin_addr: SocketAddr,
-    local_addr: SocketAddr,
-    buffer: &[u8],
-    workers: &mut Vec<WorkerHandle>,
-    worker_index: &mut usize,
-) -> std::result::Result<(), ProcessUdpPacketError> {
-    #[cfg(feature = "metrics")]
-    counter!("dht_udp_bytes_received_total").increment(size as u64);
-
-    if size > 8192 {
-        #[cfg(feature = "metrics")]
-        counter!("dht_udp_packets_received_total", "status" => "dropped_size").increment(1);
-
-        #[cfg(debug_assertions)]
-        log::trace!("⚠️ 拒绝异常大的 UDP 包: {} 字节 from {}", size, origin_addr);
-        return Err(ProcessUdpPacketError::PacketTooLarge);
+    #[test]
+    fn response_limiter_enforces_packet_byte_and_source_limits() {
+        let start = Instant::now();
+        let addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        let mut limiter = WorkerResponseLimiter::new(2, 200, 1, start);
+        assert_eq!(
+            limiter.acquire(addr, 100, false, start),
+            ResponsePermit::Regular
+        );
+        assert_eq!(
+            limiter.acquire(addr, 100, false, start),
+            ResponsePermit::Rejected
+        );
+        assert_eq!(
+            limiter.acquire(addr, 100, false, start + Duration::from_secs(1)),
+            ResponsePermit::Regular
+        );
+        assert_eq!(
+            limiter.acquire(
+                "1.1.1.1:6881".parse().unwrap(),
+                513,
+                false,
+                start + Duration::from_secs(2)
+            ),
+            ResponsePermit::Rejected
+        );
     }
 
-    if size == 0 || buffer[0] != b'd' {
-        #[cfg(feature = "metrics")]
-        counter!("dht_udp_packets_received_total", "status" => "dropped_magic").increment(1);
-        return Err(ProcessUdpPacketError::InvalidPacket);
+    #[test]
+    fn ping_and_get_peers_can_use_the_priority_reserve() {
+        let start = Instant::now();
+        let mut limiter = WorkerResponseLimiter::new(10, 1_000, 100, start);
+        let first: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        let second: SocketAddr = "1.1.1.1:6881".parse().unwrap();
+        let priority: SocketAddr = "9.9.9.9:6881".parse().unwrap();
+
+        assert_eq!(
+            limiter.acquire(first, 50, false, start),
+            ResponsePermit::Regular
+        );
+        assert_eq!(
+            limiter.acquire(second, 50, false, start),
+            ResponsePermit::Regular
+        );
+        assert_eq!(
+            limiter.acquire(priority, 50, false, start),
+            ResponsePermit::Rejected
+        );
+        assert_eq!(
+            limiter.acquire(priority, 50, true, start),
+            ResponsePermit::PriorityReserve
+        );
+        assert_eq!(
+            limiter.acquire("4.4.4.4:6881".parse().unwrap(), 50, true, start),
+            ResponsePermit::Rejected
+        );
     }
-    let mut data = Some(buffer[..size].to_owned().into_boxed_slice());
-    let mut attempts = 0;
-    let max_attempts = workers.len();
-
-    while let Some(packet) = data.take() {
-        let worker = &workers[*worker_index];
-        match worker.try_send((packet, origin_addr, local_addr)) {
-            Ok(_) => {
-                #[cfg(feature = "metrics")]
-                counter!("dht_udp_packets_received_total", "status" => "ok").increment(1);
-                break;
-            }
-            Err(mpsc::error::TrySendError::Full((packet, _, _))) => {
-                attempts += 1;
-                if attempts >= max_attempts {
-                    #[cfg(feature = "metrics")]
-                    counter!("dht_udp_packets_received_total", "status" => "queue_full")
-                        .increment(1);
-
-                    #[cfg(debug_assertions)]
-                    log::trace!("UDP worker queue full, dropping packet");
-                    return Err(ProcessUdpPacketError::ChokedWorkers);
-                }
-                let _ = data.insert(packet);
-            }
-            Err(mpsc::error::TrySendError::Closed((packet, _, _))) => {
-                log::warn!("UDP worker dropped.");
-                workers.swap_remove(*worker_index);
-                let _ = data.insert(packet);
-            }
-        }
-        if workers.is_empty() {
-            return Err(ProcessUdpPacketError::NoLiveWorkers);
-        }
-        *worker_index = (*worker_index + 1) % workers.len();
-    }
-
-    Ok(())
 }

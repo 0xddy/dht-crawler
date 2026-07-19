@@ -1,5 +1,5 @@
-use jni::{JavaVM, JNIEnv};
 use jni::objects::JObject;
+use jni::{JNIEnv, JavaVM};
 use std::sync::{Arc, Mutex};
 
 /// 跨线程安全的 Java 回调持有者。
@@ -33,10 +33,10 @@ impl JavaCallback {
         let listener_guard = self.listener.lock().unwrap();
         let result = f(&mut guard, listener_guard.as_obj());
         // 检查并清除 Java 侧遗留的异常，避免后续 JNI 调用受污染
-        if let Err(ref _e) = result {
-            if guard.exception_check().unwrap_or(false) {
-                let _ = guard.exception_clear();
-            }
+        if let Err(ref _e) = result
+            && guard.exception_check().unwrap_or(false)
+        {
+            let _ = guard.exception_clear();
         }
         result
     }

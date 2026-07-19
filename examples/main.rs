@@ -34,11 +34,14 @@ async fn main() -> Result<()> {
 
     let options = DHTOptions {
         port: 12313,
-        metadata_timeout: 3,             // ✅ 快速超时，快速失败
-        max_metadata_queue_size: 100000, // ✅ 大缓冲区（防止饱和）
-        max_metadata_worker_count: 1000, // ✅ 激进并发（最大化吞吐）
-        netmode: NetMode::Ipv4Only, // 网络模式：Ipv4Only（仅IPv4）、Ipv6Only（仅IPv6）、DualStack（双栈，默认）
-        ..Default::default()        // 使用默认值填充其他字段（节点队列容量等）
+        netmode: NetMode::Ipv4Only,
+        metadata: MetadataOptions {
+            timeout_secs: 4,
+            max_queue_size: 10_000,
+            max_worker_count: 256,
+            ..MetadataOptions::default()
+        },
+        ..Default::default()
     };
 
     // 统计计数器
@@ -83,8 +86,19 @@ async fn main() -> Result<()> {
     // 设置元数据获取前的检查回调
     server.on_metadata_fetch(|_hash| async move { true });
 
+    // 一个通过 gate 的 Hash 最终只会收到一次完成状态。
+    server.on_metadata_fetch_complete(|completion| {
+        log::debug!(
+            "Metadata complete: hash={}, status={:?}, peer_attempts={}",
+            completion.info_hash,
+            completion.status,
+            completion.attempts
+        );
+    });
+
     // 启动监控任务
     let count_monitor = torrent_count.clone();
+    let runtime_stats = server.runtime_stats();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         let start_time = std::time::Instant::now();
@@ -93,18 +107,31 @@ async fn main() -> Result<()> {
             interval.tick().await;
             let success_fetch = count_monitor.load(Ordering::Relaxed);
             let uptime = start_time.elapsed().as_secs();
+            let runtime = runtime_stats.snapshot();
 
             // ✅ 监控：爬虫运行状态
             log::info!(
-                "📊 [监控] 时长: {}s | 成功抓取: ✨ {}",
+                "📊 [监控] 时长: {}s | 成功抓取: ✨ {} | 节点: {} | Metadata: {}/{} | worker: {}",
                 uptime,
-                success_fetch
+                success_fetch,
+                runtime.node_pool_size,
+                runtime.metadata_queue_depth,
+                runtime.metadata_queue_max,
+                runtime.metadata_in_flight,
             );
 
             if uptime > 0 && success_fetch > 0 {
                 let speed = (success_fetch as f64) / (uptime as f64 / 60.0);
                 log::info!("📈 平均抓取速度: {:.2} 种子/分钟", speed);
             }
+        }
+    });
+
+    let shutdown_server = server.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            log::info!("收到 Ctrl-C，正在停止 DHT Server");
+            shutdown_server.shutdown();
         }
     });
 

@@ -1,6 +1,6 @@
 use crate::jni_bindings::callbacks::register_callbacks;
 use crate::jni_bindings::env::JavaCallback;
-use crate::jni_bindings::server::{handle_ref, into_handle_ptr, take_handle, ServerHandle};
+use crate::jni_bindings::server::{ServerHandle, handle_ref, into_handle_ptr, take_handle};
 use crate::jni_bindings::types::java_to_dht_options_or_default;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject};
@@ -29,7 +29,7 @@ pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_createServer(
         let opts = match java_to_dht_options_or_default(&mut env, &options) {
             Ok(o) => o,
             Err(e) => {
-                let _ = env.throw_new("java/lang/IllegalArgumentException", &e.to_string());
+                let _ = env.throw_new("java/lang/IllegalArgumentException", e.to_string());
                 return 0;
             }
         };
@@ -48,7 +48,7 @@ pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_createServer(
             match JavaCallback::new(&mut env, &listener) {
                 Ok(cb) => register_callbacks(&handle.server, cb),
                 Err(e) => {
-                    let _ = env.throw_new("java/lang/RuntimeException", &e.to_string());
+                    let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
                     return 0;
                 }
             }

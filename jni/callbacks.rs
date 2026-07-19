@@ -71,7 +71,7 @@ fn register_on_metadata_fetch(server: &Arc<DHTServer>, callback: JavaCallback) {
                         "(Ljava/lang/String;)Z",
                         &[JValue::Object(&j_s.into())],
                     )?;
-                    Ok(out.z()?)
+                    out.z()
                 })
             })
             .await;
