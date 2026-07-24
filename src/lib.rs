@@ -16,6 +16,7 @@ mod krpc;
 pub mod metadata;
 mod node_id;
 mod node_pool;
+mod peer_lookup;
 /// Serializable BEP-5 KRPC wire types.
 pub mod protocol;
 mod routing_snapshot;
@@ -36,8 +37,8 @@ pub use scheduler::{MetadataScheduler, MetadataSchedulerCallbacks, MetadataSched
 pub use server::{DHTServer, HashDiscovered};
 pub use types::{
     BootstrapOptions, CrawlOptions, DHTOptions, FileInfo, MetadataFetchCompletion,
-    MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PoolOptions,
-    RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
+    MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PeerLookupOptions,
+    PoolOptions, RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
 };
 
 /// Common server, configuration and callback payload imports.
@@ -50,8 +51,8 @@ pub mod prelude {
     pub use crate::server::DHTServer;
     pub use crate::types::{
         BootstrapOptions, CrawlOptions, DHTOptions, FileInfo, MetadataFetchCompletion,
-        MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PoolOptions,
-        RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
+        MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PeerLookupOptions,
+        PoolOptions, RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
     };
 }
 

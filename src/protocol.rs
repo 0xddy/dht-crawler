@@ -48,4 +48,7 @@ pub struct DhtResponse {
     #[serde(default)]
     /// Compact IPv6 node tuples.
     pub nodes6: Option<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    /// Compact Peer endpoints returned by `get_peers`.
+    pub values: Option<Vec<serde_bytes::ByteBuf>>,
 }

@@ -117,6 +117,8 @@ pub struct DHTOptions {
     pub hash_queue_capacity: usize,
     /// Metadata download and Peer-cache limits.
     pub metadata: MetadataOptions,
+    /// Active get_peers lookup rate and concurrency limits.
+    pub peer_lookup: PeerLookupOptions,
     /// Active crawl, node-pool and scheduler limits.
     pub crawl: CrawlOptions,
 }
@@ -134,6 +136,17 @@ pub struct MetadataOptions {
     pub peer_failure_cache_capacity: usize,
     /// Timeout/connect failure cache lifetime in seconds.
     pub peer_failure_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+/// Active get_peers lookup budgets used to discover additional Metadata Peers.
+pub struct PeerLookupOptions {
+    /// Maximum new InfoHash lookups started per second. Zero disables active lookup.
+    pub max_lookups_per_second: u32,
+    /// Maximum lookup budget consumed immediately after an idle period.
+    pub burst: u32,
+    /// Maximum InfoHash lookups kept active at the same time.
+    pub max_active_lookups: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -243,6 +256,7 @@ impl Default for DHTOptions {
             netmode: NetMode::Ipv4Only,
             hash_queue_capacity: 10_000,
             metadata: MetadataOptions::default(),
+            peer_lookup: PeerLookupOptions::default(),
             crawl: CrawlOptions::default(),
         }
     }
@@ -256,6 +270,16 @@ impl Default for MetadataOptions {
             max_worker_count: 256,
             peer_failure_cache_capacity: 200_000,
             peer_failure_ttl_secs: 60,
+        }
+    }
+}
+
+impl Default for PeerLookupOptions {
+    fn default() -> Self {
+        Self {
+            max_lookups_per_second: 32,
+            burst: 32,
+            max_active_lookups: 64,
         }
     }
 }

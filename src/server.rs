@@ -6,11 +6,15 @@ use crate::error::Result;
 use crate::krpc::encode_response;
 use crate::metadata::RbitFetcher;
 use crate::node_id::{neighbor_node_id, random_node_id, transaction_id_from_bytes};
+use crate::peer_lookup::{
+    PeerLookupHandle, PeerLookupRuntime, is_peer_lookup_tid, spawn_peer_lookup,
+};
 use crate::protocol::{DhtArgs, DhtMessage};
 use crate::runtime_stats::{DhtRuntimeLimits, DhtRuntimeStats};
 use crate::scheduler::{
     MetadataCompletionCallback, MetadataFetchCallback, MetadataScheduler,
-    MetadataSchedulerCallbacks, MetadataSchedulerLimits, TorrentAckCallback,
+    MetadataSchedulerCallbacks, MetadataSchedulerLimits, MetadataSchedulerRuntime,
+    TorrentAckCallback,
 };
 use crate::types::{DHTOptions, MetadataFetchCompletion, NetMode, NodeTuple, TorrentInfo};
 use crate::udp_buffer::UdpBufferPool;
@@ -252,6 +256,7 @@ pub struct DHTServer {
     metadata_completion_callback: Arc<ArcSwapOption<MetadataCompletionCallback>>,
     error_callback: Arc<ArcSwapOption<ErrorCallback>>,
     crawl_engine: Arc<CrawlEngine>,
+    peer_lookup: PeerLookupHandle,
     hash_events_tx: mpsc::Sender<HashDiscovered>,
     metadata_queue_len: Arc<AtomicUsize>,
     max_metadata_queue_size: usize,
@@ -352,8 +357,24 @@ impl DHTServer {
         let metadata_completion_callback = Arc::new(ArcSwapOption::empty());
         let metadata_queue_len = Arc::new(AtomicUsize::new(0));
         let shutdown = CancellationToken::new();
+        let crawl_engine = Arc::new(CrawlEngine::new(
+            crawl_config.clone(),
+            runtime_stats.clone(),
+        ));
+        let peer_lookup = spawn_peer_lookup(
+            options.netmode,
+            node_id,
+            &sockets_by_bind_addr,
+            crawl_engine.snapshot.clone(),
+            hash_events_tx.clone(),
+            PeerLookupRuntime {
+                options: options.peer_lookup.clone(),
+                stats: runtime_stats.clone(),
+                shutdown: shutdown.clone(),
+            },
+        );
 
-        let scheduler = MetadataScheduler::new_with_runtime_stats(
+        let scheduler = MetadataScheduler::new_with_runtime(
             hash_rx,
             fetcher,
             MetadataSchedulerLimits {
@@ -367,7 +388,10 @@ impl DHTServer {
             },
             metadata_queue_len.clone(),
             shutdown.clone(),
-            runtime_stats.clone(),
+            MetadataSchedulerRuntime {
+                stats: runtime_stats.clone(),
+                peer_lookup_tx: Some(peer_lookup.request_sender()),
+            },
         );
         tokio::spawn(scheduler.run());
 
@@ -383,7 +407,8 @@ impl DHTServer {
             on_metadata_fetch,
             metadata_completion_callback,
             error_callback: Arc::new(ArcSwapOption::empty()),
-            crawl_engine: Arc::new(CrawlEngine::new(crawl_config, runtime_stats.clone())),
+            crawl_engine,
+            peer_lookup,
             hash_events_tx,
             metadata_queue_len,
             max_metadata_queue_size,
@@ -650,7 +675,11 @@ impl DHTServer {
                 if let Some(response) = msg.r
                     && let Some(tid) = transaction_id_from_bytes(&msg.t)
                 {
-                    self.crawl_engine.route_response(remote_addr, tid, response);
+                    if is_peer_lookup_tid(&tid) {
+                        self.peer_lookup.route_response(remote_addr, tid, response);
+                    } else {
+                        self.crawl_engine.route_response(remote_addr, tid, response);
+                    }
                 }
             }
             _ => {}

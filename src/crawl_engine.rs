@@ -913,6 +913,7 @@ mod tests {
             id: None,
             nodes: None,
             nodes6: None,
+            values: None,
         };
         engine.route_response("8.8.8.8:1".parse().unwrap(), [1; 8], response());
         engine.route_response("1.1.1.1:2".parse().unwrap(), [2; 8], response());

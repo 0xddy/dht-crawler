@@ -177,6 +177,9 @@ hash ingress → deduplicating Metadata queue → bounded workers → torrent ca
 | `metadata.max_worker_count` | `256` | 最大并发 Metadata job 数 |
 | `metadata.peer_failure_cache_capacity` | `200000` | 坏 Peer 缓存容量 |
 | `metadata.peer_failure_ttl_secs` | `60` | 坏 Peer 缓存 TTL |
+| `peer_lookup.max_lookups_per_second` | `32` | 每秒启动的主动 `get_peers` 查询数；`0` 为关闭 |
+| `peer_lookup.burst` | `32` | 空闲后可立即消费的查询预算 |
+| `peer_lookup.max_active_lookups` | `64` | 同时活跃的 InfoHash 查询上限 |
 
 ### `crawl.rate_limit`
 
@@ -328,7 +331,7 @@ PrometheusBuilder::new()
 ## 应用层集成
 
 本 crate 只提供 DHT、BEP-9 Metadata、回调和观测能力，不包含 Redis、Manticore、
-HTTP 看板或 `P1`～`P16` 性能档位。同级的 `dht-crawler-node` 项目负责这些应用层策略，
+HTTP 看板或 `P1`～`P17` 性能档位。同级的 `dht-crawler-node` 项目负责这些应用层策略，
 并把档位转换成具体的 `DHTOptions`。开发两个项目时应保持下面的目录关系：
 
 ```text

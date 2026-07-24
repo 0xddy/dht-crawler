@@ -216,6 +216,36 @@ pub struct DhtRuntimeSnapshot {
     pub metadata_queue_evicted: u64,
     /// Events rejected or expired because they were stale.
     pub metadata_queue_stale: u64,
+    /// Metadata Peer races started after admission.
+    pub metadata_races_started: u64,
+    /// Distinct Peer candidates launched into Metadata races.
+    pub metadata_peer_candidates: u64,
+    /// Peer candidates added while a Metadata race was already running.
+    pub metadata_live_peer_joins: u64,
+    /// Losing Peer attempts canceled after another Peer succeeded.
+    pub metadata_peer_canceled: u64,
+    /// Active `get_peers` lookup requests received from Metadata jobs.
+    pub peer_lookup_requested: u64,
+    /// Active `get_peers` lookups admitted by the bounded rate limiter.
+    pub peer_lookup_started: u64,
+    /// Active lookup requests rejected by concurrency or rate limits.
+    pub peer_lookup_rate_limited: u64,
+    /// Active lookup requests skipped because the routing snapshot was empty.
+    pub peer_lookup_empty: u64,
+    /// Active `get_peers` UDP queries sent.
+    pub peer_lookup_queries: u64,
+    /// Matched active `get_peers` responses.
+    pub peer_lookup_responses: u64,
+    /// Active `get_peers` queries that timed out.
+    pub peer_lookup_timeouts: u64,
+    /// Active `get_peers` UDP sends that failed immediately.
+    pub peer_lookup_send_failures: u64,
+    /// Unique Peer endpoints fed back into Metadata scheduling.
+    pub peer_lookup_peers_found: u64,
+    /// Tagged lookup responses dropped before reaching the lookup actor.
+    pub peer_lookup_response_dropped: u64,
+    /// Discovered Peer endpoints dropped because Hash ingress was full.
+    pub peer_lookup_output_dropped: u64,
     /// Real Peer network attempts.
     pub metadata_peer_attempts: u64,
     /// Successful Peer downloads and parses.
@@ -295,6 +325,21 @@ struct DhtRuntimeStatsInner {
     metadata_queue_deduplicated: AtomicU64,
     metadata_queue_evicted: AtomicU64,
     metadata_queue_stale: AtomicU64,
+    metadata_races_started: AtomicU64,
+    metadata_peer_candidates: AtomicU64,
+    metadata_live_peer_joins: AtomicU64,
+    metadata_peer_canceled: AtomicU64,
+    peer_lookup_requested: AtomicU64,
+    peer_lookup_started: AtomicU64,
+    peer_lookup_rate_limited: AtomicU64,
+    peer_lookup_empty: AtomicU64,
+    peer_lookup_queries: AtomicU64,
+    peer_lookup_responses: AtomicU64,
+    peer_lookup_timeouts: AtomicU64,
+    peer_lookup_send_failures: AtomicU64,
+    peer_lookup_peers_found: AtomicU64,
+    peer_lookup_response_dropped: AtomicU64,
+    peer_lookup_output_dropped: AtomicU64,
     metadata_peer_attempts: AtomicU64,
     metadata_peer_succeeded: AtomicU64,
     metadata_peer_failed: AtomicU64,
@@ -382,6 +427,21 @@ impl Default for DhtRuntimeStatsInner {
             metadata_queue_deduplicated: AtomicU64::new(0),
             metadata_queue_evicted: AtomicU64::new(0),
             metadata_queue_stale: AtomicU64::new(0),
+            metadata_races_started: AtomicU64::new(0),
+            metadata_peer_candidates: AtomicU64::new(0),
+            metadata_live_peer_joins: AtomicU64::new(0),
+            metadata_peer_canceled: AtomicU64::new(0),
+            peer_lookup_requested: AtomicU64::new(0),
+            peer_lookup_started: AtomicU64::new(0),
+            peer_lookup_rate_limited: AtomicU64::new(0),
+            peer_lookup_empty: AtomicU64::new(0),
+            peer_lookup_queries: AtomicU64::new(0),
+            peer_lookup_responses: AtomicU64::new(0),
+            peer_lookup_timeouts: AtomicU64::new(0),
+            peer_lookup_send_failures: AtomicU64::new(0),
+            peer_lookup_peers_found: AtomicU64::new(0),
+            peer_lookup_response_dropped: AtomicU64::new(0),
+            peer_lookup_output_dropped: AtomicU64::new(0),
             metadata_peer_attempts: AtomicU64::new(0),
             metadata_peer_succeeded: AtomicU64::new(0),
             metadata_peer_failed: AtomicU64::new(0),
@@ -492,6 +552,23 @@ impl DhtRuntimeStats {
             metadata_queue_deduplicated: inner.metadata_queue_deduplicated.load(Ordering::Relaxed),
             metadata_queue_evicted: inner.metadata_queue_evicted.load(Ordering::Relaxed),
             metadata_queue_stale: inner.metadata_queue_stale.load(Ordering::Relaxed),
+            metadata_races_started: inner.metadata_races_started.load(Ordering::Relaxed),
+            metadata_peer_candidates: inner.metadata_peer_candidates.load(Ordering::Relaxed),
+            metadata_live_peer_joins: inner.metadata_live_peer_joins.load(Ordering::Relaxed),
+            metadata_peer_canceled: inner.metadata_peer_canceled.load(Ordering::Relaxed),
+            peer_lookup_requested: inner.peer_lookup_requested.load(Ordering::Relaxed),
+            peer_lookup_started: inner.peer_lookup_started.load(Ordering::Relaxed),
+            peer_lookup_rate_limited: inner.peer_lookup_rate_limited.load(Ordering::Relaxed),
+            peer_lookup_empty: inner.peer_lookup_empty.load(Ordering::Relaxed),
+            peer_lookup_queries: inner.peer_lookup_queries.load(Ordering::Relaxed),
+            peer_lookup_responses: inner.peer_lookup_responses.load(Ordering::Relaxed),
+            peer_lookup_timeouts: inner.peer_lookup_timeouts.load(Ordering::Relaxed),
+            peer_lookup_send_failures: inner.peer_lookup_send_failures.load(Ordering::Relaxed),
+            peer_lookup_peers_found: inner.peer_lookup_peers_found.load(Ordering::Relaxed),
+            peer_lookup_response_dropped: inner
+                .peer_lookup_response_dropped
+                .load(Ordering::Relaxed),
+            peer_lookup_output_dropped: inner.peer_lookup_output_dropped.load(Ordering::Relaxed),
             metadata_peer_attempts: inner.metadata_peer_attempts.load(Ordering::Relaxed),
             metadata_peer_succeeded: inner.metadata_peer_succeeded.load(Ordering::Relaxed),
             metadata_peer_failed: inner.metadata_peer_failed.load(Ordering::Relaxed),
@@ -640,6 +717,94 @@ impl DhtRuntimeStats {
         self.inner
             .metadata_queue_stale
             .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_race_started(&self) {
+        self.inner
+            .metadata_races_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_peer_candidate(&self) {
+        self.inner
+            .metadata_peer_candidates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_live_peer_join(&self) {
+        self.inner
+            .metadata_live_peer_joins
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_peer_canceled(&self, count: usize) {
+        self.inner
+            .metadata_peer_canceled
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_requested(&self) {
+        self.inner
+            .peer_lookup_requested
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_started(&self) {
+        self.inner
+            .peer_lookup_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_rate_limited(&self) {
+        self.inner
+            .peer_lookup_rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_empty(&self) {
+        self.inner.peer_lookup_empty.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_query(&self) {
+        self.inner
+            .peer_lookup_queries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_response(&self) {
+        self.inner
+            .peer_lookup_responses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_timeout(&self) {
+        self.inner
+            .peer_lookup_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_send_failed(&self) {
+        self.inner
+            .peer_lookup_send_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_peer_found(&self) {
+        self.inner
+            .peer_lookup_peers_found
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_response_dropped(&self) {
+        self.inner
+            .peer_lookup_response_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_lookup_output_dropped(&self) {
+        self.inner
+            .peer_lookup_output_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metadata_peer_attempt(&self) {
@@ -953,6 +1118,21 @@ mod tests {
         writer.metadata_queue_deduplicated();
         writer.metadata_queue_evicted();
         writer.metadata_queue_stale(3);
+        writer.metadata_race_started();
+        writer.metadata_peer_candidate();
+        writer.metadata_live_peer_join();
+        writer.metadata_peer_canceled(2);
+        writer.peer_lookup_requested();
+        writer.peer_lookup_started();
+        writer.peer_lookup_rate_limited();
+        writer.peer_lookup_empty();
+        writer.peer_lookup_query();
+        writer.peer_lookup_response();
+        writer.peer_lookup_timeout();
+        writer.peer_lookup_send_failed();
+        writer.peer_lookup_peer_found();
+        writer.peer_lookup_response_dropped();
+        writer.peer_lookup_output_dropped();
         writer.metadata_peer_attempt();
         writer.metadata_peer_succeeded();
         writer.metadata_peer_failed();
@@ -997,6 +1177,21 @@ mod tests {
                 metadata_queue_deduplicated: 1,
                 metadata_queue_evicted: 1,
                 metadata_queue_stale: 3,
+                metadata_races_started: 1,
+                metadata_peer_candidates: 1,
+                metadata_live_peer_joins: 1,
+                metadata_peer_canceled: 2,
+                peer_lookup_requested: 1,
+                peer_lookup_started: 1,
+                peer_lookup_rate_limited: 1,
+                peer_lookup_empty: 1,
+                peer_lookup_queries: 1,
+                peer_lookup_responses: 1,
+                peer_lookup_timeouts: 1,
+                peer_lookup_send_failures: 1,
+                peer_lookup_peers_found: 1,
+                peer_lookup_response_dropped: 1,
+                peer_lookup_output_dropped: 1,
                 metadata_peer_attempts: 1,
                 metadata_peer_succeeded: 1,
                 metadata_peer_failed: 1,

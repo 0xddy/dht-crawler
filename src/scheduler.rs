@@ -1,4 +1,4 @@
-use crate::metadata::{MetadataFetchOutcome, RbitFetcher};
+use crate::metadata::{FetchedMetadata, MetadataFetchOutcome, RbitFetcher};
 #[cfg(test)]
 use crate::runtime_stats::DhtRuntimeLimits;
 use crate::runtime_stats::DhtRuntimeStats;
@@ -8,6 +8,7 @@ use arc_swap::ArcSwapOption;
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge, histogram};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -17,8 +18,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-const MAX_PEERS_PER_HASH: usize = 3;
+/// Maximum distinct Peer endpoints retained and raced for one InfoHash.
+pub const MAX_METADATA_PEERS_PER_HASH: usize = 12;
 const HASH_QUEUE_TTL: Duration = Duration::from_secs(60);
+const PEER_COALESCE_WINDOW: Duration = Duration::from_millis(25);
+const LIVE_PEER_IDLE_GRACE: Duration = Duration::from_millis(300);
+const ACTIVE_PEER_LOOKUP_DELAY: Duration = Duration::from_millis(100);
+const DISPATCH_TICK: Duration = Duration::from_millis(25);
 
 /// Callback returning whether the application accepted a downloaded torrent.
 pub type TorrentAckCallback = Box<dyn Fn(TorrentInfo) -> bool + Send + Sync + 'static>;
@@ -52,6 +58,11 @@ pub struct MetadataSchedulerCallbacks {
     pub completion: Arc<ArcSwapOption<MetadataCompletionCallback>>,
 }
 
+pub(crate) struct MetadataSchedulerRuntime {
+    pub(crate) stats: DhtRuntimeStats,
+    pub(crate) peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PeerCandidate {
     addr: SocketAddr,
@@ -62,6 +73,8 @@ struct PeerCandidate {
 struct QueuedHash {
     info_hash: String,
     peers: Vec<PeerCandidate>,
+    queued_at: Instant,
+    ready_at: Instant,
     latest_at: Instant,
     order_key: (Instant, u64),
 }
@@ -137,7 +150,7 @@ impl PendingHashQueue {
             entry
                 .peers
                 .sort_unstable_by(|left, right| right.discovered_at.cmp(&left.discovered_at));
-            entry.peers.truncate(MAX_PEERS_PER_HASH);
+            entry.peers.truncate(MAX_METADATA_PEERS_PER_HASH);
             entry.latest_at = entry.latest_at.max(event.discovered_at);
             entry.order_key = self.next_order_key(entry.latest_at);
             self.order.insert(entry.order_key, entry.info_hash.clone());
@@ -170,6 +183,8 @@ impl PendingHashQueue {
                     addr: event.peer_addr,
                     discovered_at: event.discovered_at,
                 }],
+                queued_at: now,
+                ready_at: now + PEER_COALESCE_WINDOW,
                 latest_at: event.discovered_at,
                 order_key,
             },
@@ -183,15 +198,15 @@ impl PendingHashQueue {
         Some(entry)
     }
 
-    fn pop_newest_available(
+    fn pop_newest_ready(
         &mut self,
+        now: Instant,
         in_flight: &HashMap<String, InFlightState>,
     ) -> Option<QueuedHash> {
-        let info_hash = self
-            .order
-            .iter()
-            .rev()
-            .find_map(|(_, hash)| (!in_flight.contains_key(hash)).then(|| hash.clone()))?;
+        let info_hash = self.order.iter().rev().find_map(|(_, hash)| {
+            let entry = self.entries.get(hash)?;
+            (!in_flight.contains_key(hash) && entry.ready_at <= now).then(|| hash.clone())
+        })?;
         self.remove(&info_hash)
     }
 
@@ -217,12 +232,12 @@ impl PendingHashQueue {
 struct MetadataJob {
     info_hash: String,
     peers: Vec<PeerCandidate>,
-    already_admitted: bool,
+    peer_rx: mpsc::Receiver<PeerCandidate>,
 }
 
 #[derive(Debug)]
 struct InFlightState {
-    attempts: usize,
+    peer_tx: mpsc::Sender<PeerCandidate>,
     scheduled_peers: HashSet<SocketAddr>,
 }
 
@@ -254,6 +269,7 @@ pub struct MetadataScheduler {
     total_completed: Arc<AtomicU64>,
     queue_len: Arc<AtomicUsize>,
     runtime_stats: DhtRuntimeStats,
+    peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
     shutdown: CancellationToken,
 }
 
@@ -287,6 +303,29 @@ impl MetadataScheduler {
         shutdown: CancellationToken,
         runtime_stats: DhtRuntimeStats,
     ) -> Self {
+        Self::new_with_runtime(
+            hash_rx,
+            fetcher,
+            limits,
+            callbacks,
+            queue_len,
+            shutdown,
+            MetadataSchedulerRuntime {
+                stats: runtime_stats,
+                peer_lookup_tx: None,
+            },
+        )
+    }
+
+    pub(crate) fn new_with_runtime(
+        hash_rx: mpsc::Receiver<HashDiscovered>,
+        fetcher: Arc<RbitFetcher>,
+        limits: MetadataSchedulerLimits,
+        callbacks: MetadataSchedulerCallbacks,
+        queue_len: Arc<AtomicUsize>,
+        shutdown: CancellationToken,
+        runtime: MetadataSchedulerRuntime,
+    ) -> Self {
         Self {
             hash_rx,
             max_queue_size: limits.queue_size.max(1),
@@ -300,7 +339,8 @@ impl MetadataScheduler {
             total_dispatched: Arc::new(AtomicU64::new(0)),
             total_completed: Arc::new(AtomicU64::new(0)),
             queue_len,
-            runtime_stats,
+            runtime_stats: runtime.stats,
+            peer_lookup_tx: runtime.peer_lookup_tx,
             shutdown,
         }
     }
@@ -326,7 +366,11 @@ impl MetadataScheduler {
         let mut in_flight = HashMap::<String, InFlightState>::new();
         let mut tasks = JoinSet::<JobResult>::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dispatch_tick = tokio::time::interval(DISPATCH_TICK);
+        dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
+        stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut input_closed = false;
 
         loop {
@@ -343,14 +387,14 @@ impl MetadataScheduler {
                     self.runtime_stats
                         .set_hash_ingress_queue_depth(self.hash_rx.len());
                     match result {
-                        Some(hash) => self.enqueue(&mut queue, hash),
+                        Some(hash) => self.enqueue(&mut queue, &mut in_flight, hash),
                         None => input_closed = true,
                     }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     match result {
                         Some(Ok(result)) => {
-                            self.handle_job_result(result, &mut queue, &mut in_flight, &mut tasks);
+                            self.handle_job_result(result, &mut queue, &mut in_flight);
                         }
                         Some(Err(error)) => {
                             #[cfg(feature = "metrics")]
@@ -360,6 +404,7 @@ impl MetadataScheduler {
                         None => {}
                     }
                 }
+                _ = dispatch_tick.tick() => {}
                 _ = maintenance.tick() => {
                     let expired = queue.expire(Instant::now());
                     if expired > 0 {
@@ -383,9 +428,50 @@ impl MetadataScheduler {
         gauge!("dht_metadata_queue_depth").set(0.0);
     }
 
-    fn enqueue(&self, queue: &mut PendingHashQueue, hash: HashDiscovered) {
+    fn enqueue(
+        &self,
+        queue: &mut PendingHashQueue,
+        in_flight: &mut HashMap<String, InFlightState>,
+        hash: HashDiscovered,
+    ) {
         self.total_received.fetch_add(1, Ordering::Relaxed);
-        let kind = queue.push(hash, Instant::now());
+        let now = Instant::now();
+        if let Some(state) = in_flight.get_mut(&hash.info_hash) {
+            let kind = if now
+                .checked_duration_since(hash.discovered_at)
+                .unwrap_or_default()
+                > HASH_QUEUE_TTL
+            {
+                QueuePushKind::Stale
+            } else if state.scheduled_peers.contains(&hash.peer_addr)
+                || state.scheduled_peers.len() >= MAX_METADATA_PEERS_PER_HASH
+            {
+                QueuePushKind::Updated
+            } else {
+                let peer = PeerCandidate {
+                    addr: hash.peer_addr,
+                    discovered_at: hash.discovered_at,
+                };
+                match state.peer_tx.try_send(peer) {
+                    Ok(()) => {
+                        state.scheduled_peers.insert(hash.peer_addr);
+                        self.runtime_stats.metadata_live_peer_join();
+                        #[cfg(feature = "metrics")]
+                        counter!("dht_metadata_live_peer_joins_total").increment(1);
+                        QueuePushKind::Updated
+                    }
+                    Err(_) => QueuePushKind::Updated,
+                }
+            };
+            self.record_queue_push(kind);
+            return;
+        }
+
+        let kind = queue.push(hash, now);
+        self.record_queue_push(kind);
+    }
+
+    fn record_queue_push(&self, kind: QueuePushKind) {
         let result = match kind {
             QueuePushKind::Inserted => {
                 self.runtime_stats.metadata_queue_inserted();
@@ -420,68 +506,45 @@ impl MetadataScheduler {
         tasks: &mut JoinSet<JobResult>,
     ) {
         while tasks.len() < self.max_concurrent {
-            let Some(entry) = queue.pop_newest_available(in_flight) else {
+            let Some(mut entry) = queue.pop_newest_ready(Instant::now(), in_flight) else {
                 break;
             };
             let queue_wait = Instant::now()
-                .checked_duration_since(entry.latest_at)
+                .checked_duration_since(entry.queued_at)
                 .unwrap_or_default();
             self.runtime_stats.observe_metadata_queue_wait(
                 queue_wait.as_millis().min(u128::from(u64::MAX)) as u64,
             );
             #[cfg(feature = "metrics")]
             histogram!("dht_metadata_queue_wait_seconds").record(queue_wait.as_secs_f64());
+            let now = Instant::now();
+            entry.peers.retain(|peer| {
+                now.checked_duration_since(peer.discovered_at)
+                    .unwrap_or_default()
+                    <= HASH_QUEUE_TTL
+            });
+            entry.peers.truncate(MAX_METADATA_PEERS_PER_HASH);
+            if entry.peers.is_empty() {
+                self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                self.runtime_stats.metadata_queue_stale(1);
+                continue;
+            }
+            let (peer_tx, peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
             let state = InFlightState {
-                attempts: 0,
-                scheduled_peers: HashSet::new(),
+                peer_tx,
+                scheduled_peers: entry.peers.iter().map(|peer| peer.addr).collect(),
             };
             in_flight.insert(entry.info_hash.clone(), state);
-            self.spawn_job(entry, false, in_flight, tasks);
+            self.spawn_job(entry, peer_rx, tasks);
         }
     }
 
     fn spawn_job(
         &self,
-        mut entry: QueuedHash,
-        already_admitted: bool,
-        in_flight: &mut HashMap<String, InFlightState>,
+        entry: QueuedHash,
+        peer_rx: mpsc::Receiver<PeerCandidate>,
         tasks: &mut JoinSet<JobResult>,
     ) {
-        let Some(state) = in_flight.get_mut(&entry.info_hash) else {
-            return;
-        };
-        let remaining = MAX_PEERS_PER_HASH.saturating_sub(state.attempts);
-        let now = Instant::now();
-        entry.peers.retain(|peer| {
-            !state.scheduled_peers.contains(&peer.addr)
-                && now
-                    .checked_duration_since(peer.discovered_at)
-                    .unwrap_or_default()
-                    <= HASH_QUEUE_TTL
-        });
-        entry.peers.truncate(remaining);
-        for peer in &entry.peers {
-            state.scheduled_peers.insert(peer.addr);
-        }
-
-        if entry.peers.is_empty() {
-            let attempts = state.attempts;
-            if already_admitted {
-                self.finish(
-                    entry.info_hash.clone(),
-                    MetadataFetchCompletionStatus::FetchFailed,
-                    attempts,
-                );
-            } else {
-                self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                self.runtime_stats.metadata_queue_stale(1);
-                #[cfg(feature = "metrics")]
-                counter!("dht_metadata_queue_events_total", "result" => "expired").increment(1);
-            }
-            in_flight.remove(&entry.info_hash);
-            return;
-        }
-
         self.total_dispatched.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
         counter!("dht_metadata_jobs_dispatched_total").increment(1);
@@ -489,13 +552,23 @@ impl MetadataScheduler {
         let job = MetadataJob {
             info_hash: entry.info_hash,
             peers: entry.peers,
-            already_admitted,
+            peer_rx,
         };
         let fetcher = self.fetcher.clone();
         let callback = self.callback.clone();
         let on_metadata_fetch = self.on_metadata_fetch.clone();
+        let runtime_stats = self.runtime_stats.clone();
+        let peer_lookup_tx = self.peer_lookup_tx.clone();
         tasks.spawn(async move {
-            Self::process_hash(job, &fetcher, &callback, &on_metadata_fetch).await
+            Self::process_hash(
+                job,
+                &fetcher,
+                &callback,
+                &on_metadata_fetch,
+                &runtime_stats,
+                peer_lookup_tx,
+            )
+            .await
         });
     }
 
@@ -504,12 +577,10 @@ impl MetadataScheduler {
         result: JobResult,
         queue: &mut PendingHashQueue,
         in_flight: &mut HashMap<String, InFlightState>,
-        tasks: &mut JoinSet<JobResult>,
     ) {
-        let Some(state) = in_flight.get_mut(&result.info_hash) else {
+        if !in_flight.contains_key(&result.info_hash) {
             return;
-        };
-        state.attempts = state.attempts.saturating_add(result.attempts);
+        }
 
         match result.outcome {
             JobOutcome::GateRejected => {
@@ -519,26 +590,10 @@ impl MetadataScheduler {
                 counter!("dht_metadata_jobs_completed_total", "result" => "gate_rejected")
                     .increment(1);
             }
-            JobOutcome::Completed(MetadataFetchCompletionStatus::FetchFailed)
-                if state.attempts < MAX_PEERS_PER_HASH =>
-            {
-                if let Some(entry) = queue.remove(&result.info_hash) {
-                    self.spawn_job(entry, true, in_flight, tasks);
-                } else {
-                    let attempts = state.attempts;
-                    in_flight.remove(&result.info_hash);
-                    self.finish(
-                        result.info_hash,
-                        MetadataFetchCompletionStatus::FetchFailed,
-                        attempts,
-                    );
-                }
-            }
             JobOutcome::Completed(status) => {
-                let attempts = state.attempts;
                 queue.remove(&result.info_hash);
                 in_flight.remove(&result.info_hash);
-                self.finish(result.info_hash, status, attempts);
+                self.finish(result.info_hash, status, result.attempts);
             }
         }
     }
@@ -570,13 +625,14 @@ impl MetadataScheduler {
     }
 
     async fn process_hash(
-        job: MetadataJob,
+        mut job: MetadataJob,
         fetcher: &Arc<RbitFetcher>,
         callback: &Arc<ArcSwapOption<TorrentAckCallback>>,
         on_metadata_fetch: &Arc<ArcSwapOption<MetadataFetchCallback>>,
+        runtime_stats: &DhtRuntimeStats,
+        peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
     ) -> JobResult {
-        if !job.already_admitted
-            && let Some(gate) = on_metadata_fetch.load_full()
+        if let Some(gate) = on_metadata_fetch.load_full()
             && !gate(job.info_hash.clone()).await
         {
             return JobResult {
@@ -601,21 +657,39 @@ impl MetadataScheduler {
             }
         };
 
-        let mut attempts = 0;
-        for peer in job.peers {
-            let (name, total_size, files, piece_length) =
-                match fetcher.fetch(&info_hash_bytes, peer.addr).await {
-                    MetadataFetchOutcome::Fetched(metadata) => {
-                        attempts += 1;
-                        metadata
-                    }
-                    MetadataFetchOutcome::Failed => {
-                        attempts += 1;
-                        continue;
-                    }
-                    MetadataFetchOutcome::SkippedCached => continue,
-                };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_fetch = attempts.clone();
+        let fetcher_for_race = fetcher.clone();
+        let lookup_task = peer_lookup_tx.map(|peer_lookup_tx| {
+            tokio::spawn(async move {
+                tokio::time::sleep(ACTIVE_PEER_LOOKUP_DELAY).await;
+                let _ = peer_lookup_tx.try_send(info_hash_bytes);
+            })
+        });
+        let fetched = race_peer_fetches(
+            job.peers,
+            &mut job.peer_rx,
+            move |peer| {
+                let attempts = attempts_for_fetch.clone();
+                let fetcher = fetcher_for_race.clone();
+                async move {
+                    let outcome = fetcher
+                        .fetch_with_attempt_observer(&info_hash_bytes, peer.addr, move || {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                        })
+                        .await;
+                    (peer, outcome)
+                }
+            },
+            runtime_stats,
+        )
+        .await;
+        if let Some(task) = lookup_task {
+            task.abort();
+        }
+        let attempts = attempts.load(Ordering::Relaxed);
 
+        if let Some((peer, (name, total_size, files, piece_length))) = fetched {
             let metadata = TorrentInfo {
                 info_hash: job.info_hash.clone(),
                 name,
@@ -686,9 +760,99 @@ impl MetadataScheduler {
     }
 }
 
+async fn race_peer_fetches<F, Fut>(
+    peers: Vec<PeerCandidate>,
+    peer_rx: &mut mpsc::Receiver<PeerCandidate>,
+    fetch: F,
+    runtime_stats: &DhtRuntimeStats,
+) -> Option<(PeerCandidate, FetchedMetadata)>
+where
+    F: Fn(PeerCandidate) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = (PeerCandidate, MetadataFetchOutcome)> + Send + 'static,
+{
+    runtime_stats.metadata_race_started();
+    #[cfg(feature = "metrics")]
+    counter!("dht_metadata_peer_races_total").increment(1);
+
+    let mut tasks = JoinSet::new();
+    let mut candidates = 0usize;
+    for peer in peers {
+        let fetch = fetch.clone();
+        tasks.spawn(fetch(peer));
+        candidates += 1;
+        runtime_stats.metadata_peer_candidate();
+        #[cfg(feature = "metrics")]
+        counter!("dht_metadata_peer_candidates_total", "source" => "initial").increment(1);
+    }
+
+    let mut accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
+    loop {
+        if tasks.is_empty() {
+            if !accepting_live_peers {
+                return None;
+            }
+            match tokio::time::timeout(LIVE_PEER_IDLE_GRACE, peer_rx.recv()).await {
+                Ok(Some(peer)) => {
+                    let fetch = fetch.clone();
+                    tasks.spawn(fetch(peer));
+                    candidates += 1;
+                    runtime_stats.metadata_peer_candidate();
+                    #[cfg(feature = "metrics")]
+                    counter!("dht_metadata_peer_candidates_total", "source" => "live").increment(1);
+                    accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
+                }
+                Ok(None) | Err(_) => return None,
+            }
+            continue;
+        }
+
+        tokio::select! {
+            result = tasks.join_next() => {
+                let Some(Ok((peer, outcome))) = result else {
+                    continue;
+                };
+                if let MetadataFetchOutcome::Fetched(metadata) = outcome {
+                    let canceled = tasks.len();
+                    runtime_stats.metadata_peer_canceled(canceled);
+                    #[cfg(feature = "metrics")]
+                    counter!("dht_metadata_peer_canceled_total").increment(canceled as u64);
+                    peer_rx.close();
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Some((peer, metadata));
+                }
+            }
+            peer = peer_rx.recv(), if accepting_live_peers => {
+                match peer {
+                    Some(peer) => {
+                        let fetch = fetch.clone();
+                        tasks.spawn(fetch(peer));
+                        candidates += 1;
+                        runtime_stats.metadata_peer_candidate();
+                        #[cfg(feature = "metrics")]
+                        counter!("dht_metadata_peer_candidates_total", "source" => "live")
+                            .increment(1);
+                        accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
+                    }
+                    None => accepting_live_peers = false,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 
     fn empty_torrent_callback() -> Arc<ArcSwapOption<TorrentAckCallback>> {
         Arc::new(ArcSwapOption::empty())
@@ -749,22 +913,27 @@ mod tests {
         );
         let start = Instant::now();
         let mut queue = PendingHashQueue::new(2, HASH_QUEUE_TTL);
+        let mut in_flight = HashMap::new();
 
-        scheduler.enqueue(&mut queue, event("old", 1000, start));
+        scheduler.enqueue(&mut queue, &mut in_flight, event("old", 1000, start));
         scheduler.enqueue(
             &mut queue,
+            &mut in_flight,
             event("old", 1001, start + Duration::from_secs(1)),
         );
         scheduler.enqueue(
             &mut queue,
+            &mut in_flight,
             event("middle", 1002, start + Duration::from_secs(2)),
         );
         scheduler.enqueue(
             &mut queue,
+            &mut in_flight,
             event("new", 1003, start + Duration::from_secs(3)),
         );
         scheduler.enqueue(
             &mut queue,
+            &mut in_flight,
             event(
                 "stale",
                 1004,
@@ -786,10 +955,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_deduplicates_hash_and_keeps_newest_unique_peers() {
+    fn queue_deduplicates_hash_and_keeps_twelve_newest_unique_peers() {
         let start = Instant::now();
         let mut queue = PendingHashQueue::new(10, Duration::from_secs(60));
-        for offset in 0..4 {
+        for offset in 0..13 {
             assert_ne!(
                 queue.push(
                     event(
@@ -803,14 +972,224 @@ mod tests {
             );
         }
         queue.push(
-            event("hash", 1003, start + Duration::from_secs(5)),
-            start + Duration::from_secs(5),
+            event("hash", 1012, start + Duration::from_secs(20)),
+            start + Duration::from_secs(20),
         );
 
         assert_eq!(queue.len(), 1);
         let entry = queue.remove("hash").unwrap();
         let ports: Vec<_> = entry.peers.iter().map(|peer| peer.addr.port()).collect();
-        assert_eq!(ports, vec![1003, 1002, 1001]);
+        assert_eq!(ports, (1001..=1012).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn coalescing_window_is_fixed_from_first_enqueue() {
+        let start = Instant::now();
+        let mut queue = PendingHashQueue::new(10, Duration::from_secs(60));
+        let in_flight = HashMap::new();
+        queue.push(event("hash", 1000, start), start);
+        queue.push(
+            event("hash", 1001, start + Duration::from_millis(15)),
+            start + Duration::from_millis(15),
+        );
+
+        assert!(
+            queue
+                .pop_newest_ready(start + Duration::from_millis(24), &in_flight)
+                .is_none()
+        );
+        let entry = queue
+            .pop_newest_ready(start + Duration::from_millis(25), &in_flight)
+            .expect("duplicate arrivals must not extend the coalescing deadline");
+        assert_eq!(entry.peers.len(), 2);
+    }
+
+    #[test]
+    fn in_flight_hash_routes_at_most_twelve_unique_peers_to_live_race() {
+        let (_hash_tx, hash_rx) = mpsc::channel(4);
+        let stats = DhtRuntimeStats::default();
+        let scheduler = MetadataScheduler::new_with_runtime_stats(
+            hash_rx,
+            Arc::new(RbitFetcher::new(1)),
+            MetadataSchedulerLimits {
+                queue_size: 4,
+                concurrency: 1,
+            },
+            MetadataSchedulerCallbacks {
+                torrent: empty_torrent_callback(),
+                fetch_gate: Arc::new(ArcSwapOption::empty()),
+                completion: Arc::new(ArcSwapOption::empty()),
+            },
+            Arc::new(AtomicUsize::new(0)),
+            CancellationToken::new(),
+            stats.clone(),
+        );
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let mut in_flight = HashMap::from([(
+            "hash".to_string(),
+            InFlightState {
+                peer_tx,
+                scheduled_peers: HashSet::from([SocketAddr::from(([127, 0, 0, 1], 1000))]),
+            },
+        )]);
+        let mut queue = PendingHashQueue::new(4, HASH_QUEUE_TTL);
+        let now = Instant::now();
+
+        for port in 1001..=1013 {
+            scheduler.enqueue(&mut queue, &mut in_flight, event("hash", port, now));
+        }
+        scheduler.enqueue(&mut queue, &mut in_flight, event("hash", 1001, now));
+
+        let mut received = Vec::new();
+        while let Ok(peer) = peer_rx.try_recv() {
+            received.push(peer.addr.port());
+        }
+        assert_eq!(received, (1001..=1011).collect::<Vec<_>>());
+        assert_eq!(
+            in_flight["hash"].scheduled_peers.len(),
+            MAX_METADATA_PEERS_PER_HASH
+        );
+        assert!(queue.is_empty());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.metadata_live_peer_joins, 11);
+        assert_eq!(snapshot.metadata_queue_deduplicated, 14);
+    }
+
+    #[tokio::test]
+    async fn peer_race_returns_first_success_and_cancels_remaining_fetches() {
+        let now = Instant::now();
+        let peers = vec![
+            PeerCandidate {
+                addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+                discovered_at: now,
+            },
+            PeerCandidate {
+                addr: SocketAddr::from(([127, 0, 0, 1], 1001)),
+                discovered_at: now,
+            },
+            PeerCandidate {
+                addr: SocketAddr::from(([127, 0, 0, 1], 1002)),
+                discovered_at: now,
+            },
+        ];
+        let started = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(tokio::sync::Barrier::new(peers.len()));
+        let started_for_race = started.clone();
+        let cancelled_for_race = cancelled.clone();
+        let (_peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let stats = DhtRuntimeStats::default();
+
+        let result = race_peer_fetches(
+            peers,
+            &mut peer_rx,
+            move |peer| {
+                let started = started_for_race.clone();
+                let cancelled = cancelled_for_race.clone();
+                let barrier = barrier.clone();
+                async move {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    barrier.wait().await;
+                    match peer.addr.port() {
+                        1000 => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            (
+                                peer,
+                                MetadataFetchOutcome::Fetched((
+                                    "winner".to_string(),
+                                    1,
+                                    Vec::new(),
+                                    0,
+                                )),
+                            )
+                        }
+                        1001 => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            (peer, MetadataFetchOutcome::Failed)
+                        }
+                        _ => {
+                            let _signal = DropSignal(cancelled);
+                            std::future::pending::<()>().await;
+                            unreachable!()
+                        }
+                    }
+                }
+            },
+            &stats,
+        )
+        .await
+        .expect("one peer should win the race");
+
+        assert_eq!(result.0.addr.port(), 1000);
+        assert_eq!(result.1.0, "winner");
+        assert!(cancelled.load(Ordering::Relaxed));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.metadata_races_started, 1);
+        assert_eq!(snapshot.metadata_peer_candidates, 3);
+        assert_eq!(snapshot.metadata_peer_canceled, 2);
+    }
+
+    #[tokio::test]
+    async fn live_peer_joins_running_race_and_cancels_slow_initial_peer() {
+        let now = Instant::now();
+        let initial = vec![PeerCandidate {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+            discovered_at: now,
+        }];
+        let live = PeerCandidate {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1001)),
+            discovered_at: now,
+        };
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let initial_started = Arc::new(tokio::sync::Notify::new());
+        let initial_started_for_fetch = initial_started.clone();
+        let initial_cancelled = Arc::new(AtomicBool::new(false));
+        let initial_cancelled_for_fetch = initial_cancelled.clone();
+        let stats = DhtRuntimeStats::default();
+        let sender = tokio::spawn(async move {
+            initial_started.notified().await;
+            peer_tx.send(live).await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_fetches(
+                initial,
+                &mut peer_rx,
+                move |peer| {
+                    let initial_started = initial_started_for_fetch.clone();
+                    let initial_cancelled = initial_cancelled_for_fetch.clone();
+                    async move {
+                        if peer.addr.port() == 1000 {
+                            let _signal = DropSignal(initial_cancelled);
+                            initial_started.notify_one();
+                            std::future::pending::<()>().await;
+                            unreachable!()
+                        }
+                        (
+                            peer,
+                            MetadataFetchOutcome::Fetched((
+                                "live-winner".to_string(),
+                                1,
+                                Vec::new(),
+                                0,
+                            )),
+                        )
+                    }
+                },
+                &stats,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("live peer should win");
+        sender.await.unwrap();
+
+        assert_eq!(result.0.addr.port(), 1001);
+        assert!(initial_cancelled.load(Ordering::Relaxed));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.metadata_peer_candidates, 2);
+        assert_eq!(snapshot.metadata_peer_canceled, 1);
     }
 
     #[test]
@@ -844,7 +1223,14 @@ mod tests {
         );
 
         let in_flight = HashMap::new();
-        let newest = queue.pop_newest_available(&in_flight).unwrap();
+        assert!(
+            queue
+                .pop_newest_ready(start + Duration::from_millis(24), &in_flight)
+                .is_none()
+        );
+        let newest = queue
+            .pop_newest_ready(start + Duration::from_secs(2), &in_flight)
+            .unwrap();
         assert_eq!(newest.info_hash, "newer");
         assert_eq!(queue.expire(start + Duration::from_secs(11)), 1);
         assert!(queue.is_empty());

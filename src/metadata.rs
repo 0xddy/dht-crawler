@@ -194,11 +194,25 @@ impl RbitFetcher {
     /// The deadline covers TCP connect, both BitTorrent handshakes, all metadata
     /// piece I/O, hash validation and bencode parsing. Inner library timeouts can
     /// therefore never stack on top of the configured metadata timeout.
+    #[cfg(test)]
     pub(crate) async fn fetch(
         &self,
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
     ) -> MetadataFetchOutcome {
+        self.fetch_with_attempt_observer(info_hash, peer_addr, || {})
+            .await
+    }
+
+    pub(crate) async fn fetch_with_attempt_observer<F>(
+        &self,
+        info_hash: &[u8; 20],
+        peer_addr: SocketAddr,
+        on_attempt: F,
+    ) -> MetadataFetchOutcome
+    where
+        F: FnOnce() + Send,
+    {
         let (cached_reason, cache_entries) = self.peer_failure_cache.get(peer_addr, Instant::now());
         self.set_peer_failure_cache_entries(cache_entries);
         if let Some(reason) = cached_reason {
@@ -215,6 +229,7 @@ impl RbitFetcher {
             return MetadataFetchOutcome::SkippedCached;
         }
 
+        on_attempt();
         self.runtime_stats.metadata_peer_attempt();
         #[cfg(feature = "metrics")]
         {
