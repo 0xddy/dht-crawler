@@ -1,8 +1,8 @@
 # Changelog
 
-本项目遵循语义化版本。0.2.0 是包含公开 API 变更的 breaking release。
+本项目遵循语义化版本。0.2.1 是包含公开 API 变更的 breaking release。
 
-## 0.2.0 - 2026-07-11
+## 0.2.1 - 2026-07-30
 
 ### Breaking changes
 
@@ -32,7 +32,3 @@
 - UDP ingress、crawl events 和 Metadata queues 全部有界，并暴露 drop/depth 指标。
 - DHT 回复增加总包、总字节、单来源限流，以及 `ping`/`get_peers` 10% 保底预算。
 - JNI `DHTOptions` 更新为 0.2 配置的扁平化子集；未映射字段继续采用 Rust 默认值。
-
-### Migration
-
-迁移字段表、回调语义和运行时示例见 [README](README.md#从-01-迁移到-02)。
