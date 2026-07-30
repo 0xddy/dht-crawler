@@ -58,6 +58,7 @@ fn register_on_error(server: &Arc<DHTServer>, callback: JavaCallback) {
 
 /// 注册 on_metadata_fetch：在拉取 metadata 前询问 Java `onMetadataFetch(infoHash)`。
 /// 返回 `true` 才继续拉取；在阻塞线程池中执行 JNI，避免阻塞 tokio worker。
+/// JNI 调用或阻塞任务失败时按拒绝处理。
 fn register_on_metadata_fetch(server: &Arc<DHTServer>, callback: JavaCallback) {
     server.on_metadata_fetch(move |info_hash| {
         let cb = callback.clone();
@@ -78,12 +79,12 @@ fn register_on_metadata_fetch(server: &Arc<DHTServer>, callback: JavaCallback) {
             match r {
                 Ok(Ok(allow)) => allow,
                 Ok(Err(e)) => {
-                    log::error!("回调 onMetadataFetch 失败: {e}，默认允许拉取");
-                    true
+                    log::error!("回调 onMetadataFetch 失败: {e}，拒绝拉取");
+                    false
                 }
                 Err(e) => {
-                    log::error!("onMetadataFetch spawn_blocking 失败: {e}，默认允许拉取");
-                    true
+                    log::error!("onMetadataFetch spawn_blocking 失败: {e}，拒绝拉取");
+                    false
                 }
             }
         }

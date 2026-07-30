@@ -244,7 +244,8 @@ dht-crawler = { version = "0.2", features = ["metrics"] }
 | `jni` | 构建 Java JNI 接口和 `cdylib` |
 | `mimalloc` | 将 mimalloc 注册为全局分配器 |
 
-JNI 的构建方式和 Java 示例见 [examples-jni/README.md](examples-jni/README.md)。
+Java/Kotlin 封装、平台 native JAR 和示例由独立项目
+[`dht-crawler-java`](https://github.com/0xddy/dht-crawler-java) 维护。
 启用 `mimalloc` 前，请确认最终二进制没有注册其他全局分配器。
 
 ## 开发

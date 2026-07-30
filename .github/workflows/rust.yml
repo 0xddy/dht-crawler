@@ -59,6 +59,7 @@ jobs:
           - "mimalloc"
           - "metrics"
           - "mimalloc,metrics"
+          - "jni"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

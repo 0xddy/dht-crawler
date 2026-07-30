@@ -12,10 +12,10 @@ use jni::sys::{jint, jlong};
 
 /// 创建 DHTServer 并返回句柄（jlong）。
 ///
-/// Java 签名：`native long createServer(DHTOptions options, DhtListener listener);`
+/// JVM 签名：`native long createServer(Object options, Object listener);`
 ///
-/// - `options`：`cn.lmcw.dht.model.DHTOptions` 对象，或 null 则使用默认选项。
-/// - `listener`：`cn.lmcw.dht.DhtListener` 实现，或 null 则不注册回调。
+/// - `options`：包含 native 配置字段的 DTO，或 null 则使用默认选项。
+/// - `listener`：实现 `onTorrent`、`onError` 和 `onMetadataFetch` 的对象，或 null。
 /// - 返回：服务器句柄（成功）或 0（失败）。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_cn_lmcw_dht_DhtCrawlerJni_createServer(

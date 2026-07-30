@@ -13,38 +13,6 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
-  # Java fat JAR（平台无关，只需构建一次）
-  # 运行方式：java -Djava.library.path=<so/dll 目录> -jar dht-crawler-jni-example-<ver>.jar
-  # ──────────────────────────────────────────────────────────────────
-  build-java-jar:
-    name: Build Java Example JAR
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Build fat JAR
-        working-directory: examples-jni
-        run: |
-          chmod +x gradlew
-          ./gradlew shadowJar -PprojectVersion=${{ github.event.inputs.version }} --no-daemon
-        shell: bash
-
-      - name: Upload JAR to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.event.inputs.version }}
-          files: examples-jni/build/libs/dht-crawler-jni-example-${{ github.event.inputs.version }}.jar
-
-  # ──────────────────────────────────────────────────────────────────
   # 各平台 Rust 构建（example 可执行 + JNI so/dll/dylib）
   # ──────────────────────────────────────────────────────────────────
   build-and-release:
