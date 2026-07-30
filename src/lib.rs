@@ -58,5 +58,5 @@ pub mod prelude {
 
 #[cfg(feature = "jni")]
 #[path = "../jni/mod.rs"]
-/// JNI entry points used by the bundled Java wrapper.
+/// JNI entry points consumed by the external JVM bindings.
 pub mod jni_bindings;
