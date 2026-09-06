@@ -132,9 +132,9 @@ pub struct MetadataOptions {
     pub max_queue_size: usize,
     /// Maximum number of concurrent Metadata jobs.
     pub max_worker_count: usize,
-    /// Maximum number of cached bad Peer socket addresses.
+    /// Shared capacity for endpoint-wide and (InfoHash, endpoint) failure entries.
     pub peer_failure_cache_capacity: usize,
-    /// Timeout/connect failure cache lifetime in seconds.
+    /// Peer failure cache lifetime in seconds; metadata failures are InfoHash-scoped.
     pub peer_failure_ttl_secs: u64,
 }
 

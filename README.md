@@ -192,6 +192,7 @@ let options = DHTOptions {
 - `PeerLookupOptions::max_lookups_per_second = 0` 会关闭主动 `get_peers`；
 - `PoolOptions::revisit_interval_secs` 限制响应节点的最小重访间隔，默认 `0` 保留立即轮转行为；
   可按实际产出测试 `30` 秒。间隔从请求进入发送队列开始计算，收到回复不会延长间隔；
+  实际发送失败或超时的响应节点另有 5→10→20→40→60 秒退避，成功回复后恢复；
 - Metadata 和爬取队列都是有界的，容量应与下游处理能力一起调整。
 
 ## 数据与运行语义
@@ -201,8 +202,10 @@ let options = DHTOptions {
 才会交付给 torrent 回调。
 
 库使用有界队列控制内存占用。队列满或速率预算耗尽时，新事件可能被拒绝、淘汰或计入
-drop 指标。Metadata 队列按 InfoHash 去重，每个任务可尝试多个候选 Peer；连接超时和
-连接失败的 Peer 会被短期缓存，避免反复占用 worker。
+drop 指标。Metadata 队列按 InfoHash 去重，每个任务最多扫描 64 个不同候选、实际尝试
+12 个 Peer；缓存命中不占实际尝试额度。TCP 建连失败按地址短期缓存；连接建立后的握手、
+Reject 和 metadata 失败按 `(InfoHash, 地址)` 缓存，不阻断同一地址提供其他种子。
+两种缓存共用配置的容量和 TTL，本地校验等待超时不会冷却 Peer。
 
 主动 `get_peers` 结果通过每个任务专属的有界通道返回。初始 Peer 快速失败时，任务仍会
 等待查询完成；结果等待有约 2.4 秒保护期限，已经启动的 Peer 下载继续使用自己的超时。
@@ -229,9 +232,12 @@ println!(
 
 `observability_snapshot()` 提供 UDP、查询、队列、Metadata 失败原因和固定桶直方图。
 这些快照面向监控，读取时不是跨字段事务视图。
-`metadata_timeout_stages` 区分连接及基础握手、扩展握手、分片请求/接收与校验阶段；
+`metadata_timeout_stages` 的 `tcp_connect` 和 `base_handshake` 分别记录 TCP 建连及基础握手，
+并区分扩展握手、分片请求/接收与校验阶段；
 `metadata_connection_errors` 提供类型化连接错误。`connect_handshake` 包含 TCP 连接和
 基础 BitTorrent 握手，不能单独解释成 TCP 建连耗时。
+该兼容聚合项不要与两个子项相加。`observability_snapshot()` 还提供近期探测地址和
+到期索引长度、清理开销、失败退避及两类 Peer 缓存命中数。
 
 启用 `metrics` 后，库通过 [`metrics`](https://crates.io/crates/metrics) facade 记录
 指标，但不会安装 recorder 或启动 HTTP 服务：

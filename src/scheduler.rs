@@ -8,7 +8,7 @@ use crate::types::{MetadataFetchCompletion, MetadataFetchCompletionStatus, Torre
 use arc_swap::ArcSwapOption;
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge, histogram};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -19,8 +19,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-/// Maximum distinct Peer endpoints retained and raced for one InfoHash.
+/// Maximum actual Peer download attempts for one InfoHash, excluding cache skips.
 pub const MAX_METADATA_PEERS_PER_HASH: usize = 12;
+/// Bounded candidate scan/refill budget; cache skips must not consume download attempts.
+pub(crate) const MAX_METADATA_CANDIDATES_PER_HASH: usize = 64;
 const HASH_QUEUE_TTL: Duration = Duration::from_secs(60);
 const PEER_COALESCE_WINDOW: Duration = Duration::from_millis(25);
 const LIVE_PEER_IDLE_GRACE: Duration = Duration::from_millis(300);
@@ -156,7 +158,7 @@ impl PendingHashQueue {
             entry
                 .peers
                 .sort_unstable_by(|left, right| right.discovered_at.cmp(&left.discovered_at));
-            entry.peers.truncate(MAX_METADATA_PEERS_PER_HASH);
+            entry.peers.truncate(MAX_METADATA_CANDIDATES_PER_HASH);
             entry.latest_at = entry.latest_at.max(event.discovered_at);
             entry.order_key = self.next_order_key(entry.latest_at);
             self.order.insert(entry.order_key, entry.info_hash.clone());
@@ -450,7 +452,7 @@ impl MetadataScheduler {
             {
                 QueuePushKind::Stale
             } else if state.scheduled_peers.contains(&hash.peer_addr)
-                || state.scheduled_peers.len() >= MAX_METADATA_PEERS_PER_HASH
+                || state.scheduled_peers.len() >= MAX_METADATA_CANDIDATES_PER_HASH
             {
                 QueuePushKind::Updated
             } else {
@@ -526,13 +528,13 @@ impl MetadataScheduler {
                     .unwrap_or_default()
                     <= HASH_QUEUE_TTL
             });
-            entry.peers.truncate(MAX_METADATA_PEERS_PER_HASH);
+            entry.peers.truncate(MAX_METADATA_CANDIDATES_PER_HASH);
             if entry.peers.is_empty() {
                 self.total_dropped.fetch_add(1, Ordering::Relaxed);
                 self.runtime_stats.metadata_queue_stale(1);
                 continue;
             }
-            let (peer_tx, peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+            let (peer_tx, peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
             let state = InFlightState {
                 peer_tx,
                 scheduled_peers: entry.peers.iter().map(|peer| peer.addr).collect(),
@@ -759,6 +761,17 @@ impl MetadataScheduler {
     }
 }
 
+fn queue_race_candidate(
+    peer: PeerCandidate,
+    source: &'static str,
+    seen: &mut HashSet<SocketAddr>,
+    pending: &mut VecDeque<(PeerCandidate, &'static str)>,
+) {
+    if seen.len() < MAX_METADATA_CANDIDATES_PER_HASH && seen.insert(peer.addr) {
+        pending.push_back((peer, source));
+    }
+}
+
 async fn race_peer_fetches<F, Fut>(
     peers: Vec<PeerCandidate>,
     peer_rx: &mut mpsc::Receiver<PeerCandidate>,
@@ -776,20 +789,18 @@ where
 
     let mut tasks = JoinSet::new();
     let mut seen_peers = HashSet::new();
+    let mut pending_peers = VecDeque::new();
     for peer in peers {
-        if seen_peers.len() >= MAX_METADATA_PEERS_PER_HASH || !seen_peers.insert(peer.addr) {
-            continue;
-        }
-        let fetch = fetch.clone();
-        tasks.spawn(fetch(peer));
-        runtime_stats.metadata_peer_candidate();
-        #[cfg(feature = "metrics")]
-        counter!("dht_metadata_peer_candidates_total", "source" => "initial").increment(1);
+        queue_race_candidate(peer, "initial", &mut seen_peers, &mut pending_peers);
     }
+    // Reserve one potential attempt for every outstanding fetch. A cache skip refunds
+    // its reservation, while any real attempt keeps it, even after a fast failure.
+    // This bounds both simultaneous TCP connections and total actual attempts to 12.
+    let mut attempts_reserved = 0usize;
 
     let mut lookup_open = lookup.is_some();
     let mut lookup_submitted = !lookup_open;
-    let (lookup_peer_tx, mut lookup_peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+    let (lookup_peer_tx, mut lookup_peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
     let submit_lookup = async move {
         if let Some(lookup) = lookup {
             tokio::time::sleep(ACTIVE_PEER_LOOKUP_DELAY).await;
@@ -810,66 +821,64 @@ where
     let mut lookup_deadline_elapsed = false;
     let mut accepting_live_peers = true;
     loop {
-        if seen_peers.len() >= MAX_METADATA_PEERS_PER_HASH {
+        while attempts_reserved < MAX_METADATA_PEERS_PER_HASH {
+            let Some((peer, source)) = pending_peers.pop_front() else {
+                break;
+            };
+            attempts_reserved += 1;
+            tasks.spawn(fetch.clone()(peer));
+            runtime_stats.metadata_peer_candidate();
+            if source != "initial" {
+                runtime_stats.metadata_live_peer_join();
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_live_peer_joins_total").increment(1);
+            }
+            #[cfg(feature = "metrics")]
+            counter!("dht_metadata_peer_candidates_total", "source" => source).increment(1);
+        }
+        if seen_peers.len() >= MAX_METADATA_CANDIDATES_PER_HASH {
             accepting_live_peers = false;
             lookup_open = false;
             peer_rx.close();
             lookup_peer_rx.close();
         }
-        if tasks.is_empty() && !accepting_live_peers && !lookup_open {
+        if tasks.is_empty()
+            && (attempts_reserved >= MAX_METADATA_PEERS_PER_HASH
+                || (pending_peers.is_empty() && !accepting_live_peers && !lookup_open))
+        {
             return None;
         }
 
         tokio::select! {
             result = tasks.join_next(), if !tasks.is_empty() => {
-                let Some(Ok((peer, outcome))) = result else {
-                    continue;
-                };
-                if let MetadataFetchOutcome::Fetched(metadata) = outcome {
-                    let canceled = tasks.len();
-                    runtime_stats.metadata_peer_canceled(canceled);
-                    #[cfg(feature = "metrics")]
-                    counter!("dht_metadata_peer_canceled_total").increment(canceled as u64);
-                    peer_rx.close();
-                    lookup_peer_rx.close();
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    return Some((peer, metadata));
+                let Some(Ok((peer, outcome))) = result else { continue; };
+                match outcome {
+                    MetadataFetchOutcome::SkippedCached => {
+                        attempts_reserved = attempts_reserved.saturating_sub(1);
+                    }
+                    MetadataFetchOutcome::Failed => {},
+                    MetadataFetchOutcome::Fetched(metadata) => {
+                        let canceled = tasks.len();
+                        runtime_stats.metadata_peer_canceled(canceled);
+                        #[cfg(feature = "metrics")]
+                        counter!("dht_metadata_peer_canceled_total").increment(canceled as u64);
+                        peer_rx.close();
+                        lookup_peer_rx.close();
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        return Some((peer, metadata));
+                    }
                 }
             }
             peer = peer_rx.recv(), if accepting_live_peers => {
                 match peer {
-                    Some(peer) if seen_peers.insert(peer.addr) => {
-                        let fetch = fetch.clone();
-                        tasks.spawn(fetch(peer));
-                        runtime_stats.metadata_live_peer_join();
-                        runtime_stats.metadata_peer_candidate();
-                        #[cfg(feature = "metrics")]
-                        {
-                            counter!("dht_metadata_live_peer_joins_total").increment(1);
-                            counter!("dht_metadata_peer_candidates_total", "source" => "live")
-                                .increment(1);
-                        }
-                    }
-                    Some(_) => {}
+                    Some(peer) => queue_race_candidate(peer, "live", &mut seen_peers, &mut pending_peers),
                     None => accepting_live_peers = false,
                 }
             }
             peer = lookup_peer_rx.recv(), if lookup_open => {
                 match peer {
-                    Some(addr) if seen_peers.insert(addr) => {
-                        let fetch = fetch.clone();
-                        tasks.spawn(fetch(PeerCandidate { addr, discovered_at: Instant::now() }));
-                        runtime_stats.metadata_live_peer_join();
-                        runtime_stats.metadata_peer_candidate();
-                        #[cfg(feature = "metrics")]
-                        {
-                            counter!("dht_metadata_live_peer_joins_total").increment(1);
-                            counter!("dht_metadata_peer_candidates_total", "source" => "lookup")
-                                .increment(1);
-                        }
-                    }
-                    Some(_) => {}
+                    Some(addr) => queue_race_candidate(PeerCandidate { addr, discovered_at: Instant::now() }, "lookup", &mut seen_peers, &mut pending_peers),
                     None => lookup_open = false,
                 }
             }
@@ -883,7 +892,7 @@ where
                 // Drain any already-delivered peers before treating the lookup as complete.
             }
             _ = tokio::time::sleep(LIVE_PEER_IDLE_GRACE),
-                if tasks.is_empty() && !lookup_open => return None,
+                if tasks.is_empty() && pending_peers.is_empty() && !lookup_open => return None,
         }
     }
 }
@@ -1015,10 +1024,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_deduplicates_hash_and_keeps_twelve_newest_unique_peers() {
+    fn queue_deduplicates_hash_and_keeps_bounded_newest_unique_peers() {
         let start = Instant::now();
-        let mut queue = PendingHashQueue::new(10, Duration::from_secs(60));
-        for offset in 0..13 {
+        let mut queue = PendingHashQueue::new(10, Duration::from_secs(120));
+        for offset in 0..=MAX_METADATA_CANDIDATES_PER_HASH as u16 {
             assert_ne!(
                 queue.push(
                     event(
@@ -1032,14 +1041,23 @@ mod tests {
             );
         }
         queue.push(
-            event("hash", 1012, start + Duration::from_secs(20)),
-            start + Duration::from_secs(20),
+            event(
+                "hash",
+                1000 + MAX_METADATA_CANDIDATES_PER_HASH as u16,
+                start + Duration::from_secs(100),
+            ),
+            start + Duration::from_secs(100),
         );
 
         assert_eq!(queue.len(), 1);
         let entry = queue.remove("hash").unwrap();
         let ports: Vec<_> = entry.peers.iter().map(|peer| peer.addr.port()).collect();
-        assert_eq!(ports, (1001..=1012).rev().collect::<Vec<_>>());
+        assert_eq!(
+            ports,
+            (1001..=1000 + MAX_METADATA_CANDIDATES_PER_HASH as u16)
+                .rev()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1065,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_hash_routes_at_most_twelve_unique_peers_to_live_race() {
+    fn in_flight_hash_routes_bounded_unique_candidates_to_live_race() {
         let (_hash_tx, hash_rx) = mpsc::channel(4);
         let stats = DhtRuntimeStats::default();
         let scheduler = MetadataScheduler::new_with_runtime_stats(
@@ -1084,7 +1102,7 @@ mod tests {
             CancellationToken::new(),
             stats.clone(),
         );
-        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
         let mut in_flight = HashMap::from([(
             "hash".to_string(),
             InFlightState {
@@ -1095,7 +1113,7 @@ mod tests {
         let mut queue = PendingHashQueue::new(4, HASH_QUEUE_TTL);
         let now = Instant::now();
 
-        for port in 1001..=1013 {
+        for port in 1001..=1001 + MAX_METADATA_CANDIDATES_PER_HASH as u16 {
             scheduler.enqueue(&mut queue, &mut in_flight, event("hash", port, now));
         }
         scheduler.enqueue(&mut queue, &mut in_flight, event("hash", 1001, now));
@@ -1104,16 +1122,22 @@ mod tests {
         while let Ok(peer) = peer_rx.try_recv() {
             received.push(peer.addr.port());
         }
-        assert_eq!(received, (1001..=1011).collect::<Vec<_>>());
+        assert_eq!(
+            received,
+            (1001..1000 + MAX_METADATA_CANDIDATES_PER_HASH as u16).collect::<Vec<_>>()
+        );
         assert_eq!(
             in_flight["hash"].scheduled_peers.len(),
-            MAX_METADATA_PEERS_PER_HASH
+            MAX_METADATA_CANDIDATES_PER_HASH
         );
         assert!(queue.is_empty());
         let snapshot = stats.snapshot();
         // Enqueue only forwards candidates; joining is counted after cross-source race deduplication.
         assert_eq!(snapshot.metadata_live_peer_joins, 0);
-        assert_eq!(snapshot.metadata_queue_deduplicated, 14);
+        assert_eq!(
+            snapshot.metadata_queue_deduplicated,
+            MAX_METADATA_CANDIDATES_PER_HASH as u64 + 2
+        );
     }
 
     #[tokio::test]
@@ -1138,7 +1162,7 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(peers.len()));
         let started_for_race = started.clone();
         let cancelled_for_race = cancelled.clone();
-        let (_peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let (_peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
         let stats = DhtRuntimeStats::default();
         let (lookup, mut request_rx) = lookup_request_channel(1);
 
@@ -1210,7 +1234,7 @@ mod tests {
             addr: SocketAddr::from(([127, 0, 0, 1], 1001)),
             discovered_at: now,
         };
-        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
         let initial_started = Arc::new(tokio::sync::Notify::new());
         let initial_started_for_fetch = initial_started.clone();
         let initial_cancelled = Arc::new(AtomicBool::new(false));
@@ -1289,7 +1313,7 @@ mod tests {
             discovered_at: Instant::now(),
         };
         let duplicate_addr = SocketAddr::from(([127, 0, 0, 1], 1001));
-        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
         let (lookup, mut request_rx) = lookup_request_channel(1);
         let lookup_peer_started = Arc::new(tokio::sync::Notify::new());
         let started_for_actor = lookup_peer_started.clone();
@@ -1388,6 +1412,122 @@ mod tests {
             2,
             "duplicate lookup peer must not consume a slot"
         );
+    }
+
+    #[tokio::test]
+    async fn twelve_cached_candidates_allow_a_late_lookup_winner() {
+        let (_peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            request
+                .peer_tx
+                .send(SocketAddr::from(([127, 0, 0, 1], 2000)))
+                .await
+                .unwrap();
+        });
+        let peers = (1000..1012)
+            .map(|port| PeerCandidate {
+                addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                discovered_at: Instant::now(),
+            })
+            .collect();
+        let actual = Arc::new(AtomicUsize::new(0));
+        let recorded = actual.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            race_peer_fetches(
+                peers,
+                &mut peer_rx,
+                Some(lookup),
+                move |peer| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let outcome = if peer.addr.port() == 2000 {
+                            recorded.fetch_add(1, Ordering::Relaxed);
+                            MetadataFetchOutcome::Fetched(("late".to_string(), 1, vec![], 0))
+                        } else {
+                            MetadataFetchOutcome::SkippedCached
+                        };
+                        (peer, outcome)
+                    }
+                },
+                &DhtRuntimeStats::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        actor.await.unwrap();
+        assert_eq!(result.unwrap().0.addr.port(), 2000);
+        assert_eq!(actual.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_refills_preserve_actual_attempt_and_candidate_scan_bounds() {
+        for all_cached in [false, true] {
+            let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
+            drop(peer_tx);
+            // Inputs exceed the scan bound; even an all-cached stream must stop at 64.
+            let peers = (1000..1100)
+                .map(|port| PeerCandidate {
+                    addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                    discovered_at: Instant::now(),
+                })
+                .collect();
+            let actual = Arc::new(AtomicUsize::new(0));
+            let scanned = Arc::new(AtomicUsize::new(0));
+            let actual_for_fetch = actual.clone();
+            let scanned_for_fetch = scanned.clone();
+            let stats = DhtRuntimeStats::default();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                race_peer_fetches(
+                    peers,
+                    &mut peer_rx,
+                    None,
+                    move |peer| {
+                        let actual = actual_for_fetch.clone();
+                        let scanned = scanned_for_fetch.clone();
+                        async move {
+                            scanned.fetch_add(1, Ordering::Relaxed);
+                            let outcome = if all_cached || peer.addr.port() < 1012 {
+                                MetadataFetchOutcome::SkippedCached
+                            } else {
+                                actual.fetch_add(1, Ordering::Relaxed);
+                                tokio::task::yield_now().await;
+                                MetadataFetchOutcome::Failed
+                            };
+                            (peer, outcome)
+                        }
+                    },
+                    &stats,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_none());
+            assert_eq!(
+                actual.load(Ordering::Relaxed),
+                if all_cached {
+                    0
+                } else {
+                    MAX_METADATA_PEERS_PER_HASH
+                }
+            );
+            assert_eq!(
+                scanned.load(Ordering::Relaxed),
+                if all_cached {
+                    MAX_METADATA_CANDIDATES_PER_HASH
+                } else {
+                    MAX_METADATA_PEERS_PER_HASH * 2
+                }
+            );
+            assert_eq!(
+                stats.snapshot().metadata_peer_candidates,
+                scanned.load(Ordering::Relaxed) as u64
+            );
+        }
     }
 
     #[tokio::test]

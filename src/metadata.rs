@@ -4,9 +4,9 @@ use ahash::AHashMap;
 use bytes::Bytes;
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge, histogram};
-use rbit::peer::ExtensionMessage;
+use rbit::peer::{ExtensionMessage, PeerTransport};
 use rbit::{
-    ExtensionHandshake, Message, MetadataMessage, MetadataMessageType, PeerConnection, PeerError,
+    ExtensionHandshake, Handshake, Message, MetadataMessage, MetadataMessageType, PeerError,
     PeerId, metadata_piece_count,
 };
 use sha1::{Digest, Sha1};
@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 pub(crate) type FetchedMetadata = (String, u64, Vec<FileInfo>, u64);
@@ -33,6 +34,7 @@ enum MetadataFetchFailure {
     SizeLimit,
     Sha1,
     Parse,
+    Reject,
     Other,
 }
 
@@ -59,6 +61,7 @@ fn connection_error_category(error: &PeerError) -> MetadataConnectionError {
 enum PeerFailureReason {
     Timeout,
     ConnectFailed,
+    MetadataFailed,
 }
 
 #[cfg(feature = "metrics")]
@@ -67,6 +70,7 @@ impl PeerFailureReason {
         match self {
             Self::Timeout => "timeout",
             Self::ConnectFailed => "connect_failed",
+            Self::MetadataFailed => "metadata_failed",
         }
     }
 }
@@ -77,10 +81,18 @@ struct PeerFailureEntry {
     reason: PeerFailureReason,
 }
 
+/// A reachable peer can serve other torrents even when one handshake or download fails.
+/// Both scopes share a single configured capacity and TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerFailureKey {
+    Endpoint(SocketAddr),
+    Metadata([u8; 20], SocketAddr),
+}
+
 #[derive(Default)]
 struct PeerFailureCacheInner {
-    entries: AHashMap<SocketAddr, PeerFailureEntry>,
-    expiry: VecDeque<(Instant, SocketAddr)>,
+    entries: AHashMap<PeerFailureKey, PeerFailureEntry>,
+    expiry: VecDeque<(Instant, PeerFailureKey)>,
 }
 
 struct PeerFailureCache {
@@ -101,7 +113,7 @@ impl PeerFailureCache {
         }
     }
 
-    fn get(&self, addr: SocketAddr, now: Instant) -> (Option<PeerFailureReason>, usize) {
+    fn get(&self, key: PeerFailureKey, now: Instant) -> (Option<PeerFailureReason>, usize) {
         if self.capacity == 0 || self.ttl.is_zero() {
             return (None, 0);
         }
@@ -111,12 +123,12 @@ impl PeerFailureCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::expire(&mut inner, now);
         (
-            inner.entries.get(&addr).map(|entry| entry.reason),
+            inner.entries.get(&key).map(|entry| entry.reason),
             inner.entries.len(),
         )
     }
 
-    fn insert(&self, addr: SocketAddr, reason: PeerFailureReason, now: Instant) -> usize {
+    fn insert(&self, addr: PeerFailureKey, reason: PeerFailureReason, now: Instant) -> usize {
         if self.capacity == 0 || self.ttl.is_zero() {
             return 0;
         }
@@ -146,7 +158,7 @@ impl PeerFailureCache {
         inner.entries.len()
     }
 
-    fn remove(&self, addr: &SocketAddr, now: Instant) -> usize {
+    fn remove(&self, addr: &PeerFailureKey, now: Instant) -> usize {
         if self.capacity == 0 || self.ttl.is_zero() {
             return 0;
         }
@@ -234,20 +246,27 @@ impl RbitFetcher {
     where
         F: FnOnce() + Send,
     {
-        let (cached_reason, cache_entries) = self.peer_failure_cache.get(peer_addr, Instant::now());
-        self.set_peer_failure_cache_entries(cache_entries);
-        if let Some(reason) = cached_reason {
-            self.runtime_stats.metadata_peer_failure_cache_hit();
-            match reason {
-                PeerFailureReason::Timeout => self.runtime_stats.peer_cache_hit_timeout(),
-                PeerFailureReason::ConnectFailed => self.runtime_stats.peer_cache_hit_connect(),
+        for key in [
+            PeerFailureKey::Endpoint(peer_addr),
+            PeerFailureKey::Metadata(*info_hash, peer_addr),
+        ] {
+            let (cached_reason, cache_entries) = self.peer_failure_cache.get(key, Instant::now());
+            self.set_peer_failure_cache_entries(cache_entries);
+            if let Some(reason) = cached_reason {
+                self.runtime_stats.metadata_peer_failure_cache_hit();
+                match key {
+                    PeerFailureKey::Endpoint(_) => self.runtime_stats.peer_cache_endpoint_hits(),
+                    PeerFailureKey::Metadata(_, _) => self.runtime_stats.peer_cache_metadata_hits(),
+                }
+                match reason {
+                    PeerFailureReason::Timeout => self.runtime_stats.peer_cache_hit_timeout(),
+                    PeerFailureReason::ConnectFailed => self.runtime_stats.peer_cache_hit_connect(),
+                    PeerFailureReason::MetadataFailed => {}
+                }
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_peer_failure_cache_hits_total", "reason" => reason.as_str(), "scope" => match key { PeerFailureKey::Endpoint(_) => "endpoint", PeerFailureKey::Metadata(_, _) => "metadata" }).increment(1);
+                return MetadataFetchOutcome::SkippedCached;
             }
-            #[cfg(feature = "metrics")]
-            counter!("dht_metadata_peer_failure_cache_hits_total", "reason" => reason.as_str())
-                .increment(1);
-            #[cfg(not(feature = "metrics"))]
-            let _ = reason;
-            return MetadataFetchOutcome::SkippedCached;
         }
 
         on_attempt();
@@ -259,7 +278,7 @@ impl RbitFetcher {
         }
 
         let started = Instant::now();
-        let stage = AtomicU8::new(MetadataTimeoutStage::ConnectHandshake as u8);
+        let stage = AtomicU8::new(MetadataTimeoutStage::TcpConnect as u8);
         let result = timeout(
             self.total_timeout,
             self.fetch_with_peer(info_hash, peer_addr, &stage),
@@ -274,7 +293,12 @@ impl RbitFetcher {
 
         match result {
             Ok(Ok(metadata)) => {
-                let cache_entries = self.peer_failure_cache.remove(&peer_addr, Instant::now());
+                self.peer_failure_cache
+                    .remove(&PeerFailureKey::Endpoint(peer_addr), Instant::now());
+                let cache_entries = self.peer_failure_cache.remove(
+                    &PeerFailureKey::Metadata(*info_hash, peer_addr),
+                    Instant::now(),
+                );
                 self.set_peer_failure_cache_entries(cache_entries);
                 self.runtime_stats.metadata_peer_succeeded();
                 #[cfg(feature = "metrics")]
@@ -285,6 +309,14 @@ impl RbitFetcher {
                 MetadataFetchOutcome::Fetched(metadata)
             }
             Ok(Err(reason)) => {
+                // TCP/base-handshake errors are classified at their boundary. All remaining
+                // remote metadata failures belong to this torrent, not the whole endpoint.
+                if reason != MetadataFetchFailure::Connect {
+                    self.record_peer_failure(
+                        PeerFailureKey::Metadata(*info_hash, peer_addr),
+                        PeerFailureReason::MetadataFailed,
+                    );
+                }
                 self.runtime_stats.metadata_peer_failed();
                 match reason {
                     MetadataFetchFailure::Connect => self.runtime_stats.metadata_failure_connect(),
@@ -297,6 +329,7 @@ impl RbitFetcher {
                     }
                     MetadataFetchFailure::Sha1 => self.runtime_stats.metadata_failure_sha1(),
                     MetadataFetchFailure::Parse => self.runtime_stats.metadata_failure_parse(),
+                    MetadataFetchFailure::Reject => self.runtime_stats.metadata_failure_reject(),
                     MetadataFetchFailure::Other => self.runtime_stats.metadata_failure_other(),
                 }
                 #[cfg(feature = "metrics")]
@@ -305,7 +338,7 @@ impl RbitFetcher {
             }
             Err(_) => {
                 let stage = MetadataTimeoutStage::from_index(stage.load(Ordering::Relaxed));
-                self.record_peer_failure(peer_addr, PeerFailureReason::Timeout);
+                self.record_timeout_failure(info_hash, peer_addr, stage);
                 self.runtime_stats.metadata_peer_failed();
                 self.runtime_stats.metadata_peer_timeout();
                 self.runtime_stats.metadata_failure_timeout();
@@ -322,7 +355,22 @@ impl RbitFetcher {
         }
     }
 
-    fn record_peer_failure(&self, peer_addr: SocketAddr, reason: PeerFailureReason) {
+    fn record_timeout_failure(
+        &self,
+        info_hash: &[u8; 20],
+        addr: SocketAddr,
+        stage: MetadataTimeoutStage,
+    ) {
+        let key = match stage {
+            MetadataTimeoutStage::TcpConnect => PeerFailureKey::Endpoint(addr),
+            // Blocking-pool congestion and local validation are not a peer failure.
+            MetadataTimeoutStage::Validation => return,
+            _ => PeerFailureKey::Metadata(*info_hash, addr),
+        };
+        self.record_peer_failure(key, PeerFailureReason::Timeout);
+    }
+
+    fn record_peer_failure(&self, peer_addr: PeerFailureKey, reason: PeerFailureReason) {
         let cache_entries = self
             .peer_failure_cache
             .insert(peer_addr, reason, Instant::now());
@@ -339,47 +387,91 @@ impl RbitFetcher {
         gauge!("dht_metadata_peer_failure_cache_entries").set(count as f64);
     }
 
-    async fn fetch_with_peer(
+    async fn connect_peer(
         &self,
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
         stage: &AtomicU8,
-    ) -> Result<FetchedMetadata, MetadataFetchFailure> {
-        let peer_id = PeerId::generate();
-        // rbit 0.2.2 combines TCP connect, both base-handshake I/O operations and
-        // info-hash verification here; it exposes no separate TCP timing boundary.
-        let mut conn = match PeerConnection::connect(peer_addr, *info_hash, *peer_id.as_bytes())
-            .await
-        {
-            Ok(conn) => {
-                #[cfg(feature = "metrics")]
-                counter!("dht_metadata_connection_result_total", "result" => "success")
-                    .increment(1);
-                conn
+    ) -> Result<PeerTransport, MetadataFetchFailure> {
+        let stream = TcpStream::connect(peer_addr).await.map_err(|error| {
+            self.record_connection_failure(
+                info_hash,
+                peer_addr,
+                MetadataTimeoutStage::TcpConnect,
+                &PeerError::Io(error),
+            );
+            MetadataFetchFailure::Connect
+        })?;
+        // This is the same public transport, handshake encoder and buffered reader used by
+        // rbit::PeerConnection::connect; retain unread extension frames from the handshake read.
+        let mut transport = PeerTransport::new(stream);
+        stage.store(MetadataTimeoutStage::BaseHandshake as u8, Ordering::Relaxed);
+        let handshake_result = async {
+            let peer_id = PeerId::generate();
+            transport
+                .send_handshake(&Handshake::new(*info_hash, *peer_id.as_bytes()))
+                .await?;
+            let remote = transport.receive_handshake().await?;
+            if remote.info_hash != *info_hash {
+                return Err(PeerError::InfoHashMismatch);
             }
-            Err(error) => {
-                let category = connection_error_category(&error);
-                self.runtime_stats.metadata_connection_error(category);
-                self.record_peer_failure(peer_addr, PeerFailureReason::ConnectFailed);
-                self.runtime_stats.metadata_connect_failed();
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("dht_metadata_connection_result_total", "result" => "failed")
-                        .increment(1);
-                    counter!("dht_metadata_connection_error_total", "reason" => category.as_str())
-                        .increment(1);
-                }
-                return Err(MetadataFetchFailure::Connect);
-            }
-        };
-
-        if !conn.supports_extension {
+            Ok(remote.supports_extension_protocol())
+        }
+        .await;
+        let supports_extension = handshake_result.map_err(|error| {
+            self.record_connection_failure(
+                info_hash,
+                peer_addr,
+                MetadataTimeoutStage::BaseHandshake,
+                &error,
+            );
+            MetadataFetchFailure::Connect
+        })?;
+        #[cfg(feature = "metrics")]
+        counter!("dht_metadata_connection_result_total", "result" => "success").increment(1);
+        if !supports_extension {
             self.runtime_stats.metadata_no_extension();
             #[cfg(feature = "metrics")]
             counter!("dht_metadata_handshake_result_total", "result" => "no_extension_support")
                 .increment(1);
             return Err(MetadataFetchFailure::NoExtension);
         }
+        Ok(transport)
+    }
+
+    fn record_connection_failure(
+        &self,
+        info_hash: &[u8; 20],
+        addr: SocketAddr,
+        stage: MetadataTimeoutStage,
+        error: &PeerError,
+    ) {
+        let category = connection_error_category(error);
+        self.runtime_stats.metadata_connection_error(category);
+        self.runtime_stats.metadata_connect_failed();
+        let key = if stage == MetadataTimeoutStage::TcpConnect {
+            self.runtime_stats.metadata_failure_tcp_connect();
+            PeerFailureKey::Endpoint(addr)
+        } else {
+            self.runtime_stats.metadata_failure_base_handshake();
+            PeerFailureKey::Metadata(*info_hash, addr)
+        };
+        self.record_peer_failure(key, PeerFailureReason::ConnectFailed);
+        #[cfg(feature = "metrics")]
+        {
+            counter!("dht_metadata_connection_result_total", "result" => "failed").increment(1);
+            counter!("dht_metadata_connection_error_total", "reason" => category.as_str())
+                .increment(1);
+        }
+    }
+
+    async fn fetch_with_peer(
+        &self,
+        info_hash: &[u8; 20],
+        peer_addr: SocketAddr,
+        stage: &AtomicU8,
+    ) -> Result<FetchedMetadata, MetadataFetchFailure> {
+        let mut conn = self.connect_peer(info_hash, peer_addr, stage).await?;
 
         let my_ut_metadata_id = 1;
         stage.store(
@@ -389,7 +481,7 @@ impl RbitFetcher {
         let handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", my_ut_metadata_id)]);
         let handshake_bytes = handshake.encode().map_err(|_| MetadataFetchFailure::Send)?;
         if conn
-            .send(Message::Extended {
+            .send_message(&Message::Extended {
                 id: 0,
                 payload: handshake_bytes,
             })
@@ -417,7 +509,7 @@ impl RbitFetcher {
                 Ordering::Relaxed,
             );
             let msg = conn
-                .receive()
+                .receive_message()
                 .await
                 .map_err(|_| MetadataFetchFailure::Other)?;
             let Message::Extended { id, payload } = msg else {
@@ -454,7 +546,7 @@ impl RbitFetcher {
                             .encode()
                             .map_err(|_| MetadataFetchFailure::Send)?;
                         if conn
-                            .send(Message::Extended {
+                            .send_message(&Message::Extended {
                                 id: remote_ut_metadata_id,
                                 payload: encoded,
                             })
@@ -478,6 +570,14 @@ impl RbitFetcher {
             let Ok(meta_msg) = MetadataMessage::decode(&payload) else {
                 continue;
             };
+            if request_sent
+                && meta_msg.msg_type == MetadataMessageType::Reject
+                && (meta_msg.piece as usize) < metadata_piece_count(metadata_size as usize)
+            {
+                #[cfg(feature = "metrics")]
+                counter!("dht_metadata_fetch_fail_total", "reason" => "reject").increment(1);
+                return Err(MetadataFetchFailure::Reject);
+            }
             if meta_msg.msg_type != MetadataMessageType::Data {
                 continue;
             }
@@ -611,15 +711,232 @@ fn parse_metadata(info_bytes: &[u8]) -> Option<FetchedMetadata> {
 mod tests {
     use super::*;
     use crate::{MetadataConnectionErrorsSnapshot, MetadataTimeoutStagesSnapshot};
+    use rbit::PeerConnection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    async fn serve_metadata(mut conn: PeerConnection, metadata: Bytes, reject: bool) {
+        assert!(matches!(
+            conn.receive().await.unwrap(),
+            Message::Extended { id: 0, .. }
+        ));
+        let mut handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", 3)]);
+        handshake.metadata_size = Some(metadata.len() as i64);
+        conn.send(Message::Extended {
+            id: 0,
+            payload: handshake.encode().unwrap(),
+        })
+        .await
+        .unwrap();
+        let Message::Extended { id: 3, payload } = conn.receive().await.unwrap() else {
+            panic!("expected metadata request using the remote extension ID");
+        };
+        assert_eq!(MetadataMessage::decode(&payload).unwrap().piece, 0);
+        let message = if reject {
+            MetadataMessage::reject(0)
+        } else {
+            MetadataMessage::data(0, metadata.len() as u32, metadata)
+        };
+        conn.send(Message::Extended {
+            id: 1,
+            payload: message.encode().unwrap(),
+        })
+        .await
+        .unwrap();
+        if reject {
+            // Keep the TCP socket open: success requires explicit Reject handling, not EOF.
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn torrent_failures_do_not_block_other_hashes_at_the_same_endpoint() {
+        let metadata = Bytes::from_static(b"d6:lengthi1e4:name1:xe");
+        let good_hash: [u8; 20] = Sha1::digest(&metadata).into();
+        for failure in [
+            "hash_mismatch",
+            "reject",
+            "piece_timeout",
+            "handshake_timeout",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let metadata_for_peer = metadata.clone();
+            let actor = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let bad_metadata = metadata_for_peer.clone();
+                let first = tokio::spawn(async move {
+                    match failure {
+                        "hash_mismatch" => {
+                            let mut request = [0; 68];
+                            stream.read_exact(&mut request).await.unwrap();
+                            stream
+                                .write_all(&Handshake::new(good_hash, [9; 20]).encode())
+                                .await
+                                .unwrap();
+                        }
+                        "handshake_timeout" => {
+                            let _stream = stream;
+                            std::future::pending::<()>().await;
+                        }
+                        _ => {
+                            let mut conn = PeerConnection::accept(stream, [7; 20], [9; 20])
+                                .await
+                                .unwrap();
+                            if failure == "reject" {
+                                serve_metadata(conn, bad_metadata, true).await;
+                            } else {
+                                conn.receive().await.unwrap();
+                                let mut hs =
+                                    ExtensionHandshake::with_extensions(&[("ut_metadata", 3)]);
+                                hs.metadata_size = Some(1);
+                                conn.send(Message::Extended {
+                                    id: 0,
+                                    payload: hs.encode().unwrap(),
+                                })
+                                .await
+                                .unwrap();
+                                conn.receive().await.unwrap();
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    }
+                });
+                let (stream, _) = listener.accept().await.unwrap();
+                let conn = PeerConnection::accept(stream, good_hash, [9; 20])
+                    .await
+                    .unwrap();
+                serve_metadata(conn, metadata_for_peer, false).await;
+                first.abort();
+                let _ = first.await;
+            });
+            let stats = DhtRuntimeStats::default();
+            let fetcher = RbitFetcher::new_with_runtime_stats(1, 10, 60, stats.clone());
+            let started = Instant::now();
+            assert!(
+                matches!(
+                    fetcher.fetch(&[7; 20], addr).await,
+                    MetadataFetchOutcome::Failed
+                ),
+                "{failure}"
+            );
+            if failure == "reject" {
+                assert!(
+                    started.elapsed() < Duration::from_millis(800),
+                    "explicit rejection must not wait for timeout"
+                );
+                assert_eq!(stats.observability_snapshot().metadata_failure_reject, 1);
+                assert_eq!(stats.snapshot().metadata_peer_timeouts, 0);
+            }
+            assert!(
+                matches!(
+                    fetcher.fetch(&[7; 20], addr).await,
+                    MetadataFetchOutcome::SkippedCached
+                ),
+                "same hash must remain cooled down: {failure}"
+            );
+            assert!(
+                matches!(
+                    fetcher.fetch(&good_hash, addr).await,
+                    MetadataFetchOutcome::Fetched(_)
+                ),
+                "unrelated hash must remain reachable: {failure}"
+            );
+            timeout(Duration::from_secs(2), actor)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stats.snapshot().metadata_peer_attempts, 2);
+            assert_eq!(stats.observability_snapshot().peer_cache_metadata_hits, 1);
+            assert_eq!(stats.observability_snapshot().peer_cache_endpoint_hits, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_tcp_endpoint_is_cooled_down_across_hashes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let stats = DhtRuntimeStats::default();
+        let fetcher = RbitFetcher::new_with_runtime_stats(1, 10, 60, stats.clone());
+        assert!(matches!(
+            fetcher.fetch(&[7; 20], addr).await,
+            MetadataFetchOutcome::Failed
+        ));
+        assert!(matches!(
+            fetcher.fetch(&[8; 20], addr).await,
+            MetadataFetchOutcome::SkippedCached
+        ));
+        let obs = stats.observability_snapshot();
+        // Windows may deliver a refused-loopback error after our deadline; either
+        // outcome must remain TCP-only and use endpoint scope.
+        assert_eq!(
+            obs.metadata_failure_tcp_connect + obs.metadata_timeout_stages.tcp_connect,
+            1
+        );
+        assert_eq!(obs.metadata_failure_base_handshake, 0);
+        assert_eq!(obs.peer_cache_endpoint_hits, 1);
+        assert_eq!(obs.peer_cache_metadata_hits, 0);
+    }
+
+    #[test]
+    fn validation_pool_delay_does_not_cool_down_a_healthy_peer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            ready_rx.await.unwrap();
+            let metadata = Bytes::from_static(b"d6:lengthi1e4:name1:xe");
+            let hash: [u8; 20] = Sha1::digest(&metadata).into();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let actor = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let conn = PeerConnection::accept(stream, hash, [9; 20]).await.unwrap();
+                    serve_metadata(conn, metadata.clone(), false).await;
+                }
+            });
+            let stats = DhtRuntimeStats::default();
+            let fetcher = RbitFetcher::new_with_runtime_stats(1, 10, 60, stats.clone());
+            let first = fetcher.fetch(&hash, addr).await;
+            // Release the blocking pool before asserting to keep failures from hanging runtime drop.
+            drop(release_tx);
+            blocker.await.unwrap();
+            assert!(matches!(first, MetadataFetchOutcome::Failed));
+            assert_eq!(
+                stats
+                    .observability_snapshot()
+                    .metadata_timeout_stages
+                    .validation,
+                1
+            );
+            assert_eq!(stats.snapshot().metadata_peer_failure_cache_entries, 0);
+            assert!(matches!(
+                fetcher.fetch(&hash, addr).await,
+                MetadataFetchOutcome::Fetched(_)
+            ));
+            timeout(Duration::from_secs(2), actor)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
 
     #[test]
     fn peer_failure_cache_is_socket_specific_and_expires() {
         let start = Instant::now();
         let cache = PeerFailureCache::new(10, Duration::from_secs(60));
-        let first: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let same_ip_other_port: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let first = PeerFailureKey::Endpoint("127.0.0.1:1000".parse().unwrap());
+        let same_ip_other_port = PeerFailureKey::Endpoint("127.0.0.1:1001".parse().unwrap());
 
         assert_eq!(cache.insert(first, PeerFailureReason::Timeout, start), 1);
         assert_eq!(cache.get(first, start).0, Some(PeerFailureReason::Timeout));
@@ -631,8 +948,8 @@ mod tests {
     fn peer_failure_cache_evicts_oldest_at_capacity() {
         let start = Instant::now();
         let cache = PeerFailureCache::new(1, Duration::from_secs(60));
-        let first: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let first = PeerFailureKey::Endpoint("127.0.0.1:1000".parse().unwrap());
+        let second = PeerFailureKey::Endpoint("127.0.0.1:1001".parse().unwrap());
 
         cache.insert(first, PeerFailureReason::Timeout, start);
         cache.insert(second, PeerFailureReason::ConnectFailed, start);
@@ -664,7 +981,7 @@ mod tests {
 
         let cached_started = Instant::now();
         assert!(matches!(
-            fetcher.fetch(&[8; 20], addr).await,
+            fetcher.fetch(&[7; 20], addr).await,
             MetadataFetchOutcome::SkippedCached
         ));
         assert!(cached_started.elapsed() < Duration::from_millis(100));
@@ -683,6 +1000,7 @@ mod tests {
             observability.metadata_timeout_stages,
             MetadataTimeoutStagesSnapshot {
                 connect_handshake: 1,
+                base_handshake: 1,
                 ..Default::default()
             }
         );

@@ -275,8 +275,17 @@ fn create_udp_sock(domain: Domain, ty: Type, addr: SocketAddr) -> std::io::Resul
     }
     let _ = sock.set_reuse_address(true);
     sock.set_nonblocking(true)?;
-    let _ = sock.set_recv_buffer_size(32 * 1024 * 1024);
-    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+    if let Err(error) = sock.set_recv_buffer_size(32 * 1024 * 1024) {
+        log::warn!("Could not request UDP receive buffer for {addr}: {error}");
+    }
+    if let Err(error) = sock.set_send_buffer_size(8 * 1024 * 1024) {
+        log::warn!("Could not request UDP send buffer for {addr}: {error}");
+    }
+    log::info!(
+        "UDP socket {addr} effective buffers: receive={:?}, send={:?}",
+        sock.recv_buffer_size(),
+        sock.send_buffer_size()
+    );
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
 }

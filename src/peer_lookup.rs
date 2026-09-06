@@ -4,6 +4,7 @@ use crate::node_id::TransactionId;
 use crate::protocol::DhtResponse;
 use crate::routing_snapshot::{RoutingSnapshot, xor_distance_cmp};
 use crate::runtime_stats::DhtRuntimeStats;
+use crate::scheduler::MAX_METADATA_CANDIDATES_PER_HASH;
 use crate::types::{NetMode, NodeTuple, PeerLookupOptions};
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
@@ -22,7 +23,7 @@ const LOOKUP_TID_TAG: u8 = 0xa5;
 const MAX_QUERIES_PER_LOOKUP: usize = 12;
 const MAX_CONCURRENT_QUERIES_PER_LOOKUP: usize = 4;
 const MAX_FRONTIER_NODES: usize = 64;
-const MAX_PEERS_PER_LOOKUP: usize = 12;
+const MAX_PEERS_PER_LOOKUP: usize = MAX_METADATA_CANDIDATES_PER_HASH;
 pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(25);
@@ -554,9 +555,10 @@ mod tests {
                 nodes: None,
                 nodes6: None,
                 values: Some(
-                    (0..MAX_PEERS_PER_LOOKUP)
+                    (0..MAX_PEERS_PER_LOOKUP + 8)
                         .map(|offset| {
-                            serde_bytes::ByteBuf::from(vec![8, 8, 4, 4, 0x1a, 0xe1 + offset as u8])
+                            let port = (6881 + offset as u16).to_be_bytes();
+                            serde_bytes::ByteBuf::from(vec![8, 8, 4, 4, port[0], port[1]])
                         })
                         .collect(),
                 ),

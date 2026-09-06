@@ -14,7 +14,7 @@ pub const METADATA_SIZE_BUCKETS_BYTES: [u64; 8] = [
     10 * 1024 * 1024,
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataTimeoutStage {
     ConnectHandshake,
     ExtensionHandshakeSend,
@@ -22,10 +22,12 @@ pub(crate) enum MetadataTimeoutStage {
     PieceRequestSend,
     PieceReceive,
     Validation,
+    TcpConnect,
+    BaseHandshake,
 }
 
 impl MetadataTimeoutStage {
-    const COUNT: usize = 6;
+    const COUNT: usize = 8;
 
     pub(crate) fn from_index(index: u8) -> Self {
         match index {
@@ -34,6 +36,8 @@ impl MetadataTimeoutStage {
             2 => Self::ExtensionHandshakeReceive,
             3 => Self::PieceRequestSend,
             4 => Self::PieceReceive,
+            6 => Self::TcpConnect,
+            7 => Self::BaseHandshake,
             _ => Self::Validation,
         }
     }
@@ -47,17 +51,24 @@ impl MetadataTimeoutStage {
             Self::PieceRequestSend => "piece_request_send",
             Self::PieceReceive => "piece_receive",
             Self::Validation => "validation",
+            Self::TcpConnect => "tcp_connect",
+            Self::BaseHandshake => "base_handshake",
         }
     }
 }
 
 /// End-to-end deadline expirations grouped by the operation active when it expired.
-/// These counters partition `metadata_failure_timeout`; library/OS timeout errors
+/// Except for the compatibility aggregate `connect_handshake`, these counters
+/// partition `metadata_failure_timeout`; library/OS timeout errors
 /// returned before that deadline retain their existing connection/send/other category.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataTimeoutStagesSnapshot {
-    /// rbit's combined TCP connect and base BitTorrent handshake operation.
+    /// Compatibility aggregate: `tcp_connect + base_handshake`.
     pub connect_handshake: u64,
+    /// Establishing the TCP connection, before sending a BitTorrent handshake.
+    pub tcp_connect: u64,
+    /// Sending/receiving and validating the base BitTorrent handshake.
+    pub base_handshake: u64,
     /// Sending our BEP-10 extension handshake.
     pub extension_handshake_send: u64,
     /// Waiting for a usable remote ut_metadata extension handshake.
@@ -102,7 +113,7 @@ impl MetadataConnectionError {
     }
 }
 
-/// Typed error categories from rbit's combined TCP/base-handshake connect operation.
+/// Typed error categories aggregated across TCP and base BitTorrent handshake failures.
 /// These counters partition `metadata_failure_connect`, not TCP-only failures.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataConnectionErrorsSnapshot {
@@ -261,7 +272,7 @@ pub struct DhtObservabilitySnapshot {
     pub metadata_bytes_downloaded: u64,
     /// Metadata Peer attempts reaching the end-to-end timeout.
     pub metadata_failure_timeout: u64,
-    /// Errors from rbit's combined TCP connect and base BitTorrent handshake.
+    /// Compatibility aggregate of TCP connect and base BitTorrent handshake errors.
     pub metadata_failure_connect: u64,
     /// Active stages of end-to-end Metadata deadline expirations.
     pub metadata_timeout_stages: MetadataTimeoutStagesSnapshot,
@@ -283,6 +294,30 @@ pub struct DhtObservabilitySnapshot {
     pub peer_cache_timeout_hits: u64,
     /// Failure-cache hits for previous connection failures.
     pub peer_cache_connect_hits: u64,
+    /// BEP-9 peers explicitly rejecting a requested metadata piece.
+    pub metadata_failure_reject: u64,
+    /// TCP establishment errors, excluding outer deadline expirations.
+    pub metadata_failure_tcp_connect: u64,
+    /// Base BitTorrent handshake errors, excluding outer deadline expirations.
+    pub metadata_failure_base_handshake: u64,
+    /// Failure-cache hits scoped to an unreachable TCP endpoint.
+    pub peer_cache_endpoint_hits: u64,
+    /// Failure-cache hits scoped to one info hash and endpoint.
+    pub peer_cache_metadata_hits: u64,
+    /// Current distinct recently probed endpoints.
+    pub crawl_recent_probe_entries: usize,
+    /// Bounded recent-probe endpoint capacity.
+    pub crawl_recent_probe_capacity: usize,
+    /// Current recent-probe expiry index entries.
+    pub crawl_recent_expiry_entries: usize,
+    /// Expired recent-probe endpoints removed during maintenance.
+    pub crawl_recent_expiry_removed: u64,
+    /// Accumulated recent-probe expiry maintenance time in microseconds.
+    pub crawl_recent_expiry_micros: u64,
+    /// Recent-probe expiry maintenance calls.
+    pub crawl_recent_expiry_calls: u64,
+    /// Responsive endpoints placed in failure backoff.
+    pub responsive_probe_backoffs: u64,
     /// Queue wait observations in milliseconds.
     pub queue_wait_ms: FixedHistogramSnapshot,
     /// End-to-end Peer attempt observations in milliseconds.
@@ -370,7 +405,7 @@ pub struct DhtRuntimeSnapshot {
     pub metadata_peer_failed: u64,
     /// End-to-end Peer timeouts.
     pub metadata_peer_timeouts: u64,
-    /// Errors from rbit's combined TCP connect and base BitTorrent handshake.
+    /// Compatibility aggregate of TCP connect and base BitTorrent handshake errors.
     pub metadata_connect_failed: u64,
     /// Peers without extension-protocol support.
     pub metadata_no_extension: u64,
@@ -519,6 +554,18 @@ struct DhtRuntimeStatsInner {
     metadata_failure_other: AtomicU64,
     peer_cache_timeout_hits: AtomicU64,
     peer_cache_connect_hits: AtomicU64,
+    metadata_failure_reject: AtomicU64,
+    metadata_failure_tcp_connect: AtomicU64,
+    metadata_failure_base_handshake: AtomicU64,
+    peer_cache_endpoint_hits: AtomicU64,
+    peer_cache_metadata_hits: AtomicU64,
+    crawl_recent_probe_entries: AtomicUsize,
+    crawl_recent_probe_capacity: AtomicUsize,
+    crawl_recent_expiry_entries: AtomicUsize,
+    crawl_recent_expiry_removed: AtomicU64,
+    crawl_recent_expiry_micros: AtomicU64,
+    crawl_recent_expiry_calls: AtomicU64,
+    responsive_probe_backoffs: AtomicU64,
     queue_wait_ms: AtomicFixedHistogram<8>,
     fetch_duration_ms: AtomicFixedHistogram<7>,
     metadata_size_bytes: AtomicFixedHistogram<8>,
@@ -527,6 +574,18 @@ struct DhtRuntimeStatsInner {
 impl Default for DhtRuntimeStatsInner {
     fn default() -> Self {
         Self {
+            metadata_failure_reject: AtomicU64::new(0),
+            metadata_failure_tcp_connect: AtomicU64::new(0),
+            metadata_failure_base_handshake: AtomicU64::new(0),
+            peer_cache_endpoint_hits: AtomicU64::new(0),
+            peer_cache_metadata_hits: AtomicU64::new(0),
+            crawl_recent_probe_entries: AtomicUsize::new(0),
+            crawl_recent_probe_capacity: AtomicUsize::new(0),
+            crawl_recent_expiry_entries: AtomicUsize::new(0),
+            crawl_recent_expiry_removed: AtomicU64::new(0),
+            crawl_recent_expiry_micros: AtomicU64::new(0),
+            crawl_recent_expiry_calls: AtomicU64::new(0),
+            responsive_probe_backoffs: AtomicU64::new(0),
             queue_wait_ms: AtomicFixedHistogram::new(METADATA_QUEUE_WAIT_BUCKETS_MS),
             fetch_duration_ms: AtomicFixedHistogram::new(METADATA_FETCH_BUCKETS_MS),
             metadata_size_bytes: AtomicFixedHistogram::new(METADATA_SIZE_BUCKETS_BYTES),
@@ -764,6 +823,8 @@ impl DhtRuntimeStats {
             metadata_failure_connect: inner.metadata_failure_connect.load(Ordering::Relaxed),
             metadata_timeout_stages: MetadataTimeoutStagesSnapshot {
                 connect_handshake: inner.metadata_timeout_stages[0].load(Ordering::Relaxed),
+                tcp_connect: inner.metadata_timeout_stages[6].load(Ordering::Relaxed),
+                base_handshake: inner.metadata_timeout_stages[7].load(Ordering::Relaxed),
                 extension_handshake_send: inner.metadata_timeout_stages[1].load(Ordering::Relaxed),
                 extension_handshake_receive: inner.metadata_timeout_stages[2]
                     .load(Ordering::Relaxed),
@@ -792,6 +853,22 @@ impl DhtRuntimeStats {
             metadata_failure_other: inner.metadata_failure_other.load(Ordering::Relaxed),
             peer_cache_timeout_hits: inner.peer_cache_timeout_hits.load(Ordering::Relaxed),
             peer_cache_connect_hits: inner.peer_cache_connect_hits.load(Ordering::Relaxed),
+            metadata_failure_reject: inner.metadata_failure_reject.load(Ordering::Relaxed),
+            metadata_failure_tcp_connect: inner
+                .metadata_failure_tcp_connect
+                .load(Ordering::Relaxed),
+            metadata_failure_base_handshake: inner
+                .metadata_failure_base_handshake
+                .load(Ordering::Relaxed),
+            peer_cache_endpoint_hits: inner.peer_cache_endpoint_hits.load(Ordering::Relaxed),
+            peer_cache_metadata_hits: inner.peer_cache_metadata_hits.load(Ordering::Relaxed),
+            crawl_recent_probe_entries: inner.crawl_recent_probe_entries.load(Ordering::Relaxed),
+            crawl_recent_probe_capacity: inner.crawl_recent_probe_capacity.load(Ordering::Relaxed),
+            crawl_recent_expiry_entries: inner.crawl_recent_expiry_entries.load(Ordering::Relaxed),
+            crawl_recent_expiry_removed: inner.crawl_recent_expiry_removed.load(Ordering::Relaxed),
+            crawl_recent_expiry_micros: inner.crawl_recent_expiry_micros.load(Ordering::Relaxed),
+            crawl_recent_expiry_calls: inner.crawl_recent_expiry_calls.load(Ordering::Relaxed),
+            responsive_probe_backoffs: inner.responsive_probe_backoffs.load(Ordering::Relaxed),
             queue_wait_ms: inner.queue_wait_ms.snapshot(),
             fetch_duration_ms: inner.fetch_duration_ms.snapshot(),
             metadata_size_bytes: inner.metadata_size_bytes.snapshot(),
@@ -1151,6 +1228,13 @@ impl DhtRuntimeStats {
 
     pub(crate) fn metadata_timeout_stage(&self, stage: MetadataTimeoutStage) {
         self.inner.metadata_timeout_stages[stage as usize].fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            stage,
+            MetadataTimeoutStage::TcpConnect | MetadataTimeoutStage::BaseHandshake
+        ) {
+            self.inner.metadata_timeout_stages[MetadataTimeoutStage::ConnectHandshake as usize]
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn metadata_connection_error(&self, error: MetadataConnectionError) {
@@ -1202,6 +1286,74 @@ impl DhtRuntimeStats {
     pub(crate) fn peer_cache_hit_connect(&self) {
         self.inner
             .peer_cache_connect_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_failure_reject(&self) {
+        self.inner
+            .metadata_failure_reject
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_failure_tcp_connect(&self) {
+        self.inner
+            .metadata_failure_tcp_connect
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_failure_base_handshake(&self) {
+        self.inner
+            .metadata_failure_base_handshake
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_cache_endpoint_hits(&self) {
+        self.inner
+            .peer_cache_endpoint_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_cache_metadata_hits(&self) {
+        self.inner
+            .peer_cache_metadata_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_crawl_recent_probe_entries(&self, entries: usize, capacity: usize) {
+        self.inner
+            .crawl_recent_probe_entries
+            .store(entries, Ordering::Relaxed);
+        self.inner
+            .crawl_recent_probe_capacity
+            .store(capacity, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_crawl_recent_expiry_entries(&self, entries: usize) {
+        self.inner
+            .crawl_recent_expiry_entries
+            .store(entries, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_crawl_recent_expiry_batch(
+        &self,
+        removed: usize,
+        elapsed_micros: u64,
+        calls: u64,
+    ) {
+        self.inner
+            .crawl_recent_expiry_removed
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        self.inner
+            .crawl_recent_expiry_micros
+            .fetch_add(elapsed_micros, Ordering::Relaxed);
+        self.inner
+            .crawl_recent_expiry_calls
+            .fetch_add(calls, Ordering::Relaxed);
+    }
+
+    pub(crate) fn responsive_probe_backoff(&self) {
+        self.inner
+            .responsive_probe_backoffs
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1370,6 +1522,57 @@ mod tests {
                 udp_responses_priority_reserved: 1,
             }
         );
+    }
+
+    #[test]
+    fn timeout_stage_details_preserve_the_legacy_aggregate_and_telemetry_batches() {
+        let stats = DhtRuntimeStats::default();
+        stats.metadata_timeout_stage(MetadataTimeoutStage::TcpConnect);
+        stats.metadata_timeout_stage(MetadataTimeoutStage::BaseHandshake);
+        stats.metadata_timeout_stage(MetadataTimeoutStage::PieceReceive);
+        stats.metadata_failure_reject();
+        stats.metadata_failure_tcp_connect();
+        stats.metadata_failure_base_handshake();
+        stats.peer_cache_endpoint_hits();
+        stats.peer_cache_metadata_hits();
+        stats.set_crawl_recent_probe_entries(7, 10);
+        stats.set_crawl_recent_expiry_entries(7);
+        stats.record_crawl_recent_expiry_batch(2, 5, 3);
+        stats.record_crawl_recent_expiry_batch(1, 4, 2);
+        stats.responsive_probe_backoff();
+        let obs = stats.observability_snapshot();
+        assert_eq!(
+            obs.metadata_timeout_stages,
+            MetadataTimeoutStagesSnapshot {
+                connect_handshake: 2,
+                tcp_connect: 1,
+                base_handshake: 1,
+                piece_receive: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(obs.metadata_failure_reject, 1);
+        assert_eq!(obs.metadata_failure_tcp_connect, 1);
+        assert_eq!(obs.metadata_failure_base_handshake, 1);
+        assert_eq!(obs.peer_cache_endpoint_hits, 1);
+        assert_eq!(obs.peer_cache_metadata_hits, 1);
+        assert_eq!(
+            (
+                obs.crawl_recent_probe_entries,
+                obs.crawl_recent_probe_capacity,
+                obs.crawl_recent_expiry_entries
+            ),
+            (7, 10, 7)
+        );
+        assert_eq!(
+            (
+                obs.crawl_recent_expiry_removed,
+                obs.crawl_recent_expiry_micros,
+                obs.crawl_recent_expiry_calls
+            ),
+            (3, 9, 5)
+        );
+        assert_eq!(obs.responsive_probe_backoffs, 1);
     }
 
     #[test]

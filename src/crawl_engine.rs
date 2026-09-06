@@ -30,6 +30,36 @@ use tokio_util::sync::CancellationToken;
 const SCHEDULE_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_POOL_SCAN_PER_SCHEDULE: usize = 256;
 
+fn recent_probe_capacity(config: &ResolvedCrawlConfig) -> usize {
+    let ttl = config.recent_probe_ttl.as_secs() as u128;
+    let query_window = u128::from(config.max_find_node_rate_per_sec)
+        .saturating_mul(ttl)
+        .saturating_add(u128::from(config.burst));
+    let destination_window = u128::from(config.max_new_destinations_per_minute)
+        .saturating_mul(ttl)
+        .div_ceil(60)
+        .saturating_add(u128::from(
+            config.max_new_destinations_per_minute.div_ceil(60),
+        ));
+    // Previously responsive endpoints can keep refreshing their TTL without
+    // spending destination tokens. Replies to requests already in flight at the
+    // beginning of the window can bring further old endpoints into that set.
+    let resident_window = destination_window
+        .saturating_add(config.responsive_capacity as u128)
+        .saturating_add(config.max_in_flight as u128);
+    let bootstrap_enabled = config.bootstrap_max_nodes_per_round > 0 && config.low_watermark > 0;
+    // Bootstrap can also refresh old endpoints without destination tokens.
+    // Concurrent DNS completions may arrive late, so max_nodes_per_round does
+    // not bound the resident set. All such probes still spend query tokens.
+    // This is a logical bound only: the map and index allocate as entries arrive.
+    let capacity = if bootstrap_enabled {
+        query_window
+    } else {
+        query_window.min(resident_window)
+    };
+    capacity.max(1).min(usize::MAX as u128) as usize
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct PendingKey {
     addr: SocketAddr,
@@ -329,11 +359,13 @@ impl CrawlActor {
         } = init;
         let now = Instant::now();
         let destination_burst = config.max_new_destinations_per_minute.div_ceil(60).max(1);
+        let recent_capacity = recent_probe_capacity(&config);
         Self {
             pool: NodePool::new(
                 config.pool_capacity,
                 config.max_replacements_per_minute,
                 config.recent_probe_ttl,
+                recent_capacity,
                 now,
             ),
             responsive: ResponsiveReservoir::new(
@@ -462,6 +494,12 @@ impl CrawlActor {
                     self.release_pending(pending);
                     self.metrics.send_failures += 1;
                     self.runtime_stats.send_failure();
+                    if self
+                        .responsive
+                        .record_failure(pending.node.addr, pending.dispatched_at, now)
+                    {
+                        self.runtime_stats.responsive_probe_backoff();
+                    }
                     if pending.purpose == ProbePurpose::Bootstrap {
                         self.bootstrap_pool.mark_timeout(pending.node.addr, now);
                     }
@@ -582,7 +620,9 @@ impl CrawlActor {
                 break;
             };
             let subnet = SubnetKey::from_addr(&node.addr);
-            if self.subnet_count(&subnet) >= self.config.max_in_flight_per_subnet {
+            if self.subnet_count(&subnet) >= self.config.max_in_flight_per_subnet
+                || self.responsive.is_backing_off(&node.addr, now)
+            {
                 self.pool.rotate_front_to_back();
                 continue;
             }
@@ -612,7 +652,7 @@ impl CrawlActor {
         let was_recent = self.pool.contains_recent(&node.addr, now);
         if !was_recent && !self.destination_budget.try_take_one(now) {
             self.responsive
-                .defer_revisit(node.addr, now + SCHEDULE_INTERVAL);
+                .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
             return false;
         }
         if self.try_dispatch(node, ProbePurpose::Revisit, now) {
@@ -625,12 +665,14 @@ impl CrawlActor {
             self.destination_budget.refund_one();
         }
         self.responsive
-            .defer_revisit(node.addr, now + SCHEDULE_INTERVAL);
+            .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
         false
     }
 
     fn try_dispatch(&mut self, node: NodeTuple, purpose: ProbePurpose, now: Instant) -> bool {
-        if self.pending.len() >= self.config.max_in_flight {
+        if self.pending.len() >= self.config.max_in_flight
+            || self.responsive.is_backing_off(&node.addr, now)
+        {
             return false;
         }
         let subnet = SubnetKey::from_addr(&node.addr);
@@ -720,6 +762,12 @@ impl CrawlActor {
             self.release_pending(pending);
             self.metrics.timeouts += 1;
             self.runtime_stats.timeout();
+            if self
+                .responsive
+                .record_failure(pending.node.addr, pending.dispatched_at, now)
+            {
+                self.runtime_stats.responsive_probe_backoff();
+            }
             if pending.purpose == ProbePurpose::Bootstrap {
                 self.bootstrap_pool.mark_timeout(pending.node.addr, now);
             }
@@ -790,8 +838,22 @@ impl CrawlActor {
     }
 
     fn flush_metrics(&mut self, now: Instant) {
+        let (recent_entries, recent_capacity, expiry_entries) = self.pool.recent_state();
+        self.runtime_stats
+            .set_crawl_recent_probe_entries(recent_entries, recent_capacity);
+        self.runtime_stats
+            .set_crawl_recent_expiry_entries(expiry_entries);
+        let (expired, expiry_micros, expiry_calls) = self.pool.take_recent_expiry_stats();
+        self.runtime_stats
+            .record_crawl_recent_expiry_batch(expired, expiry_micros, expiry_calls);
         #[cfg(feature = "metrics")]
         {
+            gauge!("dht_crawl_recent_probe_entries").set(recent_entries as f64);
+            gauge!("dht_crawl_recent_probe_capacity").set(recent_capacity as f64);
+            gauge!("dht_crawl_recent_expiry_entries").set(expiry_entries as f64);
+            counter!("dht_crawl_recent_expiry_removed_total").increment(expired as u64);
+            counter!("dht_crawl_recent_expiry_micros_total").increment(expiry_micros);
+            counter!("dht_crawl_recent_expiry_calls_total").increment(expiry_calls);
             let metadata_pressure = self.metadata_pressure();
             gauge!("dht_node_pool_size").set(self.pool.len() as f64);
             gauge!("dht_node_pool_oldest_age_seconds").set(self.pool.oldest_age(now).as_secs_f64());
@@ -929,6 +991,141 @@ mod tests {
         assert_eq!(egress_rx.try_recv().unwrap().node, first);
         assert_eq!(runtime_stats.snapshot().queries_revisit, 1);
         assert!(!actor.schedule_revisit(now + Duration::from_secs(29)));
+    }
+
+    #[test]
+    fn send_failures_and_timeouts_back_off_without_blocking_healthy_pool_nodes() {
+        for send_failed in [true, false] {
+            let mut options = CrawlOptions::default();
+            options.pool.low_watermark = 0;
+            let config = ResolvedCrawlConfig::from_options(&options);
+            let (mut actor, mut egress_rx, runtime_stats) = test_actor(config);
+            let start = Instant::now() + Duration::from_secs(1);
+            let blocked = node(1, "8.8.8.8:6881");
+            let healthy = node(2, "1.1.1.1:6881");
+            actor.responsive.record(blocked, start, start);
+            actor.pool.admit(blocked, start);
+            actor.pool.admit(healthy, start);
+            assert!(actor.try_dispatch(
+                blocked,
+                ProbePurpose::Revisit,
+                start + Duration::from_secs(1)
+            ));
+            let request = egress_rx.try_recv().unwrap();
+            let now = start + Duration::from_secs(4);
+            if send_failed {
+                actor.handle_priority(PriorityEvent::SendFailed(request.key), now);
+            } else {
+                actor.expire_pending(now);
+            }
+            assert!(actor.responsive.is_backing_off(&blocked.addr, now));
+            assert!(!actor.try_dispatch(blocked, ProbePurpose::Bootstrap, now));
+            assert!(actor.responsive.snapshot(10, now).is_empty());
+            assert!(actor.schedule_one(now));
+            assert_eq!(egress_rx.try_recv().unwrap().node, healthy);
+            assert_eq!(actor.pool.front(), Some(blocked));
+            assert_eq!(
+                runtime_stats
+                    .observability_snapshot()
+                    .responsive_probe_backoffs,
+                1
+            );
+            assert!(actor.schedule_one(now + Duration::from_secs(5)));
+            assert_eq!(egress_rx.try_recv().unwrap().node, blocked);
+        }
+    }
+
+    #[test]
+    fn recent_cache_limit_covers_resident_refreshes_and_bootstrap_probes() {
+        let mut options = CrawlOptions::default();
+        options.rate_limit.max_find_node_rate_per_sec = 300_000;
+        options.rate_limit.burst = 3_840;
+        options.rate_limit.max_in_flight = 98_304;
+        options.rate_limit.max_new_destinations_per_minute = 1_440_000;
+        options.pool.responsive_capacity = 589_824;
+        options.pool.recent_probe_ttl_secs = 180;
+        let with_bootstrap = ResolvedCrawlConfig::from_options(&options);
+        assert_eq!(recent_probe_capacity(&with_bootstrap), 54_003_840);
+        options.pool.low_watermark = 0;
+        let (mut actor, _egress_rx, stats) =
+            test_actor(ResolvedCrawlConfig::from_options(&options));
+        assert_eq!(actor.pool.recent_state(), (0, 5_032_128, 0));
+        let now = Instant::now();
+        actor.pool.record_probe(node(1, "8.8.8.8:1").addr, now);
+        actor.flush_metrics(now);
+        let snapshot = stats.observability_snapshot();
+        assert_eq!(snapshot.crawl_recent_probe_entries, 1);
+        assert_eq!(snapshot.crawl_recent_probe_capacity, 5_032_128);
+        assert_eq!(snapshot.crawl_recent_expiry_entries, 1);
+    }
+
+    #[test]
+    fn refreshing_old_responsive_nodes_does_not_evict_the_new_destination_window() {
+        let mut options = CrawlOptions::default();
+        options.rate_limit.max_find_node_rate_per_sec = 100;
+        options.rate_limit.burst = 10;
+        options.rate_limit.max_in_flight = 2;
+        options.rate_limit.max_new_destinations_per_minute = 60;
+        options.pool.responsive_capacity = 3;
+        options.pool.recent_probe_ttl_secs = 10;
+        options.pool.low_watermark = 0;
+        let (mut actor, _egress_rx, _) = test_actor(ResolvedCrawlConfig::from_options(&options));
+        assert_eq!(actor.pool.recent_state().1, 11 + 3 + 2);
+        let start = Instant::now();
+        let old: Vec<_> = (1..=3)
+            .map(|port| SocketAddr::from(([8, 8, 8, 8], port)))
+            .collect();
+        for addr in &old {
+            actor.pool.record_probe(*addr, start);
+        }
+        // One new endpoint/second is within the destination budget, while the
+        // already-responsive endpoints refresh without spending that budget.
+        for second in 1..=10 {
+            let now = start + Duration::from_secs(second);
+            for addr in &old {
+                actor.pool.record_probe(*addr, now);
+            }
+            actor
+                .pool
+                .record_probe(SocketAddr::from(([1, 1, 1, 1], second as u16)), now);
+        }
+        let now = start + Duration::from_secs(10);
+        for addr in old {
+            assert!(actor.pool.contains_recent(&addr, now));
+        }
+        for port in 1..=10 {
+            assert!(
+                actor
+                    .pool
+                    .contains_recent(&SocketAddr::from(([1, 1, 1, 1], port)), now)
+            );
+        }
+        assert_eq!(actor.pool.recent_state(), (13, 16, 13));
+    }
+
+    #[test]
+    fn zero_rates_are_finite_and_zero_destination_budget_does_not_disable_the_limit() {
+        let mut options = CrawlOptions::default();
+        options.pool.low_watermark = 0;
+        options.rate_limit.max_new_destinations_per_minute = 0;
+        let config = ResolvedCrawlConfig::from_options(&options);
+        let expected = config.responsive_capacity + config.max_in_flight;
+        let query_bound = config.max_find_node_rate_per_sec as usize
+            * config.recent_probe_ttl.as_secs() as usize
+            + config.burst as usize;
+        assert_eq!(
+            recent_probe_capacity(&config),
+            expected.min(query_bound).max(1)
+        );
+        let (mut actor, _egress_rx, _) = test_actor(config);
+        assert!(
+            !actor
+                .destination_budget
+                .try_take_one(Instant::now() + Duration::from_secs(1000))
+        );
+        options.rate_limit.max_find_node_rate_per_sec = 0;
+        let config = ResolvedCrawlConfig::from_options(&options);
+        assert_eq!(recent_probe_capacity(&config), 1);
     }
 
     #[test]
