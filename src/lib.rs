@@ -32,6 +32,7 @@ mod udp_ingress;
 pub use error::{DHTError, Result};
 pub use runtime_stats::{
     DhtObservabilitySnapshot, DhtRuntimeSnapshot, DhtRuntimeStats, FixedHistogramSnapshot,
+    MetadataConnectionErrorsSnapshot, MetadataTimeoutStagesSnapshot,
 };
 pub use scheduler::{MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits};
 pub use server::{DHTServer, HashDiscovered};

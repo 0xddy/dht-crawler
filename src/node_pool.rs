@@ -2,7 +2,7 @@ use crate::addr::is_valid_node_addr;
 use crate::budget::RateBucket;
 use crate::types::NodeTuple;
 use ahash::{AHashMap, AHashSet};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -170,6 +170,8 @@ impl NodePool {
 struct ResponsiveEntry {
     node: NodeTuple,
     expires_at: Instant,
+    last_probe_at: Instant,
+    revisit_key: Option<(Instant, u64, usize)>,
 }
 
 /// Fixed-size responsive-node ring. The crawl actor is the only writer.
@@ -177,60 +179,110 @@ pub(crate) struct ResponsiveReservoir {
     slots: Vec<Option<ResponsiveEntry>>,
     index: AHashMap<SocketAddr, usize>,
     write_cursor: usize,
-    revisit_cursor: usize,
+    revisits: BTreeSet<(Instant, u64, usize)>,
+    revisit_sequence: u64,
     ttl: Duration,
+    revisit_interval: Duration,
 }
 
 impl ResponsiveReservoir {
-    pub(crate) fn new(capacity: usize, ttl: Duration) -> Self {
+    pub(crate) fn new(capacity: usize, ttl: Duration, revisit_interval: Duration) -> Self {
         let capacity = capacity.max(1);
         Self {
             slots: vec![None; capacity],
             index: AHashMap::with_capacity(capacity),
             write_cursor: 0,
-            revisit_cursor: 0,
+            revisits: BTreeSet::new(),
+            revisit_sequence: 0,
             ttl,
+            revisit_interval,
         }
     }
 
-    pub(crate) fn record(&mut self, node: NodeTuple, now: Instant) {
-        let entry = ResponsiveEntry {
-            node,
-            expires_at: now + self.ttl,
-        };
+    pub(crate) fn record(&mut self, node: NodeTuple, now: Instant, probed_at: Instant) {
         if let Some(slot) = self.index.get(&node.addr).copied() {
-            self.slots[slot] = Some(entry);
+            let entry = self.slots[slot].as_mut().expect("indexed slot exists");
+            entry.node = node;
+            entry.expires_at = now + self.ttl;
+            // Replies refresh liveness, not the time of the last dispatched probe.
             return;
         }
 
         let slot = self.write_cursor;
-        if let Some(old) = self.slots[slot]
-            && self.index.get(&old.node.addr).copied() == Some(slot)
-        {
+        if let Some(old) = self.slots[slot] {
             self.index.remove(&old.node.addr);
+            if let Some(key) = old.revisit_key {
+                self.revisits.remove(&key);
+            }
         }
-        self.slots[slot] = Some(entry);
+        self.slots[slot] = Some(ResponsiveEntry {
+            node,
+            expires_at: now + self.ttl,
+            last_probe_at: probed_at,
+            revisit_key: None,
+        });
         self.index.insert(node.addr, slot);
+        self.enqueue_revisit(slot, probed_at + self.revisit_interval);
         self.write_cursor = (self.write_cursor + 1) % self.slots.len();
     }
 
+    /// Reserve one eligible node. The caller must record a successful dispatch
+    /// or defer it after a failure before selecting another candidate.
     pub(crate) fn next_revisit(&mut self, now: Instant) -> Option<NodeTuple> {
-        for _ in 0..self.slots.len() {
-            let slot = self.revisit_cursor;
-            self.revisit_cursor = (self.revisit_cursor + 1) % self.slots.len();
-            let Some(entry) = self.slots[slot] else {
-                continue;
-            };
+        // A cold reservoir returns immediately, and expiry cleanup has a fixed
+        // per-call bound rather than scanning the entire reservoir on every tick.
+        for _ in 0..256 {
+            let key = self.revisits.first().copied()?;
+            if key.0 > now {
+                return None;
+            }
+            self.revisits.remove(&key);
+            let slot = key.2;
+            let entry = self.slots[slot].as_mut().expect("scheduled slot exists");
+            entry.revisit_key = None;
             if entry.expires_at <= now {
-                if self.index.get(&entry.node.addr).copied() == Some(slot) {
-                    self.index.remove(&entry.node.addr);
-                }
+                self.index.remove(&entry.node.addr);
                 self.slots[slot] = None;
                 continue;
             }
             return Some(entry.node);
         }
         None
+    }
+
+    pub(crate) fn record_probe(&mut self, addr: SocketAddr, now: Instant) {
+        let Some(slot) = self.index.get(&addr).copied() else {
+            return;
+        };
+        self.slots[slot]
+            .as_mut()
+            .expect("indexed slot exists")
+            .last_probe_at = now;
+        self.enqueue_revisit(slot, now + self.revisit_interval);
+    }
+
+    /// Briefly yield a candidate whose dispatch was blocked, without claiming
+    /// that another probe was sent or imposing the full revisit cooldown.
+    pub(crate) fn defer_revisit(&mut self, addr: SocketAddr, retry_at: Instant) {
+        let Some(slot) = self.index.get(&addr).copied() else {
+            return;
+        };
+        let entry = self.slots[slot].expect("indexed slot exists");
+        self.enqueue_revisit(
+            slot,
+            retry_at.max(entry.last_probe_at + self.revisit_interval),
+        );
+    }
+
+    fn enqueue_revisit(&mut self, slot: usize, when: Instant) {
+        let entry = self.slots[slot].as_mut().expect("scheduled slot exists");
+        if let Some(key) = entry.revisit_key {
+            self.revisits.remove(&key);
+        }
+        let key = (when, self.revisit_sequence, slot);
+        self.revisit_sequence = self.revisit_sequence.wrapping_add(1);
+        entry.revisit_key = Some(key);
+        self.revisits.insert(key);
     }
 
     pub(crate) fn snapshot(&self, limit: usize, now: Instant) -> Vec<NodeTuple> {
@@ -358,13 +410,74 @@ mod tests {
     #[test]
     fn responsive_ring_overwrites_without_growing() {
         let start = Instant::now();
-        let mut reservoir = ResponsiveReservoir::new(2, Duration::from_secs(10));
-        reservoir.record(node(1, "8.8.8.8:1"), start);
-        reservoir.record(node(2, "1.1.1.1:2"), start);
-        reservoir.record(node(3, "9.9.9.9:3"), start);
+        let mut reservoir = ResponsiveReservoir::new(2, Duration::from_secs(10), Duration::ZERO);
+        reservoir.record(node(1, "8.8.8.8:1"), start, start);
+        reservoir.record(node(2, "1.1.1.1:2"), start, start);
+        reservoir.record(node(3, "9.9.9.9:3"), start, start);
         let snapshot = reservoir.snapshot(10, start);
         assert_eq!(snapshot.len(), 2);
         assert!(!snapshot.iter().any(|entry| entry.id == [1; 20]));
+        assert_eq!(reservoir.revisits.len(), 2);
+    }
+
+    #[test]
+    fn revisit_cooldown_starts_at_dispatch_and_replies_do_not_extend_it() {
+        let start = Instant::now();
+        let mut reservoir =
+            ResponsiveReservoir::new(2, Duration::from_secs(90), Duration::from_secs(30));
+        let first = node(1, "8.8.8.8:1");
+        reservoir.record(first, start + Duration::from_secs(2), start);
+        assert_eq!(
+            reservoir.next_revisit(start + Duration::from_secs(29)),
+            None
+        );
+        let dispatched = start + Duration::from_secs(30);
+        assert_eq!(reservoir.next_revisit(dispatched), Some(first));
+        reservoir.record_probe(first.addr, dispatched);
+        reservoir.record(first, start + Duration::from_secs(32), dispatched);
+        assert_eq!(
+            reservoir.next_revisit(start + Duration::from_secs(59)),
+            None
+        );
+        assert_eq!(
+            reservoir.next_revisit(start + Duration::from_secs(60)),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn zero_revisit_interval_keeps_immediate_round_robin() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(2, Duration::from_secs(10), Duration::ZERO);
+        let first = node(1, "8.8.8.8:1");
+        let second = node(2, "1.1.1.1:2");
+        reservoir.record(first, start, start);
+        reservoir.record(second, start, start);
+        for expected in [first, second, first, second] {
+            assert_eq!(reservoir.next_revisit(start), Some(expected));
+            reservoir.record_probe(expected.addr, start);
+            assert_eq!(reservoir.revisits.len(), 2);
+        }
+    }
+
+    #[test]
+    fn revisit_expiry_cleanup_is_bounded_and_removes_time_index_entries() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(300, Duration::from_secs(10), Duration::ZERO);
+        for port in 1..=300 {
+            reservoir.record(node(1, &format!("8.8.8.8:{port}")), start, start);
+        }
+        assert_eq!(
+            reservoir.next_revisit(start + Duration::from_secs(11)),
+            None
+        );
+        assert_eq!(reservoir.revisits.len(), 44);
+        assert_eq!(
+            reservoir.next_revisit(start + Duration::from_secs(11)),
+            None
+        );
+        assert!(reservoir.revisits.is_empty());
+        assert!(reservoir.index.is_empty());
     }
 
     #[test]

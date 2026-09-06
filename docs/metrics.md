@@ -57,7 +57,7 @@ actor 每秒把内部增量 flush 到 counter，因此 exporter 看到的 counte
 
 | 指标 | 类型 | 标签 | 单位/含义 |
 |---|---|---|---|
-| `dht_metadata_queue_depth` | gauge | — | Pending Hash 数 |
+| `dht_metadata_queue_depth` | gauge | — | 排队和执行中的 Hash 总数 |
 | `dht_metadata_in_flight` | gauge | — | 当前 job 数 |
 | `dht_metadata_queue_events_total` | counter | `result=inserted|deduplicated|evicted_oldest|stale|expired` | 队列事件 |
 | `dht_metadata_queue_wait_seconds` | histogram | — | Hash 从最近发现到首次分派的秒数 |
@@ -76,6 +76,8 @@ actor 每秒把内部增量 flush 到 counter，因此 exporter 看到的 counte
 | `dht_metadata_fetch_result_total` | counter | `result=success|failed|timeout` | Peer 尝试结果 |
 | `dht_metadata_fetch_fail_total` | counter | `reason=timeout|send_error|size_limit|sha1_mismatch|parse_error` | 详细失败原因 |
 | `dht_metadata_connection_result_total` | counter | `result=success|failed` | TCP/BitTorrent connect 结果 |
+| `dht_metadata_timeout_stage_total` | counter | `stage=connect_handshake|extension_handshake_send|extension_handshake_receive|piece_request_send|piece_receive|validation` | 端到端期限到达时所在阶段 |
+| `dht_metadata_connection_error_total` | counter | `reason=refused|reset|aborted|closed|timeout|invalid_handshake|info_hash_mismatch|io_other|other` | TCP 连接及基础握手返回的类型化错误 |
 | `dht_metadata_handshake_result_total` | counter | `result=success|no_extension_support` | 扩展能力/最终校验结果 |
 | `dht_metadata_fetch_duration_seconds` | histogram | — | 端到端 Peer 尝试秒数 |
 | `dht_metadata_size_bytes` | histogram | — | 完整 bencoded info payload 字节数 |
@@ -86,6 +88,12 @@ actor 每秒把内部增量 flush 到 counter，因此 exporter 看到的 counte
 
 `dht_metadata_fetch_result_total{result="failed"}` 汇总非 timeout 的失败，不适合单独用于
 分析具体原因；详细原因应结合 `fetch_fail`、connection 和 handshake 指标。
+
+`connect_handshake` 包含 TCP 连接和基础 BitTorrent 握手；阶段 timeout 仅统计外层端到端
+期限到达，连接错误中的 `timeout` 则是库内部返回的错误。计数分类不依赖错误字符串。
+任务接收 lookup 结果时不再经过共享 Hash ingress，因此不会产生对应的 queue insert/dedup
+事件。Peer candidate 的 `source` 增加 `lookup`；同一端点经 lookup 和 announce 到达只作为
+一个实际加入的 live Peer 计数。
 
 ## 与原子快照的关系
 

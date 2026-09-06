@@ -366,7 +366,6 @@ impl DHTServer {
             node_id,
             &sockets_by_bind_addr,
             crawl_engine.snapshot.clone(),
-            hash_events_tx.clone(),
             PeerLookupRuntime {
                 options: options.peer_lookup.clone(),
                 stats: runtime_stats.clone(),

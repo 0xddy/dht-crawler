@@ -1,4 +1,5 @@
 use crate::metadata::{FetchedMetadata, MetadataFetchOutcome, RbitFetcher};
+use crate::peer_lookup::{LOOKUP_TIMEOUT, PeerLookupRequest};
 #[cfg(test)]
 use crate::runtime_stats::DhtRuntimeLimits;
 use crate::runtime_stats::DhtRuntimeStats;
@@ -60,13 +61,18 @@ pub struct MetadataSchedulerCallbacks {
 
 pub(crate) struct MetadataSchedulerRuntime {
     pub(crate) stats: DhtRuntimeStats,
-    pub(crate) peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
+    pub(crate) peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PeerCandidate {
     addr: SocketAddr,
     discovered_at: Instant,
+}
+
+struct JobPeerLookup {
+    request_tx: mpsc::Sender<PeerLookupRequest>,
+    info_hash: [u8; 20],
 }
 
 #[derive(Debug)]
@@ -269,7 +275,7 @@ pub struct MetadataScheduler {
     total_completed: Arc<AtomicU64>,
     queue_len: Arc<AtomicUsize>,
     runtime_stats: DhtRuntimeStats,
-    peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
+    peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
     shutdown: CancellationToken,
 }
 
@@ -455,9 +461,6 @@ impl MetadataScheduler {
                 match state.peer_tx.try_send(peer) {
                     Ok(()) => {
                         state.scheduled_peers.insert(hash.peer_addr);
-                        self.runtime_stats.metadata_live_peer_join();
-                        #[cfg(feature = "metrics")]
-                        counter!("dht_metadata_live_peer_joins_total").increment(1);
                         QueuePushKind::Updated
                     }
                     Err(_) => QueuePushKind::Updated,
@@ -630,7 +633,7 @@ impl MetadataScheduler {
         callback: &Arc<ArcSwapOption<TorrentAckCallback>>,
         on_metadata_fetch: &Arc<ArcSwapOption<MetadataFetchCallback>>,
         runtime_stats: &DhtRuntimeStats,
-        peer_lookup_tx: Option<mpsc::Sender<[u8; 20]>>,
+        peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
     ) -> JobResult {
         if let Some(gate) = on_metadata_fetch.load_full()
             && !gate(job.info_hash.clone()).await
@@ -660,15 +663,14 @@ impl MetadataScheduler {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_fetch = attempts.clone();
         let fetcher_for_race = fetcher.clone();
-        let lookup_task = peer_lookup_tx.map(|peer_lookup_tx| {
-            tokio::spawn(async move {
-                tokio::time::sleep(ACTIVE_PEER_LOOKUP_DELAY).await;
-                let _ = peer_lookup_tx.try_send(info_hash_bytes);
-            })
+        let lookup = peer_lookup_tx.map(|request_tx| JobPeerLookup {
+            request_tx,
+            info_hash: info_hash_bytes,
         });
         let fetched = race_peer_fetches(
             job.peers,
             &mut job.peer_rx,
+            lookup,
             move |peer| {
                 let attempts = attempts_for_fetch.clone();
                 let fetcher = fetcher_for_race.clone();
@@ -684,9 +686,6 @@ impl MetadataScheduler {
             runtime_stats,
         )
         .await;
-        if let Some(task) = lookup_task {
-            task.abort();
-        }
         let attempts = attempts.load(Ordering::Relaxed);
 
         if let Some((peer, (name, total_size, files, piece_length))) = fetched {
@@ -763,6 +762,7 @@ impl MetadataScheduler {
 async fn race_peer_fetches<F, Fut>(
     peers: Vec<PeerCandidate>,
     peer_rx: &mut mpsc::Receiver<PeerCandidate>,
+    lookup: Option<JobPeerLookup>,
     fetch: F,
     runtime_stats: &DhtRuntimeStats,
 ) -> Option<(PeerCandidate, FetchedMetadata)>
@@ -775,39 +775,53 @@ where
     counter!("dht_metadata_peer_races_total").increment(1);
 
     let mut tasks = JoinSet::new();
-    let mut candidates = 0usize;
+    let mut seen_peers = HashSet::new();
     for peer in peers {
+        if seen_peers.len() >= MAX_METADATA_PEERS_PER_HASH || !seen_peers.insert(peer.addr) {
+            continue;
+        }
         let fetch = fetch.clone();
         tasks.spawn(fetch(peer));
-        candidates += 1;
         runtime_stats.metadata_peer_candidate();
         #[cfg(feature = "metrics")]
         counter!("dht_metadata_peer_candidates_total", "source" => "initial").increment(1);
     }
 
-    let mut accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
+    let mut lookup_open = lookup.is_some();
+    let mut lookup_submitted = !lookup_open;
+    let (lookup_peer_tx, mut lookup_peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+    let submit_lookup = async move {
+        if let Some(lookup) = lookup {
+            tokio::time::sleep(ACTIVE_PEER_LOOKUP_DELAY).await;
+            // Full/closed request queues drop the result sender and promptly end the wait.
+            let _ = lookup.request_tx.try_send(PeerLookupRequest {
+                info_hash: lookup.info_hash,
+                peer_tx: lookup_peer_tx,
+            });
+        }
+    };
+    tokio::pin!(submit_lookup);
+    // Includes request-channel delay and a small scheduling allowance. The actor has its
+    // own deadline too, but a stalled or cancelled actor must never hold a job indefinitely.
+    let lookup_deadline = tokio::time::Instant::now()
+        + ACTIVE_PEER_LOOKUP_DELAY
+        + LOOKUP_TIMEOUT
+        + LIVE_PEER_IDLE_GRACE;
+    let mut lookup_deadline_elapsed = false;
+    let mut accepting_live_peers = true;
     loop {
-        if tasks.is_empty() {
-            if !accepting_live_peers {
-                return None;
-            }
-            match tokio::time::timeout(LIVE_PEER_IDLE_GRACE, peer_rx.recv()).await {
-                Ok(Some(peer)) => {
-                    let fetch = fetch.clone();
-                    tasks.spawn(fetch(peer));
-                    candidates += 1;
-                    runtime_stats.metadata_peer_candidate();
-                    #[cfg(feature = "metrics")]
-                    counter!("dht_metadata_peer_candidates_total", "source" => "live").increment(1);
-                    accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
-                }
-                Ok(None) | Err(_) => return None,
-            }
-            continue;
+        if seen_peers.len() >= MAX_METADATA_PEERS_PER_HASH {
+            accepting_live_peers = false;
+            lookup_open = false;
+            peer_rx.close();
+            lookup_peer_rx.close();
+        }
+        if tasks.is_empty() && !accepting_live_peers && !lookup_open {
+            return None;
         }
 
         tokio::select! {
-            result = tasks.join_next() => {
+            result = tasks.join_next(), if !tasks.is_empty() => {
                 let Some(Ok((peer, outcome))) = result else {
                     continue;
                 };
@@ -817,6 +831,7 @@ where
                     #[cfg(feature = "metrics")]
                     counter!("dht_metadata_peer_canceled_total").increment(canceled as u64);
                     peer_rx.close();
+                    lookup_peer_rx.close();
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     return Some((peer, metadata));
@@ -824,19 +839,51 @@ where
             }
             peer = peer_rx.recv(), if accepting_live_peers => {
                 match peer {
-                    Some(peer) => {
+                    Some(peer) if seen_peers.insert(peer.addr) => {
                         let fetch = fetch.clone();
                         tasks.spawn(fetch(peer));
-                        candidates += 1;
+                        runtime_stats.metadata_live_peer_join();
                         runtime_stats.metadata_peer_candidate();
                         #[cfg(feature = "metrics")]
-                        counter!("dht_metadata_peer_candidates_total", "source" => "live")
-                            .increment(1);
-                        accepting_live_peers = candidates < MAX_METADATA_PEERS_PER_HASH;
+                        {
+                            counter!("dht_metadata_live_peer_joins_total").increment(1);
+                            counter!("dht_metadata_peer_candidates_total", "source" => "live")
+                                .increment(1);
+                        }
                     }
+                    Some(_) => {}
                     None => accepting_live_peers = false,
                 }
             }
+            peer = lookup_peer_rx.recv(), if lookup_open => {
+                match peer {
+                    Some(addr) if seen_peers.insert(addr) => {
+                        let fetch = fetch.clone();
+                        tasks.spawn(fetch(PeerCandidate { addr, discovered_at: Instant::now() }));
+                        runtime_stats.metadata_live_peer_join();
+                        runtime_stats.metadata_peer_candidate();
+                        #[cfg(feature = "metrics")]
+                        {
+                            counter!("dht_metadata_live_peer_joins_total").increment(1);
+                            counter!("dht_metadata_peer_candidates_total", "source" => "lookup")
+                                .increment(1);
+                        }
+                    }
+                    Some(_) => {}
+                    None => lookup_open = false,
+                }
+            }
+            _ = &mut submit_lookup, if lookup_open && !lookup_submitted => {
+                lookup_submitted = true;
+            }
+            _ = tokio::time::sleep_until(lookup_deadline),
+                if lookup_open && !lookup_deadline_elapsed => {
+                lookup_peer_rx.close();
+                lookup_deadline_elapsed = true;
+                // Drain any already-delivered peers before treating the lookup as complete.
+            }
+            _ = tokio::time::sleep(LIVE_PEER_IDLE_GRACE),
+                if tasks.is_empty() && !lookup_open => return None,
         }
     }
 }
@@ -886,6 +933,19 @@ mod tests {
             peer_addr: SocketAddr::from(([127, 0, 0, 1], port)),
             discovered_at,
         }
+    }
+
+    fn lookup_request_channel(
+        capacity: usize,
+    ) -> (JobPeerLookup, mpsc::Receiver<PeerLookupRequest>) {
+        let (request_tx, request_rx) = mpsc::channel(capacity);
+        (
+            JobPeerLookup {
+                request_tx,
+                info_hash: [3; 20],
+            },
+            request_rx,
+        )
     }
 
     #[test]
@@ -1051,7 +1111,8 @@ mod tests {
         );
         assert!(queue.is_empty());
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.metadata_live_peer_joins, 11);
+        // Enqueue only forwards candidates; joining is counted after cross-source race deduplication.
+        assert_eq!(snapshot.metadata_live_peer_joins, 0);
         assert_eq!(snapshot.metadata_queue_deduplicated, 14);
     }
 
@@ -1079,10 +1140,12 @@ mod tests {
         let cancelled_for_race = cancelled.clone();
         let (_peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
         let stats = DhtRuntimeStats::default();
+        let (lookup, mut request_rx) = lookup_request_channel(1);
 
         let result = race_peer_fetches(
             peers,
             &mut peer_rx,
+            Some(lookup),
             move |peer| {
                 let started = started_for_race.clone();
                 let cancelled = cancelled_for_race.clone();
@@ -1123,6 +1186,13 @@ mod tests {
         assert_eq!(result.0.addr.port(), 1000);
         assert_eq!(result.1.0, "winner");
         assert!(cancelled.load(Ordering::Relaxed));
+        assert!(
+            matches!(
+                request_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "fast success must drop the delayed lookup without leaving a task behind"
+        );
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.metadata_races_started, 1);
         assert_eq!(snapshot.metadata_peer_candidates, 3);
@@ -1156,6 +1226,7 @@ mod tests {
             race_peer_fetches(
                 initial,
                 &mut peer_rx,
+                None,
                 move |peer| {
                     let initial_started = initial_started_for_fetch.clone();
                     let initial_cancelled = initial_cancelled_for_fetch.clone();
@@ -1189,7 +1260,253 @@ mod tests {
         assert!(initial_cancelled.load(Ordering::Relaxed));
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.metadata_peer_candidates, 2);
+        assert_eq!(snapshot.metadata_live_peer_joins, 1);
         assert_eq!(snapshot.metadata_peer_canceled, 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_and_announce_of_same_peer_count_only_one_live_join() {
+        let (_hash_tx, hash_rx) = mpsc::channel(4);
+        let stats = DhtRuntimeStats::default();
+        let scheduler = MetadataScheduler::new_with_runtime_stats(
+            hash_rx,
+            Arc::new(RbitFetcher::new(1)),
+            MetadataSchedulerLimits {
+                queue_size: 4,
+                concurrency: 1,
+            },
+            MetadataSchedulerCallbacks {
+                torrent: empty_torrent_callback(),
+                fetch_gate: Arc::new(ArcSwapOption::empty()),
+                completion: Arc::new(ArcSwapOption::empty()),
+            },
+            Arc::new(AtomicUsize::new(0)),
+            CancellationToken::new(),
+            stats.clone(),
+        );
+        let initial = PeerCandidate {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+            discovered_at: Instant::now(),
+        };
+        let duplicate_addr = SocketAddr::from(([127, 0, 0, 1], 1001));
+        let (peer_tx, mut peer_rx) = mpsc::channel(MAX_METADATA_PEERS_PER_HASH);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let lookup_peer_started = Arc::new(tokio::sync::Notify::new());
+        let started_for_actor = lookup_peer_started.clone();
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            request.peer_tx.send(duplicate_addr).await.unwrap();
+            started_for_actor.notified().await;
+
+            // The outer scheduler has not seen this lookup endpoint. Its announce is
+            // forwarded, but must not count as another join in the active race.
+            let mut in_flight = HashMap::from([(
+                "hash".to_string(),
+                InFlightState {
+                    peer_tx,
+                    scheduled_peers: HashSet::from([initial.addr]),
+                },
+            )]);
+            let mut queue = PendingHashQueue::new(4, HASH_QUEUE_TTL);
+            scheduler.enqueue(
+                &mut queue,
+                &mut in_flight,
+                event("hash", 1001, Instant::now()),
+            );
+            assert!(in_flight["hash"].scheduled_peers.contains(&duplicate_addr));
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_fetches(
+                vec![initial],
+                &mut peer_rx,
+                Some(lookup),
+                move |peer| {
+                    let started = lookup_peer_started.clone();
+                    async move {
+                        if peer.addr == duplicate_addr {
+                            started.notify_one();
+                        }
+                        (peer, MetadataFetchOutcome::Failed)
+                    }
+                },
+                &stats,
+            ),
+        )
+        .await
+        .unwrap();
+        actor.await.unwrap();
+        assert!(result.is_none());
+        assert_eq!(stats.snapshot().metadata_peer_candidates, 2);
+        assert_eq!(stats.snapshot().metadata_live_peer_joins, 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_peer_arriving_after_idle_grace_can_win_after_initial_peer_failed() {
+        let initial = PeerCandidate {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+            discovered_at: Instant::now(),
+        };
+        let (_peer_tx, mut peer_rx) = mpsc::channel(12);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            request.peer_tx.send(initial.addr).await.unwrap();
+            request
+                .peer_tx
+                .send(SocketAddr::from(([127, 0, 0, 1], 1001)))
+                .await
+                .unwrap();
+            // Closing immediately must not make completion overtake the buffered winner.
+        });
+        let stats = DhtRuntimeStats::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            race_peer_fetches(
+                vec![initial],
+                &mut peer_rx,
+                Some(lookup),
+                |peer| async move {
+                    let outcome = if peer.addr.port() == 1000 {
+                        MetadataFetchOutcome::SkippedCached
+                    } else {
+                        MetadataFetchOutcome::Fetched(("late-winner".to_string(), 1, Vec::new(), 0))
+                    };
+                    (peer, outcome)
+                },
+                &stats,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("pending lookup must survive the 300 ms idle grace");
+        actor.await.unwrap();
+        assert_eq!(result.0.addr.port(), 1001);
+        assert_eq!(
+            stats.snapshot().metadata_peer_candidates,
+            2,
+            "duplicate lookup peer must not consume a slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_lookup_request_queue_ends_wait_promptly() {
+        let (_peer_tx, mut peer_rx) = mpsc::channel(12);
+        let (lookup, _request_rx) = lookup_request_channel(1);
+        let (peer_tx, _result_rx) = mpsc::channel(12);
+        lookup
+            .request_tx
+            .try_send(PeerLookupRequest {
+                info_hash: [4; 20],
+                peer_tx,
+            })
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_fetches(
+                Vec::new(),
+                &mut peer_rx,
+                Some(lookup),
+                |peer| async move { (peer, MetadataFetchOutcome::Failed) },
+                &DhtRuntimeStats::default(),
+            ),
+        )
+        .await
+        .expect("rejected lookup must not wait for its full deadline");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_lookup_with_no_peers_ends_wait_promptly() {
+        let (peer_tx, mut peer_rx) = mpsc::channel(12);
+        drop(peer_tx);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let actor = tokio::spawn(async move {
+            drop(request_rx.recv().await.unwrap());
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_fetches(
+                Vec::new(),
+                &mut peer_rx,
+                Some(lookup),
+                |peer| async move { (peer, MetadataFetchOutcome::Failed) },
+                &DhtRuntimeStats::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        actor.await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_lookup_is_bounded_and_closes_its_result_stream() {
+        let (peer_tx, mut peer_rx) = mpsc::channel(12);
+        drop(peer_tx);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            request.peer_tx.closed().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            race_peer_fetches(
+                Vec::new(),
+                &mut peer_rx,
+                Some(lookup),
+                |peer| async move { (peer, MetadataFetchOutcome::Failed) },
+                &DhtRuntimeStats::default(),
+            ),
+        )
+        .await
+        .expect("a stalled actor must not retain the job indefinitely");
+        assert!(result.is_none());
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_success_cancels_a_lookup_already_in_progress() {
+        let (_peer_tx, mut peer_rx) = mpsc::channel(12);
+        let (lookup, mut request_rx) = lookup_request_channel(1);
+        let actor_started = Arc::new(tokio::sync::Notify::new());
+        let started_for_actor = actor_started.clone();
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            started_for_actor.notify_one();
+            request.peer_tx.closed().await;
+        });
+        let initial = PeerCandidate {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1000)),
+            discovered_at: Instant::now(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_fetches(
+                vec![initial],
+                &mut peer_rx,
+                Some(lookup),
+                move |peer| {
+                    let actor_started = actor_started.clone();
+                    async move {
+                        actor_started.notified().await;
+                        (
+                            peer,
+                            MetadataFetchOutcome::Fetched(("winner".to_string(), 1, Vec::new(), 0)),
+                        )
+                    }
+                },
+                &DhtRuntimeStats::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_some());
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

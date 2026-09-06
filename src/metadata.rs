@@ -1,4 +1,4 @@
-use crate::runtime_stats::DhtRuntimeStats;
+use crate::runtime_stats::{DhtRuntimeStats, MetadataConnectionError, MetadataTimeoutStage};
 use crate::types::FileInfo;
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -6,12 +6,13 @@ use bytes::Bytes;
 use metrics::{counter, gauge, histogram};
 use rbit::peer::ExtensionMessage;
 use rbit::{
-    ExtensionHandshake, Message, MetadataMessage, MetadataMessageType, PeerConnection, PeerId,
-    metadata_piece_count,
+    ExtensionHandshake, Message, MetadataMessage, MetadataMessageType, PeerConnection, PeerError,
+    PeerId, metadata_piece_count,
 };
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -33,6 +34,25 @@ enum MetadataFetchFailure {
     Sha1,
     Parse,
     Other,
+}
+
+fn connection_error_category(error: &PeerError) -> MetadataConnectionError {
+    use std::io::ErrorKind;
+    match error {
+        PeerError::Io(error) => match error.kind() {
+            ErrorKind::ConnectionRefused => MetadataConnectionError::Refused,
+            ErrorKind::ConnectionReset => MetadataConnectionError::Reset,
+            ErrorKind::ConnectionAborted => MetadataConnectionError::Aborted,
+            ErrorKind::UnexpectedEof => MetadataConnectionError::Closed,
+            ErrorKind::TimedOut => MetadataConnectionError::Timeout,
+            _ => MetadataConnectionError::IoOther,
+        },
+        PeerError::ConnectionClosed => MetadataConnectionError::Closed,
+        PeerError::Timeout => MetadataConnectionError::Timeout,
+        PeerError::InvalidHandshake => MetadataConnectionError::InvalidHandshake,
+        PeerError::InfoHashMismatch => MetadataConnectionError::InfoHashMismatch,
+        _ => MetadataConnectionError::Other,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,8 +212,9 @@ impl RbitFetcher {
     /// Fetch metadata from one peer under a single end-to-end deadline.
     ///
     /// The deadline covers TCP connect, both BitTorrent handshakes, all metadata
-    /// piece I/O, hash validation and bencode parsing. Inner library timeouts can
-    /// therefore never stack on top of the configured metadata timeout.
+    /// piece I/O and the wait for hash validation. Inner library timeouts cannot
+    /// stack on top of this deadline. Like any Tokio timeout, it is cooperative:
+    /// synchronous work such as bencode parsing cannot be preempted mid-poll.
     #[cfg(test)]
     pub(crate) async fn fetch(
         &self,
@@ -238,9 +259,10 @@ impl RbitFetcher {
         }
 
         let started = Instant::now();
+        let stage = AtomicU8::new(MetadataTimeoutStage::ConnectHandshake as u8);
         let result = timeout(
             self.total_timeout,
-            self.fetch_with_peer(info_hash, peer_addr),
+            self.fetch_with_peer(info_hash, peer_addr, &stage),
         )
         .await;
 
@@ -282,14 +304,18 @@ impl RbitFetcher {
                 MetadataFetchOutcome::Failed
             }
             Err(_) => {
+                let stage = MetadataTimeoutStage::from_index(stage.load(Ordering::Relaxed));
                 self.record_peer_failure(peer_addr, PeerFailureReason::Timeout);
                 self.runtime_stats.metadata_peer_failed();
                 self.runtime_stats.metadata_peer_timeout();
                 self.runtime_stats.metadata_failure_timeout();
+                self.runtime_stats.metadata_timeout_stage(stage);
                 #[cfg(feature = "metrics")]
                 {
                     counter!("dht_metadata_fetch_fail_total", "reason" => "timeout").increment(1);
                     counter!("dht_metadata_fetch_result_total", "result" => "timeout").increment(1);
+                    counter!("dht_metadata_timeout_stage_total", "stage" => stage.as_str())
+                        .increment(1);
                 }
                 MetadataFetchOutcome::Failed
             }
@@ -317,8 +343,11 @@ impl RbitFetcher {
         &self,
         info_hash: &[u8; 20],
         peer_addr: SocketAddr,
+        stage: &AtomicU8,
     ) -> Result<FetchedMetadata, MetadataFetchFailure> {
         let peer_id = PeerId::generate();
+        // rbit 0.2.2 combines TCP connect, both base-handshake I/O operations and
+        // info-hash verification here; it exposes no separate TCP timing boundary.
         let mut conn = match PeerConnection::connect(peer_addr, *info_hash, *peer_id.as_bytes())
             .await
         {
@@ -328,11 +357,18 @@ impl RbitFetcher {
                     .increment(1);
                 conn
             }
-            Err(_) => {
+            Err(error) => {
+                let category = connection_error_category(&error);
+                self.runtime_stats.metadata_connection_error(category);
                 self.record_peer_failure(peer_addr, PeerFailureReason::ConnectFailed);
                 self.runtime_stats.metadata_connect_failed();
                 #[cfg(feature = "metrics")]
-                counter!("dht_metadata_connection_result_total", "result" => "failed").increment(1);
+                {
+                    counter!("dht_metadata_connection_result_total", "result" => "failed")
+                        .increment(1);
+                    counter!("dht_metadata_connection_error_total", "reason" => category.as_str())
+                        .increment(1);
+                }
                 return Err(MetadataFetchFailure::Connect);
             }
         };
@@ -346,6 +382,10 @@ impl RbitFetcher {
         }
 
         let my_ut_metadata_id = 1;
+        stage.store(
+            MetadataTimeoutStage::ExtensionHandshakeSend as u8,
+            Ordering::Relaxed,
+        );
         let handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", my_ut_metadata_id)]);
         let handshake_bytes = handshake.encode().map_err(|_| MetadataFetchFailure::Send)?;
         if conn
@@ -368,6 +408,14 @@ impl RbitFetcher {
         let mut request_sent = false;
 
         let info_bytes = loop {
+            stage.store(
+                if request_sent {
+                    MetadataTimeoutStage::PieceReceive
+                } else {
+                    MetadataTimeoutStage::ExtensionHandshakeReceive
+                } as u8,
+                Ordering::Relaxed,
+            );
             let msg = conn
                 .receive()
                 .await
@@ -397,6 +445,10 @@ impl RbitFetcher {
                     }
 
                     let count = metadata_piece_count(metadata_size as usize);
+                    stage.store(
+                        MetadataTimeoutStage::PieceRequestSend as u8,
+                        Ordering::Relaxed,
+                    );
                     for piece in 0..count {
                         let encoded = MetadataMessage::request(piece as u32)
                             .encode()
@@ -457,6 +509,7 @@ impl RbitFetcher {
             }
 
             let info_hash_copy = *info_hash;
+            stage.store(MetadataTimeoutStage::Validation as u8, Ordering::Relaxed);
             let validated = tokio::task::spawn_blocking(move || {
                 let mut hasher = Sha1::new();
                 hasher.update(&full_data);
@@ -557,6 +610,8 @@ fn parse_metadata(info_bytes: &[u8]) -> Option<FetchedMetadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MetadataConnectionErrorsSnapshot, MetadataTimeoutStagesSnapshot};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
@@ -621,6 +676,227 @@ mod tests {
         assert_eq!(snapshot.metadata_peer_failure_cache_hits, 1);
         assert_eq!(snapshot.metadata_peer_failure_cache_entries, 1);
 
+        let observability = stats.observability_snapshot();
+        assert_eq!(observability.metadata_failure_timeout, 1);
+        assert_eq!(observability.metadata_failure_connect, 0);
+        assert_eq!(
+            observability.metadata_timeout_stages,
+            MetadataTimeoutStagesSnapshot {
+                connect_handshake: 1,
+                ..Default::default()
+            }
+        );
+
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn deadlines_distinguish_extension_handshake_from_piece_wait() {
+        for request_pieces in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut conn = PeerConnection::accept(stream, [7; 20], [9; 20])
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    conn.receive().await.unwrap(),
+                    Message::Extended { id: 0, .. }
+                ));
+                if request_pieces {
+                    let mut handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", 3)]);
+                    handshake.metadata_size = Some(1);
+                    conn.send(Message::Extended {
+                        id: 0,
+                        payload: handshake.encode().unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                    let Message::Extended { id: 3, payload } = conn.receive().await.unwrap() else {
+                        panic!("expected metadata request");
+                    };
+                    assert_eq!(
+                        MetadataMessage::decode(&payload).unwrap().msg_type,
+                        MetadataMessageType::Request
+                    );
+                }
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let stats = DhtRuntimeStats::default();
+            let fetcher = RbitFetcher::new_with_runtime_stats(1, 0, 0, stats.clone());
+            assert!(matches!(
+                fetcher.fetch(&[7; 20], addr).await,
+                MetadataFetchOutcome::Failed
+            ));
+            ready_rx.await.unwrap();
+            peer.abort();
+
+            let runtime = stats.snapshot();
+            assert_eq!(runtime.metadata_peer_attempts, 1);
+            assert_eq!(runtime.metadata_peer_failed, 1);
+            assert_eq!(runtime.metadata_peer_timeouts, 1);
+            let obs = stats.observability_snapshot();
+            assert_eq!(obs.metadata_failure_timeout, 1);
+            assert_eq!(obs.metadata_failure_connect, 0);
+            assert_eq!(
+                obs.metadata_connection_errors,
+                MetadataConnectionErrorsSnapshot::default()
+            );
+            assert_eq!(
+                obs.metadata_timeout_stages,
+                MetadataTimeoutStagesSnapshot {
+                    extension_handshake_receive: u64::from(!request_pieces),
+                    piece_receive: u64::from(request_pieces),
+                    ..Default::default()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn base_handshake_errors_preserve_aggregate_connection_failures() {
+        let stats = DhtRuntimeStats::default();
+        let fetcher = RbitFetcher::new_with_runtime_stats(5, 0, 0, stats.clone());
+        // A malformed handshake, a valid handshake for a different hash, and an orderly EOF.
+        for response in [
+            vec![0; 68],
+            rbit::Handshake::new([8; 20], [9; 20]).encode().to_vec(),
+            vec![],
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut handshake = [0; 68];
+                stream.read_exact(&mut handshake).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            assert!(matches!(
+                fetcher.fetch(&[7; 20], addr).await,
+                MetadataFetchOutcome::Failed
+            ));
+            peer.await.unwrap();
+        }
+        let runtime = stats.snapshot();
+        assert_eq!(runtime.metadata_peer_attempts, 3);
+        assert_eq!(runtime.metadata_peer_failed, 3);
+        assert_eq!(runtime.metadata_connect_failed, 3);
+        assert_eq!(runtime.metadata_peer_timeouts, 0);
+        let obs = stats.observability_snapshot();
+        assert_eq!(obs.metadata_failure_connect, 3);
+        assert_eq!(obs.metadata_failure_timeout, 0);
+        assert_eq!(
+            obs.metadata_timeout_stages,
+            MetadataTimeoutStagesSnapshot::default()
+        );
+        assert_eq!(
+            obs.metadata_connection_errors,
+            MetadataConnectionErrorsSnapshot {
+                invalid_handshake: 1,
+                info_hash_mismatch: 1,
+                closed: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn connection_errors_use_typed_variants_not_error_text() {
+        use std::io::{Error, ErrorKind};
+        for (kind, expected) in [
+            (
+                ErrorKind::ConnectionRefused,
+                MetadataConnectionError::Refused,
+            ),
+            (ErrorKind::ConnectionReset, MetadataConnectionError::Reset),
+            (
+                ErrorKind::ConnectionAborted,
+                MetadataConnectionError::Aborted,
+            ),
+            (ErrorKind::UnexpectedEof, MetadataConnectionError::Closed),
+            (ErrorKind::TimedOut, MetadataConnectionError::Timeout),
+            (ErrorKind::Other, MetadataConnectionError::IoOther),
+        ] {
+            assert_eq!(
+                connection_error_category(&PeerError::Io(Error::new(kind, "opaque"))),
+                expected
+            );
+        }
+        assert_eq!(
+            connection_error_category(&PeerError::Timeout),
+            MetadataConnectionError::Timeout
+        );
+        assert_eq!(
+            connection_error_category(&PeerError::Protocol("connection refused".into())),
+            MetadataConnectionError::Other
+        );
+        assert_eq!(
+            connection_error_category(&PeerError::Io(Error::other("timeout"))),
+            MetadataConnectionError::IoOther
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_local_metadata_does_not_increment_failure_diagnostics() {
+        let metadata = Bytes::from_static(b"d6:lengthi1e4:name1:xe");
+        let info_hash: [u8; 20] = Sha1::digest(&metadata).into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = PeerConnection::accept(stream, info_hash, [9; 20])
+                .await
+                .unwrap();
+            assert!(matches!(
+                conn.receive().await.unwrap(),
+                Message::Extended { id: 0, .. }
+            ));
+            let mut handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", 3)]);
+            handshake.metadata_size = Some(metadata.len() as i64);
+            conn.send(Message::Extended {
+                id: 0,
+                payload: handshake.encode().unwrap(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                conn.receive().await.unwrap(),
+                Message::Extended { id: 3, .. }
+            ));
+            conn.send(Message::Extended {
+                id: 1,
+                payload: MetadataMessage::data(0, metadata.len() as u32, metadata)
+                    .encode()
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+        });
+        let stats = DhtRuntimeStats::default();
+        let fetcher = RbitFetcher::new_with_runtime_stats(5, 0, 0, stats.clone());
+        let MetadataFetchOutcome::Fetched((name, size, files, _)) =
+            fetcher.fetch(&info_hash, addr).await
+        else {
+            panic!("expected successful metadata");
+        };
+        peer.await.unwrap();
+        assert_eq!((name.as_str(), size, files.len()), ("x", 1, 1));
+        assert_eq!(stats.snapshot().metadata_peer_succeeded, 1);
+        assert_eq!(stats.snapshot().metadata_peer_failed, 0);
+        let obs = stats.observability_snapshot();
+        assert_eq!(obs.metadata_failure_timeout, 0);
+        assert_eq!(obs.metadata_failure_connect, 0);
+        assert_eq!(
+            obs.metadata_timeout_stages,
+            MetadataTimeoutStagesSnapshot::default()
+        );
+        assert_eq!(
+            obs.metadata_connection_errors,
+            MetadataConnectionErrorsSnapshot::default()
+        );
     }
 }

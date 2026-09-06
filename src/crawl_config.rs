@@ -18,6 +18,7 @@ pub(crate) struct ResolvedCrawlConfig {
     pub(crate) recent_probe_ttl: Duration,
     pub(crate) responsive_capacity: usize,
     pub(crate) responsive_ttl: Duration,
+    pub(crate) revisit_interval: Duration,
     pub(crate) low_watermark: usize,
     pub(crate) max_in_flight_per_subnet: usize,
 
@@ -65,6 +66,7 @@ impl ResolvedCrawlConfig {
             recent_probe_ttl: Duration::from_secs(options.pool.recent_probe_ttl_secs.max(1)),
             responsive_capacity: options.pool.responsive_capacity.max(1),
             responsive_ttl: Duration::from_secs(options.pool.responsive_ttl_secs.max(1)),
+            revisit_interval: Duration::from_secs(options.pool.revisit_interval_secs),
             low_watermark: options.pool.low_watermark.min(capacity),
             max_in_flight_per_subnet: options.rate_limit.max_in_flight_per_subnet.max(1),
 

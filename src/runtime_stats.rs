@@ -14,6 +14,118 @@ pub const METADATA_SIZE_BUCKETS_BYTES: [u64; 8] = [
     10 * 1024 * 1024,
 ];
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MetadataTimeoutStage {
+    ConnectHandshake,
+    ExtensionHandshakeSend,
+    ExtensionHandshakeReceive,
+    PieceRequestSend,
+    PieceReceive,
+    Validation,
+}
+
+impl MetadataTimeoutStage {
+    const COUNT: usize = 6;
+
+    pub(crate) fn from_index(index: u8) -> Self {
+        match index {
+            0 => Self::ConnectHandshake,
+            1 => Self::ExtensionHandshakeSend,
+            2 => Self::ExtensionHandshakeReceive,
+            3 => Self::PieceRequestSend,
+            4 => Self::PieceReceive,
+            _ => Self::Validation,
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectHandshake => "connect_handshake",
+            Self::ExtensionHandshakeSend => "extension_handshake_send",
+            Self::ExtensionHandshakeReceive => "extension_handshake_receive",
+            Self::PieceRequestSend => "piece_request_send",
+            Self::PieceReceive => "piece_receive",
+            Self::Validation => "validation",
+        }
+    }
+}
+
+/// End-to-end deadline expirations grouped by the operation active when it expired.
+/// These counters partition `metadata_failure_timeout`; library/OS timeout errors
+/// returned before that deadline retain their existing connection/send/other category.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataTimeoutStagesSnapshot {
+    /// rbit's combined TCP connect and base BitTorrent handshake operation.
+    pub connect_handshake: u64,
+    /// Sending our BEP-10 extension handshake.
+    pub extension_handshake_send: u64,
+    /// Waiting for a usable remote ut_metadata extension handshake.
+    pub extension_handshake_receive: u64,
+    /// Sending metadata piece requests.
+    pub piece_request_send: u64,
+    /// Waiting for metadata pieces after requesting them.
+    pub piece_receive: u64,
+    /// Waiting for hash validation (including blocking-pool queue time).
+    pub validation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataConnectionError {
+    Refused,
+    Reset,
+    Aborted,
+    Closed,
+    Timeout,
+    InvalidHandshake,
+    InfoHashMismatch,
+    IoOther,
+    Other,
+}
+
+impl MetadataConnectionError {
+    const COUNT: usize = 9;
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Reset => "reset",
+            Self::Aborted => "aborted",
+            Self::Closed => "closed",
+            Self::Timeout => "timeout",
+            Self::InvalidHandshake => "invalid_handshake",
+            Self::InfoHashMismatch => "info_hash_mismatch",
+            Self::IoOther => "io_other",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Typed error categories from rbit's combined TCP/base-handshake connect operation.
+/// These counters partition `metadata_failure_connect`, not TCP-only failures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataConnectionErrorsSnapshot {
+    /// OS reported connection refused.
+    pub refused: u64,
+    /// OS reported connection reset.
+    pub reset: u64,
+    /// OS reported connection aborted.
+    pub aborted: u64,
+    /// rbit reported a closed connection, or I/O reported unexpected EOF.
+    pub closed: u64,
+    /// rbit's inner timeout or an OS I/O timeout fired before the outer deadline.
+    pub timeout: u64,
+    /// Peer sent an invalid base BitTorrent handshake.
+    pub invalid_handshake: u64,
+    /// Peer's base handshake contained a different info hash.
+    pub info_hash_mismatch: u64,
+    /// Other typed I/O errors; no string-based cause inference is performed.
+    pub io_other: u64,
+    /// Other rbit error variants.
+    pub other: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Snapshot of a non-cumulative fixed-bucket histogram.
 pub struct FixedHistogramSnapshot {
@@ -149,8 +261,12 @@ pub struct DhtObservabilitySnapshot {
     pub metadata_bytes_downloaded: u64,
     /// Metadata Peer attempts reaching the end-to-end timeout.
     pub metadata_failure_timeout: u64,
-    /// Metadata Peer connection failures.
+    /// Errors from rbit's combined TCP connect and base BitTorrent handshake.
     pub metadata_failure_connect: u64,
+    /// Active stages of end-to-end Metadata deadline expirations.
+    pub metadata_timeout_stages: MetadataTimeoutStagesSnapshot,
+    /// Typed errors returned by the combined TCP/base-handshake connect operation.
+    pub metadata_connection_errors: MetadataConnectionErrorsSnapshot,
     /// Peers without extension-protocol support.
     pub metadata_failure_no_extension: u64,
     /// Extension handshake or piece-request send failures.
@@ -254,7 +370,7 @@ pub struct DhtRuntimeSnapshot {
     pub metadata_peer_failed: u64,
     /// End-to-end Peer timeouts.
     pub metadata_peer_timeouts: u64,
-    /// Peer connection failures.
+    /// Errors from rbit's combined TCP connect and base BitTorrent handshake.
     pub metadata_connect_failed: u64,
     /// Peers without extension-protocol support.
     pub metadata_no_extension: u64,
@@ -393,6 +509,8 @@ struct DhtRuntimeStatsInner {
     metadata_bytes_downloaded: AtomicU64,
     metadata_failure_timeout: AtomicU64,
     metadata_failure_connect: AtomicU64,
+    metadata_timeout_stages: [AtomicU64; MetadataTimeoutStage::COUNT],
+    metadata_connection_errors: [AtomicU64; MetadataConnectionError::COUNT],
     metadata_failure_no_extension: AtomicU64,
     metadata_failure_send: AtomicU64,
     metadata_failure_size_limit: AtomicU64,
@@ -491,6 +609,8 @@ impl Default for DhtRuntimeStatsInner {
             metadata_bytes_downloaded: AtomicU64::new(0),
             metadata_failure_timeout: AtomicU64::new(0),
             metadata_failure_connect: AtomicU64::new(0),
+            metadata_timeout_stages: std::array::from_fn(|_| AtomicU64::new(0)),
+            metadata_connection_errors: std::array::from_fn(|_| AtomicU64::new(0)),
             metadata_failure_no_extension: AtomicU64::new(0),
             metadata_failure_send: AtomicU64::new(0),
             metadata_failure_size_limit: AtomicU64::new(0),
@@ -642,6 +762,26 @@ impl DhtRuntimeStats {
             metadata_bytes_downloaded: inner.metadata_bytes_downloaded.load(Ordering::Relaxed),
             metadata_failure_timeout: inner.metadata_failure_timeout.load(Ordering::Relaxed),
             metadata_failure_connect: inner.metadata_failure_connect.load(Ordering::Relaxed),
+            metadata_timeout_stages: MetadataTimeoutStagesSnapshot {
+                connect_handshake: inner.metadata_timeout_stages[0].load(Ordering::Relaxed),
+                extension_handshake_send: inner.metadata_timeout_stages[1].load(Ordering::Relaxed),
+                extension_handshake_receive: inner.metadata_timeout_stages[2]
+                    .load(Ordering::Relaxed),
+                piece_request_send: inner.metadata_timeout_stages[3].load(Ordering::Relaxed),
+                piece_receive: inner.metadata_timeout_stages[4].load(Ordering::Relaxed),
+                validation: inner.metadata_timeout_stages[5].load(Ordering::Relaxed),
+            },
+            metadata_connection_errors: MetadataConnectionErrorsSnapshot {
+                refused: inner.metadata_connection_errors[0].load(Ordering::Relaxed),
+                reset: inner.metadata_connection_errors[1].load(Ordering::Relaxed),
+                aborted: inner.metadata_connection_errors[2].load(Ordering::Relaxed),
+                closed: inner.metadata_connection_errors[3].load(Ordering::Relaxed),
+                timeout: inner.metadata_connection_errors[4].load(Ordering::Relaxed),
+                invalid_handshake: inner.metadata_connection_errors[5].load(Ordering::Relaxed),
+                info_hash_mismatch: inner.metadata_connection_errors[6].load(Ordering::Relaxed),
+                io_other: inner.metadata_connection_errors[7].load(Ordering::Relaxed),
+                other: inner.metadata_connection_errors[8].load(Ordering::Relaxed),
+            },
             metadata_failure_no_extension: inner
                 .metadata_failure_no_extension
                 .load(Ordering::Relaxed),
@@ -1007,6 +1147,14 @@ impl DhtRuntimeStats {
         self.inner
             .metadata_failure_connect
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_timeout_stage(&self, stage: MetadataTimeoutStage) {
+        self.inner.metadata_timeout_stages[stage as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_connection_error(&self, error: MetadataConnectionError) {
+        self.inner.metadata_connection_errors[error as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metadata_failure_no_extension(&self) {

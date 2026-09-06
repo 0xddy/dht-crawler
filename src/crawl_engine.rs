@@ -47,6 +47,7 @@ enum ProbePurpose {
 struct PendingRequest {
     node: NodeTuple,
     purpose: ProbePurpose,
+    dispatched_at: Instant,
     deadline: Instant,
     subnet: SubnetKey,
 }
@@ -335,7 +336,11 @@ impl CrawlActor {
                 config.recent_probe_ttl,
                 now,
             ),
-            responsive: ResponsiveReservoir::new(config.responsive_capacity, config.responsive_ttl),
+            responsive: ResponsiveReservoir::new(
+                config.responsive_capacity,
+                config.responsive_ttl,
+                config.revisit_interval,
+            ),
             pending: AHashMap::with_capacity(config.max_in_flight),
             pending_expiry: VecDeque::with_capacity(config.max_in_flight),
             subnet_in_flight: AHashMap::new(),
@@ -502,7 +507,8 @@ impl CrawlActor {
         {
             responsive_node.id = id;
         }
-        self.responsive.record(responsive_node, now);
+        self.responsive
+            .record(responsive_node, now, pending.dispatched_at);
 
         let pool = &mut self.pool;
         let metrics = &mut self.metrics;
@@ -532,13 +538,13 @@ impl CrawlActor {
         self.runtime_stats.set_find_node_effective_rate(rate);
         self.query_budget.set_per_second_rate(rate, now);
         let budget = self.query_budget.try_take(self.config.burst as usize, now);
-        for _ in 0..budget {
+        for scheduled in 0..budget {
             if self.pending.len() >= self.config.max_in_flight {
-                self.query_budget.refund_one();
+                self.query_budget.refund(budget - scheduled);
                 break;
             }
             if !self.schedule_one(now) {
-                self.query_budget.refund_one();
+                self.query_budget.refund(budget - scheduled);
                 break;
             }
         }
@@ -605,6 +611,8 @@ impl CrawlActor {
         };
         let was_recent = self.pool.contains_recent(&node.addr, now);
         if !was_recent && !self.destination_budget.try_take_one(now) {
+            self.responsive
+                .defer_revisit(node.addr, now + SCHEDULE_INTERVAL);
             return false;
         }
         if self.try_dispatch(node, ProbePurpose::Revisit, now) {
@@ -616,6 +624,8 @@ impl CrawlActor {
         if !was_recent {
             self.destination_budget.refund_one();
         }
+        self.responsive
+            .defer_revisit(node.addr, now + SCHEDULE_INTERVAL);
         false
     }
 
@@ -651,6 +661,7 @@ impl CrawlActor {
             PendingRequest {
                 node,
                 purpose,
+                dispatched_at: now,
                 deadline,
                 subnet,
             },
@@ -675,6 +686,7 @@ impl CrawlActor {
             target: self.choose_target(&node),
             sender_id,
         });
+        self.responsive.record_probe(node.addr, now);
         true
     }
 
@@ -858,6 +870,65 @@ mod tests {
             shutdown: CancellationToken::new(),
         });
         (actor, egress_rx, runtime_stats)
+    }
+
+    #[test]
+    fn schedule_tick_refunds_all_unused_tokens_after_partial_dispatch() {
+        // Cover both the in-flight limit and running out of eligible nodes.
+        for max_in_flight in [1, 16] {
+            let mut options = CrawlOptions::default();
+            options.rate_limit.max_find_node_rate_per_sec = 10;
+            options.rate_limit.burst = 10;
+            options.rate_limit.max_in_flight = max_in_flight;
+            options.pool.low_watermark = 0;
+            let config = ResolvedCrawlConfig::from_options(&options);
+            let (mut actor, mut egress_rx, runtime_stats) = test_actor(config);
+            let now = Instant::now() + Duration::from_secs(1);
+            actor.pool.admit(node(1, "8.8.8.8:6881"), now);
+
+            actor.on_schedule_tick(now);
+
+            assert!(egress_rx.try_recv().is_ok());
+            assert_eq!(runtime_stats.snapshot().queries_new, 1);
+            assert_eq!(actor.query_budget.try_take(10, now), 9);
+        }
+    }
+
+    #[test]
+    fn schedule_tick_refunds_the_entire_batch_when_no_node_is_eligible() {
+        let mut options = CrawlOptions::default();
+        options.rate_limit.max_find_node_rate_per_sec = 10;
+        options.rate_limit.burst = 10;
+        options.pool.low_watermark = 0;
+        let (mut actor, _egress_rx, _) = test_actor(ResolvedCrawlConfig::from_options(&options));
+        let now = Instant::now() + Duration::from_secs(1);
+
+        actor.on_schedule_tick(now);
+
+        assert_eq!(actor.query_budget.try_take(10, now), 10);
+    }
+
+    #[test]
+    fn failed_revisit_dispatch_retries_without_consuming_the_cooldown() {
+        let mut options = CrawlOptions::default();
+        options.pool.revisit_interval_secs = 30;
+        let (mut actor, egress_rx, runtime_stats) =
+            test_actor(ResolvedCrawlConfig::from_options(&options));
+        let start = Instant::now();
+        let now = start + Duration::from_secs(30);
+        let first = node(1, "8.8.8.8:6881");
+        actor.responsive.record(first, start, start);
+        actor.pool.record_probe(first.addr, start);
+        drop(egress_rx);
+
+        assert!(!actor.schedule_revisit(now));
+        let (egress_tx, mut egress_rx) = mpsc::channel(1);
+        actor.egress_v4 = Some(egress_tx);
+        assert!(!actor.schedule_revisit(now));
+        assert!(actor.schedule_revisit(now + SCHEDULE_INTERVAL));
+        assert_eq!(egress_rx.try_recv().unwrap().node, first);
+        assert_eq!(runtime_stats.snapshot().queries_revisit, 1);
+        assert!(!actor.schedule_revisit(now + Duration::from_secs(29)));
     }
 
     #[test]

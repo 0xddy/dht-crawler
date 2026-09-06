@@ -202,6 +202,8 @@ pub struct PoolOptions {
     pub responsive_capacity: usize,
     /// Responsive-node lifetime in seconds.
     pub responsive_ttl_secs: u64,
+    /// Minimum time between probes of a responsive endpoint; zero disables cooldown.
+    pub revisit_interval_secs: u64,
     /// Pool size below which bootstrap is considered.
     pub low_watermark: usize,
 }
@@ -309,6 +311,7 @@ impl Default for PoolOptions {
             recent_probe_ttl_secs: 600,
             responsive_capacity: 16_384,
             responsive_ttl_secs: 900,
+            revisit_interval_secs: 0,
             low_watermark: 10_000,
         }
     }
