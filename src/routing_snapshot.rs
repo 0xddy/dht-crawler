@@ -21,7 +21,15 @@ impl PrefixIndex {
         nodes.sort_unstable_by(|left, right| {
             left.id.cmp(&right.id).then(left.addr.cmp(&right.addr))
         });
+        let distinct_ids = usize::from(!nodes.is_empty())
+            + nodes
+                .windows(2)
+                .filter(|pair| pair[0].id != pair[1].id)
+                .count();
         let mut index = Self {
+            // A binary Patricia trie has 2n - 1 branches for n distinct IDs.
+            // Reserve once without overallocating for duplicate IDs.
+            branches: Vec::with_capacity(distinct_ids.saturating_mul(2).saturating_sub(1)),
             nodes,
             ..Self::default()
         };
@@ -101,18 +109,33 @@ pub(crate) struct RoutingSnapshot {
 }
 
 impl RoutingSnapshot {
-    pub(crate) fn from_nodes(nodes: Vec<NodeTuple>, limit: usize) -> Self {
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        for node in nodes.into_iter().take(limit) {
-            if node.addr.is_ipv6() {
-                v6.push(node);
-            } else {
-                v4.push(node);
-            }
+    pub(crate) fn from_nodes(mut nodes: Vec<NodeTuple>, limit: usize) -> Self {
+        nodes.truncate(limit);
+        let v6_count = nodes.iter().filter(|node| node.addr.is_ipv6()).count();
+        // Keep the sampled allocation for the only family when possible.
+        if v6_count == 0 {
+            return Self {
+                v4: PrefixIndex::new(nodes),
+                v6: PrefixIndex::default(),
+            };
         }
+        if v6_count == nodes.len() {
+            return Self {
+                v4: PrefixIndex::default(),
+                v6: PrefixIndex::new(nodes),
+            };
+        }
+        let mut v6 = Vec::with_capacity(v6_count);
+        nodes.retain(|node| {
+            if node.addr.is_ipv6() {
+                v6.push(*node);
+                false
+            } else {
+                true
+            }
+        });
         Self {
-            v4: PrefixIndex::new(v4),
+            v4: PrefixIndex::new(nodes),
             v6: PrefixIndex::new(v6),
         }
     }
@@ -295,6 +318,40 @@ mod tests {
         assert_eq!(chosen.len(), 8);
         assert_eq!(distinct.len(), 8);
         assert_eq!(snapshot.v4.branches.len(), 1);
+        assert_eq!(snapshot.v4.branches.capacity(), 1);
+    }
+
+    #[test]
+    fn snapshot_limit_precedes_family_partitioning() {
+        let nodes: Vec<_> = (1..=24)
+            .map(|port| NodeTuple {
+                id: [port as u8 % 3; 20],
+                addr: if port % 3 == 0 {
+                    SocketAddr::from(([8, 8, 8, 8], port))
+                } else {
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, port))
+                },
+            })
+            .collect();
+        for limit in [0, 1, 2, 3, 8, 24, usize::MAX] {
+            let snapshot = RoutingSnapshot::from_nodes(nodes.clone(), limit);
+            for family in [None, Some(false), Some(true)] {
+                let mut expected: Vec<_> = nodes
+                    .iter()
+                    .take(limit)
+                    .copied()
+                    .filter(|node| family.is_none_or(|ipv6| node.addr.is_ipv6() == ipv6))
+                    .collect();
+                let target = [7; 20];
+                expected.sort_unstable_by(|left, right| {
+                    xor_distance_cmp(&left.id, &right.id, &target).then(left.addr.cmp(&right.addr))
+                });
+                assert_eq!(
+                    snapshot.closest_nodes(&target, usize::MAX, family),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

@@ -357,6 +357,68 @@ struct ResponsiveEntry {
     next: Option<usize>,
 }
 
+/// Temporary queues share one link per reservoir slot. Moving a consumed slot
+/// to a deferred queue reuses its link, so skewed prefixes cannot retain a
+/// separate reservoir-sized allocation for each of the 256 prefixes.
+#[derive(Clone, Copy)]
+struct SnapshotSlots {
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl Default for SnapshotSlots {
+    fn default() -> Self {
+        Self {
+            head: usize::MAX,
+            tail: usize::MAX,
+            len: 0,
+        }
+    }
+}
+
+impl SnapshotSlots {
+    fn push_back(&mut self, slot: usize, links: &mut [usize]) {
+        links[slot] = usize::MAX;
+        if self.len == 0 {
+            self.head = slot;
+        } else {
+            links[self.tail] = slot;
+        }
+        self.tail = slot;
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self, links: &[usize]) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let slot = self.head;
+        self.head = links[slot];
+        self.len -= 1;
+        Some(slot)
+    }
+
+    fn rotate_left(&mut self, count: usize, links: &mut [usize]) {
+        if count == 0 {
+            return;
+        }
+        links[self.tail] = self.head;
+        for _ in 0..count {
+            self.tail = self.head;
+            self.head = links[self.head];
+        }
+        links[self.tail] = usize::MAX;
+    }
+}
+
+#[derive(Default)]
+struct SnapshotScratch {
+    links: Vec<usize>,
+    subnets: AHashSet<SubnetKey>,
+    active: VecDeque<usize>,
+}
+
 /// Fixed-size responsive-node ring. The crawl actor is the only writer.
 pub(crate) struct ResponsiveReservoir {
     slots: Vec<Option<ResponsiveEntry>>,
@@ -372,6 +434,7 @@ pub(crate) struct ResponsiveReservoir {
     snapshot_prefix_cursor: usize,
     snapshot_member_cursors: [usize; 256],
     sparse_prefixes: Vec<u8>,
+    snapshot_scratch: SnapshotScratch,
 }
 
 impl ResponsiveReservoir {
@@ -391,6 +454,7 @@ impl ResponsiveReservoir {
             snapshot_prefix_cursor: 0,
             snapshot_member_cursors: [0; 256],
             sparse_prefixes: (0..=u8::MAX).collect(),
+            snapshot_scratch: SnapshotScratch::default(),
         }
     }
 
@@ -579,34 +643,46 @@ impl ResponsiveReservoir {
     /// Work and temporary storage are bounded by the reservoir capacity, once
     /// per snapshot refresh; target selection only reads the cached prefixes.
     pub(crate) fn snapshot(&mut self, limit: usize, now: Instant) -> Vec<NodeTuple> {
-        let mut groups: [VecDeque<usize>; 256] = std::array::from_fn(|_| VecDeque::new());
+        let SnapshotScratch {
+            links,
+            subnets,
+            active,
+        } = &mut self.snapshot_scratch;
+        links.resize(self.slots.len(), usize::MAX);
+        subnets.clear();
+        active.clear();
+        active.reserve(256);
+        let mut groups = [SnapshotSlots::default(); 256];
         for (slot, entry) in self.slots.iter().enumerate() {
             if let Some(entry) = entry
                 && entry.expires_at > now
                 && entry.blocked_until.is_none_or(|deadline| deadline <= now)
             {
-                groups[usize::from(entry.node.id[0])].push_back(slot);
+                groups[usize::from(entry.node.id[0])].push_back(slot, links);
             }
         }
-        let counts: [usize; 256] = std::array::from_fn(|prefix| groups[prefix].len());
+        let counts: [usize; 256] = std::array::from_fn(|prefix| groups[prefix].len);
         let minimum = *counts.iter().min().unwrap();
         self.sparse_prefixes.clear();
+        let mut prefix_order = [0usize; 256];
+        let mut prefix_count = 0;
         for (prefix, count) in counts.iter().enumerate() {
             if *count == minimum {
                 self.sparse_prefixes.push(prefix as u8);
             }
             if *count > 0 {
-                groups[prefix].rotate_left(self.snapshot_member_cursors[prefix] % count);
+                groups[prefix].rotate_left(self.snapshot_member_cursors[prefix] % count, links);
+                prefix_order[prefix_count] = prefix;
+                prefix_count += 1;
             }
         }
 
         let limit = limit.min(counts.iter().sum());
         let mut output = Vec::with_capacity(limit);
         let mut selected = [0usize; 256];
-        let mut subnets = AHashSet::with_capacity(limit);
-        let mut active = VecDeque::with_capacity(256);
-        let mut deferred: [VecDeque<usize>; 256] = std::array::from_fn(|_| VecDeque::new());
-        let mut prefix_order: Vec<usize> = (0..256).filter(|prefix| counts[*prefix] > 0).collect();
+        subnets.reserve(limit);
+        let mut deferred = [SnapshotSlots::default(); 256];
+        let prefix_order = &mut prefix_order[..prefix_count];
         if !prefix_order.is_empty() {
             let rotate = self.snapshot_prefix_cursor % prefix_order.len();
             prefix_order.rotate_left(rotate);
@@ -616,14 +692,14 @@ impl ResponsiveReservoir {
         // second time. Even prefixes sharing one IP subnet remain reachable.
         for prefix in prefix_order.iter().copied() {
             if output.len() < limit
-                && let Some(slot) = groups[prefix].pop_front()
+                && let Some(slot) = groups[prefix].pop_front(links)
             {
                 let node = self.slots[slot].unwrap().node;
                 output.push(node);
                 selected[prefix] += 1;
                 subnets.insert(SubnetKey::from_addr(&node.addr));
             }
-            if !groups[prefix].is_empty() {
+            if groups[prefix].len > 0 {
                 active.push_back(prefix);
             }
         }
@@ -635,16 +711,16 @@ impl ResponsiveReservoir {
             let Some(prefix) = active.pop_front() else {
                 break;
             };
-            while let Some(slot) = groups[prefix].pop_front() {
+            while let Some(slot) = groups[prefix].pop_front(links) {
                 let node = self.slots[slot].unwrap().node;
                 if subnets.insert(SubnetKey::from_addr(&node.addr)) {
                     output.push(node);
                     selected[prefix] += 1;
                     break;
                 }
-                deferred[prefix].push_back(slot);
+                deferred[prefix].push_back(slot, links);
             }
-            if !groups[prefix].is_empty() {
+            if groups[prefix].len > 0 {
                 active.push_back(prefix);
             }
         }
@@ -653,7 +729,7 @@ impl ResponsiveReservoir {
         // have been considered. This keeps snapshots useful in small networks.
         if output.len() < limit {
             for prefix in prefix_order.iter().copied() {
-                if !deferred[prefix].is_empty() {
+                if deferred[prefix].len > 0 {
                     active.push_back(prefix);
                 }
             }
@@ -661,10 +737,10 @@ impl ResponsiveReservoir {
                 let Some(prefix) = active.pop_front() else {
                     break;
                 };
-                let slot = deferred[prefix].pop_front().unwrap();
+                let slot = deferred[prefix].pop_front(links).unwrap();
                 output.push(self.slots[slot].unwrap().node);
                 selected[prefix] += 1;
-                if !deferred[prefix].is_empty() {
+                if deferred[prefix].len > 0 {
                     active.push_back(prefix);
                 }
             }
@@ -1049,6 +1125,57 @@ mod tests {
                 assert_eq!(observed.len(), snapshot.len());
                 assert!(observed.is_subset(&eligible));
             }
+        }
+    }
+
+    #[test]
+    fn snapshot_scratch_stays_bounded_as_prefixes_change_and_slots_expire() {
+        let start = Instant::now();
+        let capacity = 96;
+        let mut reservoir =
+            ResponsiveReservoir::new(capacity, Duration::from_secs(1), Duration::ZERO);
+        let mut scratch_capacities = None;
+        for round in 0..256 {
+            let now = start + Duration::from_secs(round * 2);
+            let mut eligible = AHashSet::new();
+            for index in 0..capacity {
+                let prefix = if round % 2 == 0 {
+                    round as u8
+                } else {
+                    index as u8
+                };
+                let port = round as usize * capacity + index + 1;
+                let candidate = node(prefix, &format!("8.8.{}.8:{port}", index % 9));
+                reservoir.record(candidate, now, now);
+                if index % 11 == 0 {
+                    reservoir.record_failure(candidate.addr, now, now);
+                } else {
+                    eligible.insert(candidate.addr);
+                }
+            }
+            // Alternate short and full samples: a short refresh leaves unused
+            // group/deferred links which must not enter the next snapshot.
+            for limit in [capacity, 1, 0, 32, capacity * 2] {
+                let snapshot = reservoir.snapshot(limit, now);
+                let observed: AHashSet<_> = snapshot.iter().map(|node| node.addr).collect();
+                assert_eq!(snapshot.len(), limit.min(eligible.len()));
+                assert_eq!(observed.len(), snapshot.len());
+                assert!(observed.is_subset(&eligible));
+            }
+            let scratch = &reservoir.snapshot_scratch;
+            let capacities = (
+                scratch.links.capacity(),
+                scratch.subnets.capacity(),
+                scratch.active.capacity(),
+            );
+            assert_eq!(scratch.links.len(), capacity);
+            assert_eq!(*scratch_capacities.get_or_insert(capacities), capacities);
+            assert!(
+                reservoir
+                    .snapshot(capacity, now + Duration::from_secs(1))
+                    .is_empty()
+            );
+            assert_eq!(reservoir.sparse_prefixes().len(), 256);
         }
     }
 
