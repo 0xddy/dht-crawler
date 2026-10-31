@@ -118,6 +118,22 @@ pub(crate) fn encode_get_peers_query(
     buffer.extend_from_slice(b"1:y1:qe");
 }
 
+pub(crate) fn encode_sample_infohashes_query(
+    buffer: &mut BytesMut,
+    tid: &TransactionId,
+    target: &[u8; 20],
+    sender_id: &[u8; 20],
+) {
+    buffer.clear();
+    buffer.extend_from_slice(b"d1:ad2:id20:");
+    buffer.extend_from_slice(sender_id);
+    buffer.extend_from_slice(b"6:target20:");
+    buffer.extend_from_slice(target);
+    buffer.extend_from_slice(b"e1:q17:sample_infohashes1:t8:");
+    buffer.extend_from_slice(tid);
+    buffer.extend_from_slice(b"1:y1:qe");
+}
+
 pub(crate) fn encode_response(
     buffer: &mut BytesMut,
     tid: &[u8],
@@ -241,6 +257,22 @@ mod tests {
     }
 
     #[test]
+    fn sample_infohashes_encoding_and_response_fields_round_trip() {
+        let mut buffer = BytesMut::new();
+        encode_sample_infohashes_query(&mut buffer, &[0xb5; 8], &[2; 20], &[3; 20]);
+        let query: DhtMessage = serde_bencode::from_bytes(&buffer).unwrap();
+        assert_eq!(query.q.as_deref(), Some("sample_infohashes"));
+        assert_eq!(query.t.as_ref(), &[0xb5; 8]);
+        assert_eq!(query.a.unwrap().target.unwrap().as_ref(), &[2; 20]);
+        let decoded: DhtResponse = serde_bencode::from_bytes(
+            b"d2:id20:abcdefghijklmnopqrst8:intervali21600e3:numi1e7:samples20:ABCDEFGHIJKLMNOPQRSTe",
+        ).unwrap();
+        assert_eq!(decoded.interval, Some(21_600));
+        assert_eq!(decoded.num, Some(1));
+        assert_eq!(decoded.samples.unwrap().as_ref(), b"ABCDEFGHIJKLMNOPQRST");
+    }
+
+    #[test]
     fn manual_response_encoding_round_trips() {
         let mut buffer = BytesMut::new();
         let nodes = [NodeTuple {
@@ -264,6 +296,7 @@ mod tests {
                 serde_bytes::ByteBuf::from(vec![10, 0, 0, 1, 0x1a, 0xe1]),
                 serde_bytes::ByteBuf::from(vec![1, 2, 3]),
             ]),
+            ..DhtResponse::default()
         };
         let mut peers = Vec::new();
         assert_eq!(

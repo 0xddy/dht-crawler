@@ -2,6 +2,7 @@ use crate::addr::is_valid_node_addr;
 use crate::budget::RateBucket;
 use crate::crawl_config::ResolvedCrawlConfig;
 use crate::crawl_engine::CrawlEngine;
+use crate::discovery::{DiscoveryHandle, DiscoveryRuntime, is_sample_tid, spawn_discovery};
 use crate::error::Result;
 use crate::krpc::encode_response;
 use crate::metadata::RbitFetcher;
@@ -12,7 +13,7 @@ use crate::peer_lookup::{
 use crate::protocol::{DhtArgs, DhtMessage};
 use crate::runtime_stats::{DhtRuntimeLimits, DhtRuntimeStats};
 use crate::scheduler::{
-    MetadataCompletionCallback, MetadataFetchCallback, MetadataScheduler,
+    MetadataAdmission, MetadataCompletionCallback, MetadataFetchCallback, MetadataScheduler,
     MetadataSchedulerCallbacks, MetadataSchedulerLimits, MetadataSchedulerRuntime,
     TorrentAckCallback,
 };
@@ -37,7 +38,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-type FilterCallback = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+pub(crate) type FilterCallback = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
 type ErrorCallback = Box<dyn Fn(crate::error::DHTError) + Send + Sync + 'static>;
 
 struct QueryResponse<'a> {
@@ -232,14 +233,26 @@ impl WorkerResponseLimiter {
 }
 
 #[derive(Debug, Clone)]
-/// InfoHash and announcing Peer submitted to the Metadata scheduler.
+/// InfoHash candidate submitted to the Metadata scheduler.
 pub struct HashDiscovered {
     /// Lowercase hexadecimal InfoHash.
     pub info_hash: String,
-    /// Peer endpoint derived from announce `port`/`implied_port`.
-    pub peer_addr: SocketAddr,
+    /// Peer endpoint derived from announce `port`/`implied_port`; absent for hash-only sources.
+    pub peer_addr: Option<SocketAddr>,
+    /// DHT node that supplied or requested the hash; a seed for active peer lookup.
+    pub source_node: Option<NodeTuple>,
+    /// Discovery origin, retained through scheduling and yield reporting.
+    pub source: HashSource,
     /// Monotonic discovery time used for freshness and queue ordering.
     pub discovered_at: std::time::Instant,
+}
+
+/// Origin of an InfoHash candidate. A DHT source is not necessarily a BitTorrent peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashSource {
+    Announce,
+    GetPeers,
+    Sample,
 }
 
 #[derive(Clone)]
@@ -257,6 +270,7 @@ pub struct DHTServer {
     error_callback: Arc<ArcSwapOption<ErrorCallback>>,
     crawl_engine: Arc<CrawlEngine>,
     peer_lookup: PeerLookupHandle,
+    discovery: DiscoveryHandle,
     hash_events_tx: mpsc::Sender<HashDiscovered>,
     metadata_queue_len: Arc<AtomicUsize>,
     max_metadata_queue_size: usize,
@@ -362,6 +376,7 @@ impl DHTServer {
             runtime_stats.clone(),
         ));
         let torrent_callback = Arc::new(ArcSwapOption::empty());
+        let hash_filter = Arc::new(ArcSwapOption::empty());
         let on_metadata_fetch = Arc::new(ArcSwapOption::empty());
         let metadata_completion_callback = Arc::new(ArcSwapOption::empty());
         let metadata_queue_len = Arc::new(AtomicUsize::new(0));
@@ -378,6 +393,19 @@ impl DHTServer {
             PeerLookupRuntime {
                 options: options.peer_lookup.clone(),
                 stats: runtime_stats.clone(),
+                shutdown: shutdown.clone(),
+            },
+        );
+        let discovery = spawn_discovery(
+            options.netmode,
+            node_id,
+            &sockets_by_bind_addr,
+            crawl_engine.snapshot.clone(),
+            DiscoveryRuntime {
+                options: options.discovery.clone(),
+                stats: runtime_stats.clone(),
+                hash_tx: hash_events_tx.clone(),
+                filter: hash_filter.clone(),
                 shutdown: shutdown.clone(),
             },
         );
@@ -399,6 +427,8 @@ impl DHTServer {
             MetadataSchedulerRuntime {
                 stats: runtime_stats.clone(),
                 peer_lookup_tx: Some(peer_lookup.request_sender()),
+                metadata_options: options.metadata.clone(),
+                lookup_timeout: Duration::from_millis(options.peer_lookup.lookup_timeout_ms.max(1)),
             },
         );
         tokio::spawn(scheduler.run());
@@ -411,12 +441,13 @@ impl DHTServer {
             sockets_by_bind_addr: Arc::new(sockets_by_bind_addr),
             token_secret,
             torrent_callback,
-            hash_filter: Arc::new(ArcSwapOption::empty()),
+            hash_filter,
             on_metadata_fetch,
             metadata_completion_callback,
             error_callback: Arc::new(ArcSwapOption::empty()),
             crawl_engine,
             peer_lookup,
+            discovery,
             hash_events_tx,
             metadata_queue_len,
             max_metadata_queue_size,
@@ -433,6 +464,25 @@ impl DHTServer {
     where
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.on_metadata_admission(move |hash| {
+            let result = callback(hash);
+            async move {
+                if result.await {
+                    MetadataAdmission::Fetch
+                } else {
+                    MetadataAdmission::Skip
+                }
+            }
+        });
+    }
+
+    /// Registers an admission gate that can defer a candidate while retaining its peers.
+    /// Replaces a previously registered boolean or deferred admission callback.
+    pub fn on_metadata_admission<F, Fut>(&self, callback: F)
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = MetadataAdmission> + Send + 'static,
     {
         let callback: Arc<MetadataFetchCallback> =
             Arc::new(Box::new(move |hash| Box::pin(callback(hash))));
@@ -480,7 +530,7 @@ impl DHTServer {
         self.metadata_completion_callback.store(Some(callback));
     }
 
-    /// Registers an early synchronous InfoHash filter for valid `announce_peer` queries.
+    /// Registers an early synchronous InfoHash filter for all discovery sources.
     ///
     /// Returning `false` prevents the Hash from entering the bounded ingress queue. Registering a
     /// new filter replaces the previous one.
@@ -683,11 +733,21 @@ impl DHTServer {
                 if let Some(response) = msg.r
                     && let Some(tid) = transaction_id_from_bytes(&msg.t)
                 {
-                    if is_peer_lookup_tid(&tid) {
+                    if is_sample_tid(&tid) {
+                        self.discovery
+                            .route_response(remote_addr, tid, Some(response));
+                    } else if is_peer_lookup_tid(&tid) {
                         self.peer_lookup.route_response(remote_addr, tid, response);
                     } else {
                         self.crawl_engine.route_response(remote_addr, tid, response);
                     }
+                }
+            }
+            "e" => {
+                if let Some(tid) = transaction_id_from_bytes(&msg.t)
+                    && is_sample_tid(&tid)
+                {
+                    self.discovery.route_response(remote_addr, tid, None);
                 }
             }
             _ => {}
@@ -746,6 +806,24 @@ impl DHTServer {
 
         if q_str == "announce_peer" {
             self.handle_announce_peer(args, remote_addr).await?;
+        } else if q_str == "get_peers"
+            && is_valid_node_addr(&remote_addr)
+            && let Some(hash) = args
+                .info_hash
+                .as_ref()
+                .and_then(|hash| <[u8; 20]>::try_from(hash.as_slice()).ok())
+            && let Some(id) = args
+                .id
+                .as_ref()
+                .and_then(|id| <[u8; 20]>::try_from(id.as_slice()).ok())
+        {
+            self.discovery.observe_get_peers(
+                hash,
+                NodeTuple {
+                    id,
+                    addr: remote_addr,
+                },
+            );
         }
 
         self.send_response(
@@ -815,7 +893,13 @@ impl DHTServer {
                 self.runtime_stats.hash_received();
                 let event = HashDiscovered {
                     info_hash: hash_hex,
-                    peer_addr: SocketAddr::new(addr.ip(), port),
+                    peer_addr: Some(SocketAddr::new(addr.ip(), port)),
+                    source_node: args
+                        .id
+                        .as_ref()
+                        .and_then(|id| <[u8; 20]>::try_from(id.as_slice()).ok())
+                        .map(|id| NodeTuple { id, addr }),
+                    source: HashSource::Announce,
                     discovered_at: std::time::Instant::now(),
                 };
 

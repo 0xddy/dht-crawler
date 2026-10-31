@@ -35,8 +35,8 @@ pub struct DhtArgs {
     pub implied_port: Option<u8>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
-/// Supported BEP-5 response fields.
+#[derive(Deserialize, Debug, Clone, Default)]
+/// Supported BEP-5 and BEP-51 response fields.
 pub struct DhtResponse {
     #[serde(default)]
     #[allow(dead_code)]
@@ -51,4 +51,13 @@ pub struct DhtResponse {
     #[serde(default)]
     /// Compact Peer endpoints returned by `get_peers`.
     pub values: Option<Vec<serde_bytes::ByteBuf>>,
+    /// BEP-51 compact concatenation of twenty-byte InfoHashes.
+    #[serde(default)]
+    pub samples: Option<serde_bytes::ByteBuf>,
+    /// Minimum seconds before sampling this endpoint again (BEP-51: 0..=21600).
+    #[serde(default)]
+    pub interval: Option<u64>,
+    /// Total number of InfoHashes in the responder's database.
+    #[serde(default)]
+    pub num: Option<u64>,
 }

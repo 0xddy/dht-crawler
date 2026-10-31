@@ -369,6 +369,9 @@ pub(crate) struct ResponsiveReservoir {
     ready_len: usize,
     ttl: Duration,
     revisit_interval: Duration,
+    snapshot_prefix_cursor: usize,
+    snapshot_member_cursors: [usize; 256],
+    sparse_prefixes: Vec<u8>,
 }
 
 impl ResponsiveReservoir {
@@ -385,6 +388,9 @@ impl ResponsiveReservoir {
             ready_len: 0,
             ttl,
             revisit_interval,
+            snapshot_prefix_cursor: 0,
+            snapshot_member_cursors: [0; 256],
+            sparse_prefixes: (0..=u8::MAX).collect(),
         }
     }
 
@@ -569,19 +575,116 @@ impl ResponsiveReservoir {
         self.revisits.insert(key);
     }
 
-    pub(crate) fn snapshot(&self, limit: usize, now: Instant) -> Vec<NodeTuple> {
-        self.slots
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .filter(|entry| {
-                        entry.expires_at > now
-                            && entry.blocked_until.is_none_or(|deadline| deadline <= now)
-                    })
-                    .map(|entry| entry.node)
-            })
-            .take(limit)
-            .collect()
+    /// Publish a rotating, stratified sample rather than the first live slots.
+    /// Work and temporary storage are bounded by the reservoir capacity, once
+    /// per snapshot refresh; target selection only reads the cached prefixes.
+    pub(crate) fn snapshot(&mut self, limit: usize, now: Instant) -> Vec<NodeTuple> {
+        let mut groups: [VecDeque<usize>; 256] = std::array::from_fn(|_| VecDeque::new());
+        for (slot, entry) in self.slots.iter().enumerate() {
+            if let Some(entry) = entry
+                && entry.expires_at > now
+                && entry.blocked_until.is_none_or(|deadline| deadline <= now)
+            {
+                groups[usize::from(entry.node.id[0])].push_back(slot);
+            }
+        }
+        let counts: [usize; 256] = std::array::from_fn(|prefix| groups[prefix].len());
+        let minimum = *counts.iter().min().unwrap();
+        self.sparse_prefixes.clear();
+        for (prefix, count) in counts.iter().enumerate() {
+            if *count == minimum {
+                self.sparse_prefixes.push(prefix as u8);
+            }
+            if *count > 0 {
+                groups[prefix].rotate_left(self.snapshot_member_cursors[prefix] % count);
+            }
+        }
+
+        let limit = limit.min(counts.iter().sum());
+        let mut output = Vec::with_capacity(limit);
+        let mut selected = [0usize; 256];
+        let mut subnets = AHashSet::with_capacity(limit);
+        let mut active = VecDeque::with_capacity(256);
+        let mut deferred: [VecDeque<usize>; 256] = std::array::from_fn(|_| VecDeque::new());
+        let mut prefix_order: Vec<usize> = (0..256).filter(|prefix| counts[*prefix] > 0).collect();
+        if !prefix_order.is_empty() {
+            let rotate = self.snapshot_prefix_cursor % prefix_order.len();
+            prefix_order.rotate_left(rotate);
+        }
+
+        // Give each represented ID prefix a seed before filling any prefix a
+        // second time. Even prefixes sharing one IP subnet remain reachable.
+        for prefix in prefix_order.iter().copied() {
+            if output.len() < limit
+                && let Some(slot) = groups[prefix].pop_front()
+            {
+                let node = self.slots[slot].unwrap().node;
+                output.push(node);
+                selected[prefix] += 1;
+                subnets.insert(SubnetKey::from_addr(&node.addr));
+            }
+            if !groups[prefix].is_empty() {
+                active.push_back(prefix);
+            }
+        }
+
+        // Fill in prefix round-robin order, preferring new /24 or /64 subnets.
+        // Each slot is examined at most once here; duplicate subnets wait for
+        // the fallback pass instead of being scanned repeatedly.
+        while output.len() < limit {
+            let Some(prefix) = active.pop_front() else {
+                break;
+            };
+            while let Some(slot) = groups[prefix].pop_front() {
+                let node = self.slots[slot].unwrap().node;
+                if subnets.insert(SubnetKey::from_addr(&node.addr)) {
+                    output.push(node);
+                    selected[prefix] += 1;
+                    break;
+                }
+                deferred[prefix].push_back(slot);
+            }
+            if !groups[prefix].is_empty() {
+                active.push_back(prefix);
+            }
+        }
+
+        // Relax subnet diversity only after all distinct subnet candidates
+        // have been considered. This keeps snapshots useful in small networks.
+        if output.len() < limit {
+            for prefix in prefix_order.iter().copied() {
+                if !deferred[prefix].is_empty() {
+                    active.push_back(prefix);
+                }
+            }
+            while output.len() < limit {
+                let Some(prefix) = active.pop_front() else {
+                    break;
+                };
+                let slot = deferred[prefix].pop_front().unwrap();
+                output.push(self.slots[slot].unwrap().node);
+                selected[prefix] += 1;
+                if !deferred[prefix].is_empty() {
+                    active.push_back(prefix);
+                }
+            }
+        }
+        for prefix in 0..256 {
+            if selected[prefix] > 0 {
+                // Advance by one so even when the sample size shares a factor
+                // with this group's size, every member gets the first slot.
+                self.snapshot_member_cursors[prefix] =
+                    (self.snapshot_member_cursors[prefix] + 1) % counts[prefix];
+            }
+        }
+        self.snapshot_prefix_cursor = (self.snapshot_prefix_cursor + 1) % prefix_order.len().max(1);
+        output
+    }
+
+    /// Lowest-coverage first-byte ID prefixes from the full eligible reservoir,
+    /// not from its smaller published sample. Always contains at least one item.
+    pub(crate) fn sparse_prefixes(&self) -> &[u8] {
+        &self.sparse_prefixes
     }
 }
 
@@ -807,6 +910,146 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert!(!snapshot.iter().any(|entry| entry.id == [1; 20]));
         assert_eq!(reservoir.ready_len + reservoir.revisits.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_covers_id_prefixes_beyond_the_first_reservoir_slots() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(32, Duration::from_secs(90), Duration::ZERO);
+        for port in 1..=20 {
+            reservoir.record(node(0, &format!("8.8.8.8:{port}")), start, start);
+        }
+        for prefix in [64, 128, 192] {
+            reservoir.record(node(prefix, &format!("9.9.{prefix}.1:1")), start, start);
+        }
+        let snapshot = reservoir.snapshot(4, start);
+        assert_eq!(snapshot.len(), 4);
+        let prefixes: AHashSet<_> = snapshot.iter().map(|node| node.id[0]).collect();
+        assert_eq!(prefixes, AHashSet::from_iter([0, 64, 128, 192]));
+    }
+
+    #[test]
+    fn snapshot_prefers_distinct_subnets_then_fills_from_remaining_peers() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(16, Duration::from_secs(90), Duration::ZERO);
+        for port in 1..=8 {
+            reservoir.record(node(0, &format!("8.8.8.8:{port}")), start, start);
+        }
+        reservoir.record(node(0, "1.1.1.1:1"), start, start);
+        reservoir.record(node(0, "9.9.9.9:1"), start, start);
+        let snapshot = reservoir.snapshot(3, start);
+        assert_eq!(snapshot.len(), 3);
+        let subnets: AHashSet<_> = snapshot
+            .iter()
+            .map(|node| SubnetKey::from_addr(&node.addr))
+            .collect();
+        assert_eq!(subnets.len(), 3);
+        let all = reservoir.snapshot(16, start);
+        assert_eq!(all.len(), 10);
+        assert_eq!(
+            all.iter()
+                .map(|node| node.addr)
+                .collect::<AHashSet<_>>()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn small_snapshots_rotate_between_populated_prefixes_and_their_members() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(16, Duration::from_secs(90), Duration::ZERO);
+        for prefix in [0, 64, 192] {
+            for port in 1..=4 {
+                reservoir.record(
+                    node(prefix, &format!("8.8.8.8:{}", u16::from(prefix) * 4 + port)),
+                    start,
+                    start,
+                );
+            }
+        }
+        let mut seen = AHashSet::new();
+        for _ in 0..4 {
+            let mut prefixes = AHashSet::new();
+            for _ in 0..3 {
+                let snapshot = reservoir.snapshot(1, start);
+                assert_eq!(snapshot.len(), 1);
+                assert!(prefixes.insert(snapshot[0].id[0]));
+                assert!(seen.insert(snapshot[0].addr));
+            }
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn snapshot_and_coverage_exclude_expired_and_failed_nodes() {
+        let start = Instant::now();
+        let mut reservoir = ResponsiveReservoir::new(300, Duration::from_secs(10), Duration::ZERO);
+        for prefix in 0..=u8::MAX {
+            reservoir.record(
+                node(prefix, &format!("8.8.8.8:{}", u16::from(prefix) + 1)),
+                start,
+                start,
+            );
+        }
+        let now = start + Duration::from_secs(1);
+        let failed = node(83, "8.8.8.8:84");
+        assert!(reservoir.record_failure(failed.addr, now, now));
+        let snapshot = reservoir.snapshot(16, now);
+        assert!(!snapshot.iter().any(|node| node.addr == failed.addr));
+        assert_eq!(reservoir.sparse_prefixes(), &[83]);
+        // Coverage comes from all 255 eligible nodes, not the 16 published ones.
+        reservoir.snapshot(1, now + Duration::from_secs(5));
+        assert_eq!(reservoir.sparse_prefixes().len(), 256);
+        assert!(
+            reservoir
+                .snapshot(300, start + Duration::from_secs(10))
+                .is_empty()
+        );
+        assert_eq!(reservoir.sparse_prefixes().len(), 256);
+    }
+
+    #[test]
+    fn snapshot_remains_complete_and_unique_under_skewed_prefixes_and_overwrites() {
+        let start = Instant::now();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(417);
+        let mut reservoir = ResponsiveReservoir::new(96, Duration::from_secs(10), Duration::ZERO);
+        for port in 1..=192 {
+            let prefix = if rng.gen_bool(0.8) {
+                0
+            } else {
+                rng.gen_range(1..=255)
+            };
+            reservoir.record(
+                node(prefix, &format!("8.8.{}.8:{port}", port % 9)),
+                start,
+                start,
+            );
+        }
+        let now = start + Duration::from_secs(1);
+        for port in 100..=110 {
+            reservoir.record_failure(
+                format!("8.8.{}.8:{port}", port % 9).parse().unwrap(),
+                now,
+                now,
+            );
+        }
+        for limit in [0, 1, 2, 8, 32, 80, 200] {
+            for _ in 0..8 {
+                let snapshot = reservoir.snapshot(limit, now);
+                let eligible: AHashSet<_> = reservoir
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|entry| entry.blocked_until.is_none_or(|deadline| deadline <= now))
+                    .map(|entry| entry.node.addr)
+                    .collect();
+                let observed: AHashSet<_> = snapshot.iter().map(|node| node.addr).collect();
+                assert_eq!(snapshot.len(), limit.min(eligible.len()));
+                assert_eq!(observed.len(), snapshot.len());
+                assert!(observed.is_subset(&eligible));
+            }
+        }
     }
 
     #[test]

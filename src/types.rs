@@ -113,14 +113,68 @@ pub struct DHTOptions {
     pub port: u16,
     /// Enabled IP families.
     pub netmode: NetMode,
-    /// Capacity between announce processing and the Metadata scheduler.
+    /// Capacity between hash discovery and the Metadata scheduler.
     pub hash_queue_capacity: usize,
     /// Metadata download and Peer-cache limits.
     pub metadata: MetadataOptions,
     /// Active get_peers lookup rate and concurrency limits.
     pub peer_lookup: PeerLookupOptions,
+    /// Bounded hash discovery from inbound get_peers and BEP-51 sampling.
+    pub discovery: DiscoveryOptions,
     /// Active crawl, node-pool and scheduler limits.
     pub crawl: CrawlOptions,
+}
+
+/// Independent budgets for hash-only discovery. Announce peers retain their existing path.
+/// Local intervals are capped at seven days and sample request timeouts at 300 seconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryOptions {
+    /// Enables both passive get_peers hash capture and active BEP-51 sampling.
+    pub enabled: bool,
+    /// Zero disables outbound sampling, while get_peers capture can continue.
+    pub sample_queries_per_second: u32,
+    pub sample_burst: u32,
+    pub sample_max_in_flight: usize,
+    pub sample_query_timeout_secs: u64,
+    pub sample_min_interval_secs: u64,
+    /// Minimum delay after a timeout, unsupported response or malformed response.
+    pub sample_failure_backoff_secs: u64,
+    /// Extra delay only when returned hashes are empty or all recently seen.
+    pub sample_no_new_backoff_secs: u64,
+    /// Maximum active sampling candidates, separate from interval history.
+    pub sample_max_nodes: usize,
+    /// Sampling pauses if this interval-history limit fills; future deadlines are never evicted.
+    pub sample_cooldown_capacity: usize,
+    pub hash_dedup_capacity: usize,
+    pub hash_dedup_ttl_secs: u64,
+    pub get_peers_hashes_per_second: u32,
+    pub get_peers_burst: u32,
+    pub sample_hashes_per_second: u32,
+    pub sample_hash_burst: u32,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_queries_per_second: 4,
+            sample_burst: 8,
+            sample_max_in_flight: 16,
+            sample_query_timeout_secs: 3,
+            sample_min_interval_secs: 300,
+            sample_failure_backoff_secs: 900,
+            sample_no_new_backoff_secs: 1_800,
+            sample_max_nodes: 16_384,
+            sample_cooldown_capacity: 100_000,
+            hash_dedup_capacity: 100_000,
+            hash_dedup_ttl_secs: 900,
+            get_peers_hashes_per_second: 8,
+            get_peers_burst: 16,
+            sample_hashes_per_second: 16,
+            sample_hash_burst: 64,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +190,16 @@ pub struct MetadataOptions {
     pub peer_failure_cache_capacity: usize,
     /// Peer failure cache lifetime in seconds; metadata failures are InfoHash-scoped.
     pub peer_failure_ttl_secs: u64,
+    /// Initial delay after a failed Metadata job; retries still pass application admission.
+    pub retry_initial_delay_secs: u64,
+    /// Maximum exponential retry delay.
+    pub retry_max_delay_secs: u64,
+    /// Maximum failed jobs per InfoHash during one retry-history lifetime.
+    pub retry_max_attempts: usize,
+    /// Absolute lifetime of retry history; duplicate announcements never extend it.
+    pub retry_history_ttl_secs: u64,
+    /// Maximum InfoHashes retained in bounded retry history.
+    pub retry_history_capacity: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +211,14 @@ pub struct PeerLookupOptions {
     pub burst: u32,
     /// Maximum InfoHash lookups kept active at the same time.
     pub max_active_lookups: usize,
+    /// Maximum queries sent by one lookup, including its source-node seeds.
+    pub max_queries: usize,
+    /// Maximum simultaneous queries within one lookup.
+    pub max_concurrent_queries: usize,
+    /// End-to-end lookup deadline, in milliseconds.
+    pub lookup_timeout_ms: u64,
+    /// Per-node query deadline, in milliseconds.
+    pub query_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,6 +331,7 @@ impl Default for DHTOptions {
             hash_queue_capacity: 10_000,
             metadata: MetadataOptions::default(),
             peer_lookup: PeerLookupOptions::default(),
+            discovery: DiscoveryOptions::default(),
             crawl: CrawlOptions::default(),
         }
     }
@@ -272,6 +345,11 @@ impl Default for MetadataOptions {
             max_worker_count: 256,
             peer_failure_cache_capacity: 200_000,
             peer_failure_ttl_secs: 60,
+            retry_initial_delay_secs: 60,
+            retry_max_delay_secs: 3_600,
+            retry_max_attempts: 5,
+            retry_history_ttl_secs: 21_600,
+            retry_history_capacity: 100_000,
         }
     }
 }
@@ -282,6 +360,10 @@ impl Default for PeerLookupOptions {
             max_lookups_per_second: 32,
             burst: 32,
             max_active_lookups: 64,
+            max_queries: 12,
+            max_concurrent_queries: 4,
+            lookup_timeout_ms: 2_000,
+            query_timeout_ms: 500,
         }
     }
 }

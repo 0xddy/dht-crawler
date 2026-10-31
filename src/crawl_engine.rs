@@ -2,9 +2,7 @@ use crate::bootstrap::{BootstrapGate, BootstrapSourcePool, resolve_bootstrap_nod
 use crate::budget::RateBucket;
 use crate::crawl_config::ResolvedCrawlConfig;
 use crate::krpc::{for_each_response_node, send_find_node_query};
-use crate::node_id::{
-    TransactionId, bucket_index, neighbor_node_id, random_node_id, target_for_bucket,
-};
+use crate::node_id::{TransactionId, neighbor_node_id, random_node_id, target_for_prefix};
 use crate::node_pool::{AdmissionOutcome, NodePool, ResponsiveReservoir, SubnetKey};
 use crate::protocol::DhtResponse;
 use crate::routing_snapshot::RoutingSnapshot;
@@ -725,21 +723,26 @@ impl CrawlActor {
         permit.send(OutboundRequest {
             key,
             node,
-            target: self.choose_target(&node),
+            target: self.choose_target(),
             sender_id,
         });
         self.responsive.record_probe(node.addr, now);
         true
     }
 
-    fn choose_target(&self, node: &NodeTuple) -> [u8; 20] {
+    fn choose_target(&self) -> [u8; 20] {
         let total = self
             .config
             .random_walk_percent
             .saturating_add(self.config.sparse_bucket_percent)
             .max(1);
         if rand::thread_rng().gen_range(0..total) < self.config.sparse_bucket_percent {
-            target_for_bucket(&self.local_id, bucket_index(&node.id, &self.local_id))
+            // Sparse means underrepresented in our responsive ID keyspace,
+            // rather than merely the contacted node's distance from our ID.
+            // The prefix list is refreshed with the snapshot, never scanned
+            // or rebuilt for an individual outgoing query.
+            let prefixes = self.responsive.sparse_prefixes();
+            target_for_prefix(prefixes[rand::thread_rng().gen_range(0..prefixes.len())])
         } else {
             random_node_id()
         }
@@ -812,7 +815,7 @@ impl CrawlActor {
         });
     }
 
-    fn publish_snapshot(&self, now: Instant) {
+    fn publish_snapshot(&mut self, now: Instant) {
         let nodes = self
             .responsive
             .snapshot(self.config.routing_snapshot_size, now);
@@ -932,6 +935,35 @@ mod tests {
             shutdown: CancellationToken::new(),
         });
         (actor, egress_rx, runtime_stats)
+    }
+
+    #[test]
+    fn sparse_targets_follow_responsive_prefix_coverage_and_preserve_random_exploration() {
+        let mut options = CrawlOptions::default();
+        options.target.random_walk_percent = 0;
+        options.target.sparse_bucket_percent = 100;
+        let (mut actor, _egress_rx, _) = test_actor(ResolvedCrawlConfig::from_options(&options));
+        let now = Instant::now();
+        for prefix in 0..=u8::MAX {
+            if prefix != 83 {
+                actor.responsive.record(
+                    node(prefix, &format!("8.8.8.8:{}", u16::from(prefix) + 1)),
+                    now,
+                    now,
+                );
+            }
+        }
+        actor.publish_snapshot(now);
+        for _ in 0..128 {
+            assert_eq!(actor.choose_target()[0], 83);
+        }
+        actor.config.random_walk_percent = 100;
+        actor.config.sparse_bucket_percent = 0;
+        let varied = (0..128).any(|_| actor.choose_target()[0] != 83);
+        assert!(
+            varied,
+            "random exploration must not be confined to the sparse prefix"
+        );
     }
 
     #[test]
@@ -1182,6 +1214,7 @@ mod tests {
             nodes: None,
             nodes6: None,
             values: None,
+            ..Default::default()
         };
         engine.route_response("8.8.8.8:1".parse().unwrap(), [1; 8], response());
         engine.route_response("1.1.1.1:2".parse().unwrap(), [2; 8], response());

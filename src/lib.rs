@@ -10,6 +10,7 @@ mod bootstrap;
 mod budget;
 mod crawl_config;
 mod crawl_engine;
+mod discovery;
 mod error;
 mod krpc;
 /// BEP-9 Metadata fetch support.
@@ -34,12 +35,14 @@ pub use runtime_stats::{
     DhtObservabilitySnapshot, DhtRuntimeSnapshot, DhtRuntimeStats, FixedHistogramSnapshot,
     MetadataConnectionErrorsSnapshot, MetadataTimeoutStagesSnapshot,
 };
-pub use scheduler::{MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits};
-pub use server::{DHTServer, HashDiscovered};
+pub use scheduler::{
+    MetadataAdmission, MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits,
+};
+pub use server::{DHTServer, HashDiscovered, HashSource};
 pub use types::{
-    BootstrapOptions, CrawlOptions, DHTOptions, FileInfo, MetadataFetchCompletion,
-    MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PeerLookupOptions,
-    PoolOptions, RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
+    BootstrapOptions, CrawlOptions, DHTOptions, DiscoveryOptions, FileInfo,
+    MetadataFetchCompletion, MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple,
+    PeerLookupOptions, PoolOptions, RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
 };
 
 /// Common server, configuration and callback payload imports.
@@ -47,13 +50,14 @@ pub mod prelude {
     pub use crate::error::{DHTError, Result};
     pub use crate::runtime_stats::{DhtRuntimeSnapshot, DhtRuntimeStats};
     pub use crate::scheduler::{
-        MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits,
+        MetadataAdmission, MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits,
     };
-    pub use crate::server::DHTServer;
+    pub use crate::server::{DHTServer, HashDiscovered, HashSource};
     pub use crate::types::{
-        BootstrapOptions, CrawlOptions, DHTOptions, FileInfo, MetadataFetchCompletion,
-        MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple, PeerLookupOptions,
-        PoolOptions, RateLimitOptions, SchedulerOptions, TargetOptions, TorrentInfo,
+        BootstrapOptions, CrawlOptions, DHTOptions, DiscoveryOptions, FileInfo,
+        MetadataFetchCompletion, MetadataFetchCompletionStatus, MetadataOptions, NetMode,
+        NodeTuple, PeerLookupOptions, PoolOptions, RateLimitOptions, SchedulerOptions,
+        TargetOptions, TorrentInfo,
     };
 }
 

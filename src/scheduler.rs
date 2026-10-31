@@ -1,10 +1,12 @@
 use crate::metadata::{FetchedMetadata, MetadataFetchOutcome, RbitFetcher};
-use crate::peer_lookup::{LOOKUP_TIMEOUT, PeerLookupRequest};
+use crate::peer_lookup::PeerLookupRequest;
 #[cfg(test)]
 use crate::runtime_stats::DhtRuntimeLimits;
 use crate::runtime_stats::DhtRuntimeStats;
-use crate::server::HashDiscovered;
-use crate::types::{MetadataFetchCompletion, MetadataFetchCompletionStatus, TorrentInfo};
+use crate::server::{HashDiscovered, HashSource};
+use crate::types::{
+    MetadataFetchCompletion, MetadataFetchCompletionStatus, MetadataOptions, NodeTuple, TorrentInfo,
+};
 use arc_swap::ArcSwapOption;
 #[cfg(feature = "metrics")]
 use metrics::{counter, gauge, histogram};
@@ -12,8 +14,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -28,6 +30,13 @@ const PEER_COALESCE_WINDOW: Duration = Duration::from_millis(25);
 const LIVE_PEER_IDLE_GRACE: Duration = Duration::from_millis(300);
 const ACTIVE_PEER_LOOKUP_DELAY: Duration = Duration::from_millis(100);
 const DISPATCH_TICK: Duration = Duration::from_millis(25);
+const MAX_RETRY_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_LOOKUP_DURATION: Duration = Duration::from_secs(300);
+
+fn retry_deadline(now: Instant, delay: Duration) -> Instant {
+    now.checked_add(delay.min(MAX_RETRY_LIFETIME))
+        .unwrap_or(now)
+}
 
 /// Callback returning whether the application accepted a downloaded torrent.
 pub type TorrentAckCallback = Box<dyn Fn(TorrentInfo) -> bool + Send + Sync + 'static>;
@@ -35,11 +44,22 @@ pub type TorrentAckCallback = Box<dyn Fn(TorrentInfo) -> bool + Send + Sync + 's
 pub type MetadataCompletionCallback = Box<dyn Fn(MetadataFetchCompletion) + Send + Sync + 'static>;
 /// Asynchronous InfoHash admission callback.
 pub type MetadataFetchCallback = Box<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = MetadataAdmission> + Send>>
         + Send
         + Sync
         + 'static,
 >;
+
+/// Application admission distinguishes terminal deduplication from a temporary lease/cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAdmission {
+    /// Download under the application's current claim.
+    Fetch,
+    /// The hash is terminally handled and needs no retry.
+    Skip,
+    /// Preserve candidates and check admission again after this delay.
+    RetryAfter(Duration),
+}
 
 #[derive(Debug, Clone, Copy)]
 /// Pending-queue capacity and maximum concurrent Metadata jobs.
@@ -64,6 +84,8 @@ pub struct MetadataSchedulerCallbacks {
 pub(crate) struct MetadataSchedulerRuntime {
     pub(crate) stats: DhtRuntimeStats,
     pub(crate) peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
+    pub(crate) metadata_options: MetadataOptions,
+    pub(crate) lookup_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,9 +97,11 @@ struct PeerCandidate {
 struct JobPeerLookup {
     request_tx: mpsc::Sender<PeerLookupRequest>,
     info_hash: [u8; 20],
+    source_nodes: Vec<NodeTuple>,
+    timeout: Duration,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct QueuedHash {
     info_hash: String,
     peers: Vec<PeerCandidate>,
@@ -85,6 +109,11 @@ struct QueuedHash {
     ready_at: Instant,
     latest_at: Instant,
     order_key: (Instant, u64),
+    source_nodes: Vec<NodeTuple>,
+    source: HashSource,
+    expires_at: Instant,
+    is_retry: bool,
+    ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +121,7 @@ enum QueuePushKind {
     Inserted,
     Updated,
     EvictedOldest,
+    EvictedRetry,
     Stale,
 }
 
@@ -100,8 +130,47 @@ struct PendingHashQueue {
     capacity: usize,
     ttl: Duration,
     entries: HashMap<String, QueuedHash>,
-    order: BTreeMap<(Instant, u64), String>,
+    // Each hash has exactly one expiry and scheduling entry. Refresh never appends tombstones.
+    expiry: BTreeMap<(Instant, u64), String>,
+    waiting: BTreeMap<(Instant, u64), String>,
+    ready_fresh: BTreeMap<(Instant, u64), String>,
+    ready_retry: BTreeMap<(Instant, u64), String>,
+    retry_expiry: BTreeMap<(Instant, u64), String>,
     sequence: u64,
+    fresh_dispatches: u8,
+}
+
+fn merge_candidate(entry: &mut QueuedHash, event: &HashDiscovered) -> bool {
+    let mut new_peer = false;
+    if let Some(addr) = event.peer_addr {
+        new_peer = !entry.peers.iter().any(|peer| peer.addr == addr);
+        let discovered_at = entry
+            .peers
+            .iter()
+            .find(|peer| peer.addr == addr)
+            .map_or(event.discovered_at, |peer| {
+                peer.discovered_at.max(event.discovered_at)
+            });
+        entry.peers.retain(|peer| peer.addr != addr);
+        entry.peers.push(PeerCandidate {
+            addr,
+            discovered_at,
+        });
+        entry
+            .peers
+            .sort_unstable_by(|a, b| b.discovered_at.cmp(&a.discovered_at));
+        entry.peers.truncate(MAX_METADATA_CANDIDATES_PER_HASH);
+    }
+    if let Some(node) = &event.source_node {
+        entry.source_nodes.retain(|old| old.addr != node.addr);
+        entry.source_nodes.insert(0, *node);
+        entry.source_nodes.truncate(8);
+    }
+    if matches!(event.source, HashSource::Announce) {
+        entry.source = HashSource::Announce;
+    }
+    entry.latest_at = entry.latest_at.max(event.discovered_at);
+    new_peer
 }
 
 impl PendingHashQueue {
@@ -110,27 +179,51 @@ impl PendingHashQueue {
             capacity: capacity.max(1),
             ttl,
             entries: HashMap::new(),
-            order: BTreeMap::new(),
+            expiry: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            ready_fresh: BTreeMap::new(),
+            ready_retry: BTreeMap::new(),
+            retry_expiry: BTreeMap::new(),
             sequence: 0,
+            fresh_dispatches: 0,
         }
     }
-
     fn len(&self) -> usize {
         self.entries.len()
     }
-
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
+    fn pressure_len(&self) -> usize {
+        self.entries.len().saturating_sub(self.retry_expiry.len()) + self.ready_retry.len()
+    }
     #[cfg(test)]
-    fn contains(&self, info_hash: &str) -> bool {
-        self.entries.contains_key(info_hash)
+    fn contains(&self, hash: &str) -> bool {
+        self.entries.contains_key(hash)
     }
 
-    fn next_order_key(&mut self, at: Instant) -> (Instant, u64) {
+    fn insert(&mut self, mut entry: QueuedHash) {
         self.sequence = self.sequence.wrapping_add(1);
-        (at, self.sequence)
+        entry.order_key = (entry.latest_at, self.sequence);
+        self.expiry
+            .insert((entry.expires_at, self.sequence), entry.info_hash.clone());
+        if entry.is_retry {
+            self.retry_expiry
+                .insert((entry.expires_at, self.sequence), entry.info_hash.clone());
+        }
+        if entry.ready {
+            if entry.is_retry {
+                self.ready_retry
+                    .insert((entry.ready_at, self.sequence), entry.info_hash.clone());
+            } else {
+                self.ready_fresh
+                    .insert(entry.order_key, entry.info_hash.clone());
+            }
+        } else {
+            self.waiting
+                .insert((entry.ready_at, self.sequence), entry.info_hash.clone());
+        }
+        self.entries.insert(entry.info_hash.clone(), entry);
     }
 
     fn push(&mut self, event: HashDiscovered, now: Instant) -> QueuePushKind {
@@ -141,98 +234,279 @@ impl PendingHashQueue {
         {
             return QueuePushKind::Stale;
         }
-
-        if let Some(mut entry) = self.entries.remove(&event.info_hash) {
-            self.order.remove(&entry.order_key);
-            let discovered_at = entry
-                .peers
-                .iter()
-                .find(|peer| peer.addr == event.peer_addr)
-                .map(|peer| peer.discovered_at.max(event.discovered_at))
-                .unwrap_or(event.discovered_at);
-            entry.peers.retain(|peer| peer.addr != event.peer_addr);
-            entry.peers.push(PeerCandidate {
-                addr: event.peer_addr,
-                discovered_at,
-            });
-            entry
-                .peers
-                .sort_unstable_by(|left, right| right.discovered_at.cmp(&left.discovered_at));
-            entry.peers.truncate(MAX_METADATA_CANDIDATES_PER_HASH);
-            entry.latest_at = entry.latest_at.max(event.discovered_at);
-            entry.order_key = self.next_order_key(entry.latest_at);
-            self.order.insert(entry.order_key, entry.info_hash.clone());
-            self.entries.insert(entry.info_hash.clone(), entry);
+        if let Some(mut entry) = self.remove(&event.info_hash) {
+            merge_candidate(&mut entry, &event);
+            if !entry.is_retry {
+                entry.expires_at = entry.latest_at + self.ttl;
+            }
+            self.insert(entry);
             return QueuePushKind::Updated;
         }
-
         let mut result = QueuePushKind::Inserted;
         if self.entries.len() >= self.capacity {
-            let Some((&oldest_key, oldest_hash)) = self.order.first_key_value() else {
+            let Some((_, oldest_hash)) = self
+                .retry_expiry
+                .first_key_value()
+                .or_else(|| self.expiry.first_key_value())
+            else {
                 return QueuePushKind::Stale;
             };
-            if event.discovered_at <= oldest_key.0 {
+            let oldest_hash = oldest_hash.clone();
+            let oldest = &self.entries[&oldest_hash];
+            if !oldest.is_retry && event.discovered_at <= oldest.latest_at {
                 return QueuePushKind::Stale;
             }
-            let oldest_hash = oldest_hash.clone();
-            self.order.remove(&oldest_key);
-            self.entries.remove(&oldest_hash);
-            result = QueuePushKind::EvictedOldest;
+            result = if oldest.is_retry {
+                QueuePushKind::EvictedRetry
+            } else {
+                QueuePushKind::EvictedOldest
+            };
+            self.remove(&oldest_hash);
         }
-
-        let order_key = self.next_order_key(event.discovered_at);
-        let info_hash = event.info_hash;
-        self.order.insert(order_key, info_hash.clone());
-        self.entries.insert(
-            info_hash.clone(),
-            QueuedHash {
-                info_hash,
-                peers: vec![PeerCandidate {
-                    addr: event.peer_addr,
-                    discovered_at: event.discovered_at,
-                }],
-                queued_at: now,
-                ready_at: now + PEER_COALESCE_WINDOW,
-                latest_at: event.discovered_at,
-                order_key,
-            },
-        );
+        let mut entry = QueuedHash {
+            info_hash: event.info_hash.clone(),
+            peers: Vec::new(),
+            source_nodes: Vec::new(),
+            source: event.source,
+            queued_at: now,
+            ready_at: now + PEER_COALESCE_WINDOW,
+            latest_at: event.discovered_at,
+            order_key: (now, 0),
+            expires_at: event.discovered_at + self.ttl,
+            is_retry: false,
+            ready: false,
+        };
+        merge_candidate(&mut entry, &event);
+        self.insert(entry);
         result
     }
 
-    fn remove(&mut self, info_hash: &str) -> Option<QueuedHash> {
-        let entry = self.entries.remove(info_hash)?;
-        self.order.remove(&entry.order_key);
+    fn remove(&mut self, hash: &str) -> Option<QueuedHash> {
+        let entry = self.entries.remove(hash)?;
+        let sequence = entry.order_key.1;
+        self.expiry.remove(&(entry.expires_at, sequence));
+        self.retry_expiry.remove(&(entry.expires_at, sequence));
+        self.waiting.remove(&(entry.ready_at, sequence));
+        self.ready_fresh.remove(&entry.order_key);
+        self.ready_retry.remove(&(entry.ready_at, sequence));
         Some(entry)
+    }
+
+    fn defer(&mut self, mut entry: QueuedHash, record: RetryRecord) -> bool {
+        self.remove(&entry.info_hash);
+        if self.entries.len() >= self.capacity
+            || self.retry_expiry.len() >= (self.capacity / 4).max(1)
+        {
+            return false;
+        }
+        entry.ready_at = record.next_due;
+        entry.expires_at = record.expires_at;
+        entry.is_retry = true;
+        entry.ready = false;
+        self.insert(entry);
+        true
+    }
+
+    fn promote_ready(&mut self, now: Instant) {
+        while let Some((&key, _)) = self.waiting.first_key_value() {
+            if key.0 > now {
+                break;
+            }
+            let (_, hash) = self.waiting.pop_first().unwrap();
+            let entry = self.entries.get_mut(&hash).expect("indexed queued hash");
+            entry.ready = true;
+            if entry.is_retry {
+                self.ready_retry.insert(key, hash);
+            } else {
+                self.ready_fresh.insert(entry.order_key, hash);
+            }
+        }
     }
 
     fn pop_newest_ready(
         &mut self,
         now: Instant,
-        in_flight: &HashMap<String, InFlightState>,
+        _in_flight: &HashMap<String, InFlightState>,
     ) -> Option<QueuedHash> {
-        let info_hash = self.order.iter().rev().find_map(|(_, hash)| {
-            let entry = self.entries.get(hash)?;
-            (!in_flight.contains_key(hash) && entry.ready_at <= now).then(|| hash.clone())
-        })?;
-        self.remove(&info_hash)
+        self.expire(now);
+        self.promote_ready(now);
+        // At most three fresh jobs before one due retry. Either class borrows idle capacity.
+        let use_retry = !self.ready_retry.is_empty()
+            && (self.fresh_dispatches >= 3 || self.ready_fresh.is_empty());
+        let hash = if use_retry {
+            self.fresh_dispatches = 0;
+            self.ready_retry.first_key_value()?.1.clone()
+        } else {
+            self.fresh_dispatches = self.fresh_dispatches.saturating_add(1);
+            self.ready_fresh.last_key_value()?.1.clone()
+        };
+        self.remove(&hash)
     }
 
     fn expire(&mut self, now: Instant) -> usize {
         let mut expired = 0;
-        loop {
-            let Some((&oldest_key, oldest_hash)) = self.order.first_key_value() else {
-                break;
-            };
-            if now.checked_duration_since(oldest_key.0).unwrap_or_default() <= self.ttl {
+        while let Some((&key, hash)) = self.expiry.first_key_value() {
+            if key.0 >= now {
                 break;
             }
-            let oldest_hash = oldest_hash.clone();
-            self.order.remove(&oldest_key);
-            self.entries.remove(&oldest_hash);
+            let hash = hash.clone();
+            self.remove(&hash);
             expired += 1;
         }
         expired
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryRecord {
+    failures: usize,
+    next_due: Instant,
+    expires_at: Instant,
+    extra_attempts: usize,
+}
+
+impl RetryRecord {
+    fn attempt_limit(self, policy: &MetadataOptions) -> usize {
+        policy
+            .retry_max_attempts
+            .saturating_add(self.extra_attempts)
+    }
+}
+
+struct RetryState {
+    record: RetryRecord,
+    peers: Vec<SocketAddr>,
+    sources: Vec<SocketAddr>,
+}
+
+impl RetryState {
+    fn observe(&mut self, peer: Option<SocketAddr>, source: Option<SocketAddr>) -> bool {
+        let mut novel = false;
+        for (candidate, seen, capacity) in [
+            (peer, &mut self.peers, MAX_METADATA_CANDIDATES_PER_HASH),
+            (source, &mut self.sources, 8),
+        ] {
+            if let Some(addr) = candidate
+                && !seen.contains(&addr)
+            {
+                novel = true;
+                if seen.len() < capacity {
+                    seen.push(addr);
+                }
+            }
+        }
+        novel
+    }
+}
+
+#[derive(Default)]
+struct RetryHistory {
+    entries: HashMap<String, RetryState>,
+    expiry: BTreeMap<(Instant, String), ()>,
+}
+
+impl RetryHistory {
+    fn expire(&mut self, now: Instant) {
+        while let Some(((at, _), _)) = self.expiry.first_key_value() {
+            if *at > now {
+                break;
+            }
+            let ((_, hash), _) = self.expiry.pop_first().unwrap();
+            self.entries.remove(&hash);
+        }
+    }
+    fn remove(&mut self, hash: &str) {
+        if let Some(state) = self.entries.remove(hash) {
+            self.expiry
+                .remove(&(state.record.expires_at, hash.to_string()));
+        }
+    }
+    fn record(
+        &mut self,
+        hash: &str,
+        now: Instant,
+        failed: bool,
+        delay: Duration,
+        policy: &MetadataOptions,
+    ) -> Option<RetryRecord> {
+        self.expire(now);
+        if !self.entries.contains_key(hash) {
+            if self.entries.len() >= policy.retry_history_capacity {
+                return None;
+            }
+            let expires_at =
+                retry_deadline(now, Duration::from_secs(policy.retry_history_ttl_secs));
+            self.entries.insert(
+                hash.to_string(),
+                RetryState {
+                    record: RetryRecord {
+                        failures: 0,
+                        next_due: now,
+                        expires_at,
+                        extra_attempts: 0,
+                    },
+                    peers: Vec::new(),
+                    sources: Vec::new(),
+                },
+            );
+            self.expiry.insert((expires_at, hash.to_string()), ());
+        }
+        let record = &mut self.entries.get_mut(hash).unwrap().record;
+        if failed {
+            record.failures = record.failures.saturating_add(1);
+        }
+        let backoff = if failed {
+            let multiplier = 1u64 << record.failures.saturating_sub(1).min(31);
+            Duration::from_secs(
+                policy
+                    .retry_initial_delay_secs
+                    .saturating_mul(multiplier)
+                    .min(policy.retry_max_delay_secs),
+            )
+        } else {
+            delay
+        };
+        // A zero-duration application deferral must not become a busy admission loop.
+        record.next_due = retry_deadline(now, backoff.max(Duration::from_millis(100)));
+        Some(*record)
+    }
+
+    fn observe_event(
+        &mut self,
+        event: &HashDiscovered,
+        now: Instant,
+        policy: &MetadataOptions,
+    ) -> Option<RetryRecord> {
+        self.expire(now);
+        let state = self.entries.get_mut(&event.info_hash)?;
+        let novel = state.observe(
+            event.peer_addr,
+            event.source_node.as_ref().map(|node| node.addr),
+        );
+        if state.record.failures >= state.record.attempt_limit(policy)
+            && novel
+            && state.record.extra_attempts < 2
+            && policy.retry_max_attempts > 0
+        {
+            state.record.extra_attempts += 1;
+            state.record.next_due = retry_deadline(
+                now,
+                Duration::from_secs(policy.retry_initial_delay_secs)
+                    .max(Duration::from_millis(100)),
+            );
+        }
+        Some(state.record)
+    }
+
+    fn remember(&mut self, entry: &QueuedHash) {
+        if let Some(state) = self.entries.get_mut(&entry.info_hash) {
+            for peer in &entry.peers {
+                state.observe(Some(peer.addr), None);
+            }
+            for node in &entry.source_nodes {
+                state.observe(None, Some(node.addr));
+            }
+        }
     }
 }
 
@@ -241,17 +515,21 @@ struct MetadataJob {
     info_hash: String,
     peers: Vec<PeerCandidate>,
     peer_rx: mpsc::Receiver<PeerCandidate>,
+    source_nodes: Vec<NodeTuple>,
+    source: HashSource,
 }
 
 #[derive(Debug)]
 struct InFlightState {
     peer_tx: mpsc::Sender<PeerCandidate>,
     scheduled_peers: HashSet<SocketAddr>,
+    entry: QueuedHash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobOutcome {
     GateRejected,
+    Deferred(Duration),
     Completed(MetadataFetchCompletionStatus),
 }
 
@@ -278,6 +556,9 @@ pub struct MetadataScheduler {
     queue_len: Arc<AtomicUsize>,
     runtime_stats: DhtRuntimeStats,
     peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
+    metadata_options: MetadataOptions,
+    lookup_timeout: Duration,
+    retry_history: Mutex<RetryHistory>,
     shutdown: CancellationToken,
 }
 
@@ -321,6 +602,8 @@ impl MetadataScheduler {
             MetadataSchedulerRuntime {
                 stats: runtime_stats,
                 peer_lookup_tx: None,
+                metadata_options: MetadataOptions::default(),
+                lookup_timeout: Duration::from_millis(2_000),
             },
         )
     }
@@ -349,6 +632,9 @@ impl MetadataScheduler {
             queue_len,
             runtime_stats: runtime.stats,
             peer_lookup_tx: runtime.peer_lookup_tx,
+            metadata_options: runtime.metadata_options,
+            lookup_timeout: runtime.lookup_timeout.min(MAX_LOOKUP_DURATION),
+            retry_history: Mutex::new(RetryHistory::default()),
             shutdown,
         }
     }
@@ -373,6 +659,7 @@ impl MetadataScheduler {
         let mut queue = PendingHashQueue::new(self.max_queue_size, HASH_QUEUE_TTL);
         let mut in_flight = HashMap::<String, InFlightState>::new();
         let mut tasks = JoinSet::<JobResult>::new();
+        let mut task_hashes = HashMap::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(1));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut dispatch_tick = tokio::time::interval(DISPATCH_TICK);
@@ -382,8 +669,29 @@ impl MetadataScheduler {
         let mut input_closed = false;
 
         loop {
-            self.dispatch_ready(&mut queue, &mut in_flight, &mut tasks);
+            self.dispatch_ready(&mut queue, &mut in_flight, &mut tasks, &mut task_hashes);
             self.sync_queue_len(queue.len(), in_flight.len());
+            // Cooling retries consume bounded storage, but are not runnable metadata pressure.
+            self.queue_len.store(
+                queue.pressure_len().saturating_add(in_flight.len()),
+                Ordering::Relaxed,
+            );
+            self.runtime_stats.yield_stats().set(
+                "metadata_retry_waiting",
+                queue
+                    .retry_expiry
+                    .len()
+                    .saturating_sub(queue.ready_retry.len()) as u64,
+            );
+            let history_len = self
+                .retry_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .len();
+            self.runtime_stats
+                .yield_stats()
+                .set("metadata_retry_history", history_len as u64);
 
             if input_closed && queue.is_empty() && tasks.is_empty() {
                 break;
@@ -399,15 +707,24 @@ impl MetadataScheduler {
                         None => input_closed = true,
                     }
                 }
-                result = tasks.join_next(), if !tasks.is_empty() => {
+                result = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     match result {
-                        Some(Ok(result)) => {
+                        Some(Ok((id, result))) => {
+                            task_hashes.remove(&id);
                             self.handle_job_result(result, &mut queue, &mut in_flight);
                         }
                         Some(Err(error)) => {
                             #[cfg(feature = "metrics")]
                             counter!("dht_metadata_worker_join_error_total").increment(1);
                             log::warn!("Metadata worker task failed: {error}");
+                            if let Some(info_hash) = task_hashes.remove(&error.id()) {
+                                // The application fences cleanup by its actual claim, including
+                                // a claim acquired before admission panicked.
+                                self.handle_job_result(JobResult {
+                                    info_hash, attempts: 0,
+                                    outcome: JobOutcome::Completed(MetadataFetchCompletionStatus::FetchFailed),
+                                }, &mut queue, &mut in_flight);
+                            }
                         }
                         None => {}
                     }
@@ -432,6 +749,12 @@ impl MetadataScheduler {
         self.queue_len.store(0, Ordering::Relaxed);
         self.runtime_stats.set_hash_ingress_queue_depth(0);
         self.runtime_stats.set_metadata_queue(0, 0);
+        self.runtime_stats
+            .yield_stats()
+            .set("metadata_retry_waiting", 0);
+        self.runtime_stats
+            .yield_stats()
+            .set("metadata_retry_history", 0);
         #[cfg(feature = "metrics")]
         gauge!("dht_metadata_queue_depth").set(0.0);
     }
@@ -445,34 +768,63 @@ impl MetadataScheduler {
         self.total_received.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         if let Some(state) = in_flight.get_mut(&hash.info_hash) {
-            let kind = if now
+            if now
                 .checked_duration_since(hash.discovered_at)
                 .unwrap_or_default()
                 > HASH_QUEUE_TTL
             {
-                QueuePushKind::Stale
-            } else if state.scheduled_peers.contains(&hash.peer_addr)
-                || state.scheduled_peers.len() >= MAX_METADATA_CANDIDATES_PER_HASH
+                self.record_queue_push(QueuePushKind::Stale);
+                return;
+            }
+            merge_candidate(&mut state.entry, &hash);
+            if let Some(addr) = hash.peer_addr
+                && !state.scheduled_peers.contains(&addr)
+                && state.scheduled_peers.len() < MAX_METADATA_CANDIDATES_PER_HASH
+                && state
+                    .peer_tx
+                    .try_send(PeerCandidate {
+                        addr,
+                        discovered_at: hash.discovered_at,
+                    })
+                    .is_ok()
             {
-                QueuePushKind::Updated
-            } else {
-                let peer = PeerCandidate {
-                    addr: hash.peer_addr,
-                    discovered_at: hash.discovered_at,
-                };
-                match state.peer_tx.try_send(peer) {
-                    Ok(()) => {
-                        state.scheduled_peers.insert(hash.peer_addr);
-                        QueuePushKind::Updated
-                    }
-                    Err(_) => QueuePushKind::Updated,
-                }
-            };
-            self.record_queue_push(kind);
+                state.scheduled_peers.insert(addr);
+            }
+            self.record_queue_push(QueuePushKind::Updated);
             return;
         }
-
+        let record = {
+            let mut history = self
+                .retry_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            history.observe_event(&hash, now, &self.metadata_options)
+        };
+        if record
+            .is_some_and(|record| record.failures >= record.attempt_limit(&self.metadata_options))
+        {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_exhausted");
+            return;
+        }
+        if let Some(entry) = queue.entries.get(&hash.info_hash)
+            && entry.is_retry
+            && hash
+                .peer_addr
+                .is_some_and(|addr| !entry.peers.iter().any(|peer| peer.addr == addr))
+        {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_new_peer");
+        }
+        let info_hash = hash.info_hash.clone();
         let kind = queue.push(hash, now);
+        if let Some(record) = record
+            && let Some(entry) = queue.remove(&info_hash)
+        {
+            queue.defer(entry, record);
+        }
         self.record_queue_push(kind);
     }
 
@@ -486,7 +838,12 @@ impl MetadataScheduler {
                 self.runtime_stats.metadata_queue_deduplicated();
                 "deduplicated"
             }
-            QueuePushKind::EvictedOldest => {
+            QueuePushKind::EvictedOldest | QueuePushKind::EvictedRetry => {
+                if kind == QueuePushKind::EvictedRetry {
+                    self.runtime_stats
+                        .yield_stats()
+                        .inc("metadata_retry_evicted");
+                }
                 self.total_dropped.fetch_add(1, Ordering::Relaxed);
                 self.runtime_stats.metadata_queue_inserted();
                 self.runtime_stats.metadata_queue_evicted();
@@ -509,7 +866,9 @@ impl MetadataScheduler {
         queue: &mut PendingHashQueue,
         in_flight: &mut HashMap<String, InFlightState>,
         tasks: &mut JoinSet<JobResult>,
+        task_hashes: &mut HashMap<tokio::task::Id, String>,
     ) {
+        queue.promote_ready(Instant::now());
         while tasks.len() < self.max_concurrent {
             let Some(mut entry) = queue.pop_newest_ready(Instant::now(), in_flight) else {
                 break;
@@ -524,12 +883,15 @@ impl MetadataScheduler {
             histogram!("dht_metadata_queue_wait_seconds").record(queue_wait.as_secs_f64());
             let now = Instant::now();
             entry.peers.retain(|peer| {
+                if entry.is_retry {
+                    return true;
+                }
                 now.checked_duration_since(peer.discovered_at)
                     .unwrap_or_default()
                     <= HASH_QUEUE_TTL
             });
             entry.peers.truncate(MAX_METADATA_CANDIDATES_PER_HASH);
-            if entry.peers.is_empty() {
+            if entry.peers.is_empty() && self.peer_lookup_tx.is_none() {
                 self.total_dropped.fetch_add(1, Ordering::Relaxed);
                 self.runtime_stats.metadata_queue_stale(1);
                 continue;
@@ -538,9 +900,15 @@ impl MetadataScheduler {
             let state = InFlightState {
                 peer_tx,
                 scheduled_peers: entry.peers.iter().map(|peer| peer.addr).collect(),
+                entry: entry.clone(),
             };
+            if entry.is_retry {
+                self.runtime_stats
+                    .yield_stats()
+                    .inc("metadata_retry_dispatched");
+            }
             in_flight.insert(entry.info_hash.clone(), state);
-            self.spawn_job(entry, peer_rx, tasks);
+            self.spawn_job(entry, peer_rx, tasks, task_hashes);
         }
     }
 
@@ -549,6 +917,7 @@ impl MetadataScheduler {
         entry: QueuedHash,
         peer_rx: mpsc::Receiver<PeerCandidate>,
         tasks: &mut JoinSet<JobResult>,
+        task_hashes: &mut HashMap<tokio::task::Id, String>,
     ) {
         self.total_dispatched.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
@@ -558,13 +927,17 @@ impl MetadataScheduler {
             info_hash: entry.info_hash,
             peers: entry.peers,
             peer_rx,
+            source_nodes: entry.source_nodes,
+            source: entry.source,
         };
         let fetcher = self.fetcher.clone();
         let callback = self.callback.clone();
         let on_metadata_fetch = self.on_metadata_fetch.clone();
         let runtime_stats = self.runtime_stats.clone();
         let peer_lookup_tx = self.peer_lookup_tx.clone();
-        tasks.spawn(async move {
+        let lookup_timeout = self.lookup_timeout;
+        let info_hash = job.info_hash.clone();
+        let handle = tasks.spawn(async move {
             Self::process_hash(
                 job,
                 &fetcher,
@@ -572,9 +945,11 @@ impl MetadataScheduler {
                 &on_metadata_fetch,
                 &runtime_stats,
                 peer_lookup_tx,
+                lookup_timeout,
             )
             .await
         });
+        task_hashes.insert(handle.id(), info_hash);
     }
 
     fn handle_job_result(
@@ -583,23 +958,89 @@ impl MetadataScheduler {
         queue: &mut PendingHashQueue,
         in_flight: &mut HashMap<String, InFlightState>,
     ) {
-        if !in_flight.contains_key(&result.info_hash) {
+        let Some(state) = in_flight.remove(&result.info_hash) else {
             return;
-        }
-
+        };
+        queue.remove(&result.info_hash);
         match result.outcome {
             JobOutcome::GateRejected => {
-                queue.remove(&result.info_hash);
-                in_flight.remove(&result.info_hash);
+                self.retry_history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&result.info_hash);
                 #[cfg(feature = "metrics")]
                 counter!("dht_metadata_jobs_completed_total", "result" => "gate_rejected")
                     .increment(1);
             }
-            JobOutcome::Completed(status) => {
-                queue.remove(&result.info_hash);
-                in_flight.remove(&result.info_hash);
-                self.finish(result.info_hash, status, result.attempts);
+            JobOutcome::Deferred(delay) => {
+                self.runtime_stats
+                    .yield_stats()
+                    .inc("metadata_retry_deferred");
+                self.schedule_retry(state.entry, queue, false, delay);
             }
+            JobOutcome::Completed(status) => {
+                self.finish(result.info_hash.clone(), status, result.attempts);
+                if status == MetadataFetchCompletionStatus::Accepted {
+                    self.retry_history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&result.info_hash);
+                } else {
+                    self.schedule_retry(state.entry, queue, true, Duration::ZERO);
+                }
+            }
+        }
+    }
+
+    fn schedule_retry(
+        &self,
+        entry: QueuedHash,
+        queue: &mut PendingHashQueue,
+        failed: bool,
+        delay: Duration,
+    ) {
+        if self.metadata_options.retry_max_attempts == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if entry.is_retry && entry.expires_at <= now {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_exhausted");
+            return;
+        }
+        let record = {
+            let mut history = self
+                .retry_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record =
+                history.record(&entry.info_hash, now, failed, delay, &self.metadata_options);
+            history.remember(&entry);
+            record
+        };
+        let Some(record) = record else {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_history_full");
+            return;
+        };
+        if record.failures >= record.attempt_limit(&self.metadata_options)
+            || record.next_due >= record.expires_at
+        {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_exhausted");
+            return;
+        }
+        if queue.defer(entry, record) {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_scheduled");
+        } else {
+            self.runtime_stats
+                .yield_stats()
+                .inc("metadata_retry_evicted");
         }
     }
 
@@ -636,15 +1077,31 @@ impl MetadataScheduler {
         on_metadata_fetch: &Arc<ArcSwapOption<MetadataFetchCallback>>,
         runtime_stats: &DhtRuntimeStats,
         peer_lookup_tx: Option<mpsc::Sender<PeerLookupRequest>>,
+        lookup_timeout: Duration,
     ) -> JobResult {
-        if let Some(gate) = on_metadata_fetch.load_full()
-            && !gate(job.info_hash.clone()).await
-        {
-            return JobResult {
-                info_hash: job.info_hash,
-                attempts: 0,
-                outcome: JobOutcome::GateRejected,
+        if let Some(gate) = on_metadata_fetch.load_full() {
+            let outcome = match gate(job.info_hash.clone()).await {
+                MetadataAdmission::Fetch => None,
+                MetadataAdmission::Skip => Some(JobOutcome::GateRejected),
+                MetadataAdmission::RetryAfter(delay) => Some(JobOutcome::Deferred(delay)),
             };
+            if let Some(outcome) = outcome {
+                return JobResult {
+                    info_hash: job.info_hash,
+                    attempts: 0,
+                    outcome,
+                };
+            }
+        }
+        runtime_stats.yield_stats().inc(match job.source {
+            HashSource::Announce => "metadata_source_announce_started",
+            HashSource::GetPeers => "metadata_source_get_peers_started",
+            HashSource::Sample => "metadata_source_sample_started",
+        });
+        if job.peers.is_empty() {
+            runtime_stats
+                .yield_stats()
+                .inc("metadata_hash_only_started");
         }
 
         let info_hash_bytes: [u8; 20] = match hex::decode(&job.info_hash) {
@@ -668,6 +1125,8 @@ impl MetadataScheduler {
         let lookup = peer_lookup_tx.map(|request_tx| JobPeerLookup {
             request_tx,
             info_hash: info_hash_bytes,
+            source_nodes: job.source_nodes,
+            timeout: lookup_timeout,
         });
         let fetched = race_peer_fetches(
             job.peers,
@@ -691,6 +1150,11 @@ impl MetadataScheduler {
         let attempts = attempts.load(Ordering::Relaxed);
 
         if let Some((peer, (name, total_size, files, piece_length))) = fetched {
+            runtime_stats.yield_stats().inc(match job.source {
+                HashSource::Announce => "metadata_source_announce_succeeded",
+                HashSource::GetPeers => "metadata_source_get_peers_succeeded",
+                HashSource::Sample => "metadata_source_sample_succeeded",
+            });
             let metadata = TorrentInfo {
                 info_hash: job.info_hash.clone(),
                 name,
@@ -720,6 +1184,11 @@ impl MetadataScheduler {
             };
         }
 
+        runtime_stats.yield_stats().inc(match job.source {
+            HashSource::Announce => "metadata_source_announce_failed",
+            HashSource::GetPeers => "metadata_source_get_peers_failed",
+            HashSource::Sample => "metadata_source_sample_failed",
+        });
         JobResult {
             info_hash: job.info_hash,
             attempts,
@@ -799,16 +1268,26 @@ where
     let mut attempts_reserved = 0usize;
 
     let mut lookup_open = lookup.is_some();
+    let lookup_timeout = lookup.as_ref().map_or(Duration::ZERO, |lookup| {
+        lookup.timeout.min(MAX_LOOKUP_DURATION)
+    });
     let mut lookup_submitted = !lookup_open;
     let (lookup_peer_tx, mut lookup_peer_rx) = mpsc::channel(MAX_METADATA_CANDIDATES_PER_HASH);
     let submit_lookup = async move {
         if let Some(lookup) = lookup {
             tokio::time::sleep(ACTIVE_PEER_LOOKUP_DELAY).await;
             // Full/closed request queues drop the result sender and promptly end the wait.
-            let _ = lookup.request_tx.try_send(PeerLookupRequest {
-                info_hash: lookup.info_hash,
-                peer_tx: lookup_peer_tx,
-            });
+            if lookup
+                .request_tx
+                .try_send(PeerLookupRequest {
+                    info_hash: lookup.info_hash,
+                    peer_tx: lookup_peer_tx,
+                    source_nodes: lookup.source_nodes,
+                })
+                .is_err()
+            {
+                runtime_stats.yield_stats().inc("lookup_request_queue_full");
+            }
         }
     };
     tokio::pin!(submit_lookup);
@@ -816,7 +1295,7 @@ where
     // own deadline too, but a stalled or cancelled actor must never hold a job indefinitely.
     let lookup_deadline = tokio::time::Instant::now()
         + ACTIVE_PEER_LOOKUP_DELAY
-        + LOOKUP_TIMEOUT
+        + lookup_timeout
         + LIVE_PEER_IDLE_GRACE;
     let mut lookup_deadline_elapsed = false;
     let mut accepting_live_peers = true;
@@ -920,8 +1399,16 @@ mod tests {
         Fut: std::future::Future<Output = bool> + Send + 'static,
     {
         let holder = Arc::new(ArcSwapOption::empty());
-        let callback: Arc<MetadataFetchCallback> =
-            Arc::new(Box::new(move |hash| Box::pin(callback(hash))));
+        let callback: Arc<MetadataFetchCallback> = Arc::new(Box::new(move |hash| {
+            let future = callback(hash);
+            Box::pin(async move {
+                if future.await {
+                    MetadataAdmission::Fetch
+                } else {
+                    MetadataAdmission::Skip
+                }
+            })
+        }));
         holder.store(Some(callback));
         holder
     }
@@ -939,7 +1426,9 @@ mod tests {
     fn event(hash: &str, port: u16, discovered_at: Instant) -> HashDiscovered {
         HashDiscovered {
             info_hash: hash.to_string(),
-            peer_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            peer_addr: Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            source_node: None,
+            source: HashSource::Announce,
             discovered_at,
         }
     }
@@ -952,6 +1441,8 @@ mod tests {
             JobPeerLookup {
                 request_tx,
                 info_hash: [3; 20],
+                source_nodes: Vec::new(),
+                timeout: Duration::from_secs(2),
             },
             request_rx,
         )
@@ -1108,6 +1599,11 @@ mod tests {
             InFlightState {
                 peer_tx,
                 scheduled_peers: HashSet::from([SocketAddr::from(([127, 0, 0, 1], 1000))]),
+                entry: {
+                    let mut queue = PendingHashQueue::new(1, HASH_QUEUE_TTL);
+                    queue.push(event("hash", 1000, Instant::now()), Instant::now());
+                    queue.remove("hash").unwrap()
+                },
             },
         )]);
         let mut queue = PendingHashQueue::new(4, HASH_QUEUE_TTL);
@@ -1329,6 +1825,11 @@ mod tests {
                 InFlightState {
                     peer_tx,
                     scheduled_peers: HashSet::from([initial.addr]),
+                    entry: {
+                        let mut queue = PendingHashQueue::new(1, HASH_QUEUE_TTL);
+                        queue.push(event("hash", 1000, Instant::now()), Instant::now());
+                        queue.remove("hash").unwrap()
+                    },
                 },
             )]);
             let mut queue = PendingHashQueue::new(4, HASH_QUEUE_TTL);
@@ -1540,6 +2041,7 @@ mod tests {
             .try_send(PeerLookupRequest {
                 info_hash: [4; 20],
                 peer_tx,
+                source_nodes: Vec::new(),
             })
             .unwrap();
         let result = tokio::time::timeout(
@@ -1790,5 +2292,448 @@ mod tests {
 
         shutdown.cancel();
         scheduler_task.await.unwrap();
+    }
+
+    #[test]
+    fn retries_have_fixed_lifetime_bounded_history_and_exponential_failure_budget() {
+        let now = Instant::now();
+        let policy = MetadataOptions {
+            retry_initial_delay_secs: 1,
+            retry_max_delay_secs: 3,
+            retry_max_attempts: 3,
+            retry_history_ttl_secs: 20,
+            retry_history_capacity: 1,
+            ..MetadataOptions::default()
+        };
+        let mut history = RetryHistory::default();
+        let first = history
+            .record("h", now, true, Duration::ZERO, &policy)
+            .unwrap();
+        assert_eq!(first.failures, 1);
+        assert_eq!(first.next_due, now + Duration::from_secs(1));
+        let deferred = history
+            .record(
+                "h",
+                now + Duration::from_secs(1),
+                false,
+                Duration::from_secs(5),
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(
+            deferred.failures, 1,
+            "lease checks are not download attempts"
+        );
+        assert_eq!(deferred.expires_at, first.expires_at);
+        let second = history
+            .record(
+                "h",
+                now + Duration::from_secs(6),
+                true,
+                Duration::ZERO,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(second.next_due, now + Duration::from_secs(8));
+        let third = history
+            .record(
+                "h",
+                now + Duration::from_secs(8),
+                true,
+                Duration::ZERO,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(third.next_due, now + Duration::from_secs(11));
+        assert_eq!(third.failures, policy.retry_max_attempts);
+        assert!(
+            history
+                .record("other", now, true, Duration::ZERO, &policy)
+                .is_none()
+        );
+        history.expire(now + Duration::from_secs(20));
+        assert!(history.entries.is_empty());
+        assert!(history.expiry.is_empty());
+    }
+
+    #[test]
+    fn deferred_candidates_are_preserved_without_sliding_due_time_or_unbounded_indexes() {
+        let now = Instant::now();
+        let mut queue = PendingHashQueue::new(8, HASH_QUEUE_TTL);
+        queue.push(event("h", 1000, now), now);
+        let entry = queue.remove("h").unwrap();
+        let record = RetryRecord {
+            failures: 1,
+            extra_attempts: 0,
+            next_due: now + Duration::from_secs(2),
+            expires_at: now + Duration::from_secs(10),
+        };
+        assert!(queue.defer(entry, record));
+        for _ in 0..1_000 {
+            queue.push(
+                event("h", 1001, now + Duration::from_secs(1)),
+                now + Duration::from_secs(1),
+            );
+        }
+        assert_eq!(queue.waiting.len(), 1);
+        assert_eq!(queue.expiry.len(), 1);
+        assert_eq!(queue.retry_expiry.len(), 1);
+        assert_eq!(
+            queue.pressure_len(),
+            0,
+            "cooling work must not slow discovery"
+        );
+        assert!(
+            queue
+                .pop_newest_ready(now + Duration::from_secs(1), &HashMap::new())
+                .is_none()
+        );
+        let retained = queue
+            .pop_newest_ready(record.next_due, &HashMap::new())
+            .unwrap();
+        assert_eq!(retained.peers.len(), 2);
+        assert_eq!(retained.peers[0].addr.port(), 1001);
+        assert_eq!(retained.expires_at, record.expires_at);
+        assert!(
+            queue.expiry.is_empty() && queue.waiting.is_empty() && queue.retry_expiry.is_empty()
+        );
+    }
+
+    #[test]
+    fn fresh_and_due_retry_work_have_bounded_fairness_and_cold_retries_reserve_no_pressure() {
+        let now = Instant::now();
+        let mut queue = PendingHashQueue::new(12, HASH_QUEUE_TTL);
+        queue.push(event("retry", 1000, now), now);
+        let retry = queue.remove("retry").unwrap();
+        assert!(queue.defer(
+            retry,
+            RetryRecord {
+                failures: 1,
+                extra_attempts: 0,
+                next_due: now + Duration::from_secs(1),
+                expires_at: now + Duration::from_secs(10)
+            }
+        ));
+        for offset in 0..6 {
+            queue.push(event(&format!("fresh-{offset}"), 1100 + offset, now), now);
+        }
+        let kinds: Vec<_> = (0..4)
+            .map(|_| {
+                queue
+                    .pop_newest_ready(now + Duration::from_secs(1), &HashMap::new())
+                    .unwrap()
+                    .is_retry
+            })
+            .collect();
+        assert_eq!(kinds, [false, false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn hash_only_job_uses_source_for_lookup_without_connecting_to_its_udp_address() {
+        let source = NodeTuple {
+            id: [8; 20],
+            addr: SocketAddr::from(([127, 0, 0, 1], 9999)),
+        };
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let actor = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            let request: PeerLookupRequest = request;
+            assert_eq!(request.source_nodes[0].addr, source.addr);
+            // An empty lookup must never turn its seed endpoint into a TCP candidate.
+        });
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        drop(peer_tx);
+        let stats = DhtRuntimeStats::default();
+        let result = MetadataScheduler::process_hash(
+            MetadataJob {
+                info_hash: hex::encode([3; 20]),
+                peers: Vec::new(),
+                peer_rx,
+                source_nodes: vec![source],
+                source: HashSource::GetPeers,
+            },
+            &Arc::new(RbitFetcher::new(1)),
+            &empty_torrent_callback(),
+            &fetch_gate(|_| async { true }),
+            &stats,
+            Some(request_tx),
+            Duration::from_secs(1),
+        )
+        .await;
+        actor.await.unwrap();
+        assert_eq!(result.attempts, 0);
+        assert_eq!(stats.snapshot().metadata_peer_attempts, 0);
+        assert_eq!(
+            stats.yield_stats().snapshot()["metadata_hash_only_started"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn one_new_peer_during_failure_cooldown_is_fetched_without_another_announce() {
+        use bytes::Bytes;
+        use rbit::{ExtensionHandshake, Message, MetadataMessage, PeerConnection};
+        use sha1::{Digest, Sha1};
+        use tokio::net::TcpListener;
+        let metadata = Bytes::from_static(b"d6:lengthi1e4:name1:xe");
+        let hash: [u8; 20] = Sha1::digest(&metadata).into();
+        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_addr = failed_listener.local_addr().unwrap();
+        let good_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_listener.local_addr().unwrap();
+        drop(failed_listener);
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let seen_admissions = admissions.clone();
+        let gate: Arc<ArcSwapOption<MetadataFetchCallback>> = Arc::new(ArcSwapOption::empty());
+        gate.store(Some(Arc::new(Box::new(move |_| {
+            let number = seen_admissions.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if number == 1 {
+                    MetadataAdmission::RetryAfter(Duration::from_millis(200))
+                } else {
+                    MetadataAdmission::Fetch
+                }
+            })
+        }))));
+        let check_admissions = admissions.clone();
+        let peer_actor = tokio::spawn(async move {
+            let (stream, _) = good_listener.accept().await.unwrap();
+            assert!(
+                check_admissions.load(Ordering::Relaxed) >= 3,
+                "new peers must still pass admission after cooldown"
+            );
+            let mut conn = PeerConnection::accept(stream, hash, [9; 20]).await.unwrap();
+            assert!(matches!(
+                conn.receive().await.unwrap(),
+                Message::Extended { id: 0, .. }
+            ));
+            let mut handshake = ExtensionHandshake::with_extensions(&[("ut_metadata", 3)]);
+            handshake.metadata_size = Some(metadata.len() as i64);
+            conn.send(Message::Extended {
+                id: 0,
+                payload: handshake.encode().unwrap(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                conn.receive().await.unwrap(),
+                Message::Extended { id: 3, .. }
+            ));
+            conn.send(Message::Extended {
+                id: 1,
+                payload: MetadataMessage::data(0, metadata.len() as u32, metadata)
+                    .encode()
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+        });
+        let torrent: Arc<ArcSwapOption<TorrentAckCallback>> = Arc::new(ArcSwapOption::empty());
+        torrent.store(Some(Arc::new(Box::new(|_| true))));
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let (hash_tx, hash_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let stats = DhtRuntimeStats::default();
+        let scheduler = MetadataScheduler::new_with_runtime(
+            hash_rx,
+            Arc::new(RbitFetcher::new(1)),
+            MetadataSchedulerLimits {
+                queue_size: 32,
+                concurrency: 1,
+            },
+            MetadataSchedulerCallbacks {
+                torrent,
+                fetch_gate: gate,
+                completion: completion_callback(move |result| {
+                    let _ = completion_tx.send(result);
+                }),
+            },
+            Arc::new(AtomicUsize::new(0)),
+            shutdown.clone(),
+            MetadataSchedulerRuntime {
+                stats: stats.clone(),
+                peer_lookup_tx: None,
+                lookup_timeout: Duration::from_secs(1),
+                metadata_options: MetadataOptions {
+                    retry_initial_delay_secs: 0,
+                    retry_max_delay_secs: 0,
+                    ..MetadataOptions::default()
+                },
+            },
+        );
+        let task = tokio::spawn(scheduler.run());
+        hash_tx
+            .send(HashDiscovered {
+                info_hash: hex::encode(hash),
+                peer_addr: Some(failed_addr),
+                source_node: None,
+                source: HashSource::Announce,
+                discovered_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, MetadataFetchCompletionStatus::FetchFailed);
+        hash_tx
+            .send(HashDiscovered {
+                info_hash: hex::encode(hash),
+                peer_addr: Some(good_addr),
+                source_node: None,
+                source: HashSource::Announce,
+                discovered_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status, MetadataFetchCompletionStatus::Accepted);
+        assert_eq!(admissions.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            first.attempts + second.attempts,
+            2,
+            "the cached failed endpoint must not cause another TCP attempt"
+        );
+        assert_eq!(stats.yield_stats().snapshot()["metadata_retry_deferred"], 1);
+        shutdown.cancel();
+        task.await.unwrap();
+        peer_actor.await.unwrap();
+    }
+
+    #[test]
+    fn exhausted_history_allows_only_two_new_candidate_chances_and_never_old_duplicates() {
+        let now = Instant::now();
+        let policy = MetadataOptions {
+            retry_max_attempts: 1,
+            ..MetadataOptions::default()
+        };
+        let mut history = RetryHistory::default();
+        history
+            .record("h", now, true, Duration::ZERO, &policy)
+            .unwrap();
+        let mut queue = PendingHashQueue::new(8, HASH_QUEUE_TTL);
+        queue.push(event("h", 1000, now), now);
+        history.remember(&queue.remove("h").unwrap());
+        for _ in 0..100 {
+            let record = history
+                .observe_event(&event("h", 1000, now), now, &policy)
+                .unwrap();
+            assert_eq!(record.extra_attempts, 0);
+            assert_eq!(record.failures, record.attempt_limit(&policy));
+        }
+        for (offset, expected_extra) in [(1, 1), (2, 2), (3, 2)] {
+            let record = history
+                .observe_event(&event("h", 1000 + offset, now), now, &policy)
+                .unwrap();
+            assert_eq!(record.extra_attempts, expected_extra);
+            if offset <= 2 {
+                assert!(record.failures < record.attempt_limit(&policy));
+                history
+                    .record("h", now, true, Duration::ZERO, &policy)
+                    .unwrap();
+            } else {
+                assert_eq!(record.failures, record.attempt_limit(&policy));
+            }
+        }
+    }
+
+    #[test]
+    fn retry_extreme_durations_are_clamped_without_panics() {
+        let now = Instant::now();
+        let policy = MetadataOptions {
+            retry_initial_delay_secs: u64::MAX,
+            retry_max_delay_secs: u64::MAX,
+            retry_history_ttl_secs: u64::MAX,
+            ..MetadataOptions::default()
+        };
+        let mut history = RetryHistory::default();
+        let record = history
+            .record("h", now, true, Duration::ZERO, &policy)
+            .unwrap();
+        assert_eq!(record.next_due.duration_since(now), MAX_RETRY_LIFETIME);
+        assert_eq!(record.expires_at.duration_since(now), MAX_RETRY_LIFETIME);
+        let deferred = history
+            .record("h", now, false, Duration::MAX, &policy)
+            .unwrap();
+        assert_eq!(deferred.next_due.duration_since(now), MAX_RETRY_LIFETIME);
+    }
+
+    #[tokio::test]
+    async fn panicking_admission_releases_running_entry_and_disabled_retry_keeps_new_announces_eligible()
+     {
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let called = admissions.clone();
+        let gate = fetch_gate(move |_| {
+            let call = called.fetch_add(1, Ordering::Relaxed);
+            async move {
+                assert_ne!(call, 0, "test admission panic");
+                false
+            }
+        });
+        let (hash_tx, hash_rx) = mpsc::channel(8);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let stats = DhtRuntimeStats::default();
+        let scheduler = MetadataScheduler::new_with_runtime(
+            hash_rx,
+            Arc::new(RbitFetcher::new(1)),
+            MetadataSchedulerLimits {
+                queue_size: 8,
+                concurrency: 1,
+            },
+            MetadataSchedulerCallbacks {
+                torrent: empty_torrent_callback(),
+                fetch_gate: gate,
+                completion: completion_callback(move |result| {
+                    let _ = completion_tx.send(result);
+                }),
+            },
+            Arc::new(AtomicUsize::new(0)),
+            shutdown.clone(),
+            MetadataSchedulerRuntime {
+                stats: stats.clone(),
+                peer_lookup_tx: None,
+                lookup_timeout: Duration::from_secs(1),
+                metadata_options: MetadataOptions {
+                    retry_max_attempts: 0,
+                    ..MetadataOptions::default()
+                },
+            },
+        );
+        let task = tokio::spawn(scheduler.run());
+        hash_tx
+            .send(event("h", 1000, Instant::now()))
+            .await
+            .unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completion.status,
+            MetadataFetchCompletionStatus::FetchFailed
+        );
+        hash_tx
+            .send(event("h", 1001, Instant::now()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admissions.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.yield_stats().snapshot()["metadata_retry_scheduled"],
+            0
+        );
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(stats.snapshot().metadata_in_flight, 0);
     }
 }

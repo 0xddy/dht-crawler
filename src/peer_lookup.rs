@@ -20,15 +20,20 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const LOOKUP_TID_TAG: u8 = 0xa5;
-const MAX_QUERIES_PER_LOOKUP: usize = 12;
-const MAX_CONCURRENT_QUERIES_PER_LOOKUP: usize = 4;
 const MAX_FRONTIER_NODES: usize = 64;
 const MAX_PEERS_PER_LOOKUP: usize = MAX_METADATA_CANDIDATES_PER_HASH;
-pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_CHANNEL_CAPACITY: usize = 1_024;
 const RESPONSE_CHANNEL_CAPACITY: usize = 4_096;
+
+fn lookup_duration(millis: u64) -> Duration {
+    Duration::from_millis(millis.clamp(1, 300_000))
+}
+
+fn lookup_deadline(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration.min(Duration::from_secs(300)))
+        .unwrap_or(now)
+}
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct PendingKey {
@@ -46,30 +51,48 @@ struct LookupState {
     info_hash: [u8; 20],
     peer_tx: mpsc::Sender<SocketAddr>,
     frontier: Vec<NodeTuple>,
+    source_nodes: VecDeque<NodeTuple>,
     seen_nodes: AHashSet<SocketAddr>,
     peers: AHashSet<SocketAddr>,
     queried: usize,
     outstanding: usize,
     deadline: Instant,
+    max_queries: usize,
 }
 
 impl LookupState {
-    fn pop_closest(&mut self) -> Option<NodeTuple> {
+    fn pop_closest(&mut self) -> Option<(NodeTuple, bool)> {
+        if let Some(node) = self.source_nodes.pop_front() {
+            return Some((node, true));
+        }
         let index = self
             .frontier
             .iter()
             .enumerate()
             .min_by(|(_, left), (_, right)| xor_distance_cmp(&left.id, &right.id, &self.info_hash))
             .map(|(index, _)| index)?;
-        Some(self.frontier.swap_remove(index))
+        Some((self.frontier.swap_remove(index), false))
     }
 
     fn is_complete(&self, now: Instant) -> bool {
-        self.peer_tx.is_closed()
-            || self.deadline <= now
-            || self.peers.len() >= MAX_PEERS_PER_LOOKUP
-            || (self.outstanding == 0
-                && (self.queried >= MAX_QUERIES_PER_LOOKUP || self.frontier.is_empty()))
+        self.finish_reason(now).is_some()
+    }
+
+    fn finish_reason(&self, now: Instant) -> Option<&'static str> {
+        if self.peer_tx.is_closed() {
+            Some("lookup_finished_canceled")
+        } else if self.deadline <= now {
+            Some("lookup_finished_deadline")
+        } else if self.peers.len() >= MAX_PEERS_PER_LOOKUP {
+            Some("lookup_finished_peers")
+        } else if self.outstanding == 0 && self.queried >= self.max_queries {
+            Some("lookup_finished_budget")
+        } else if self.outstanding == 0 && self.frontier.is_empty() && self.source_nodes.is_empty()
+        {
+            Some("lookup_finished_exhausted")
+        } else {
+            None
+        }
     }
 }
 
@@ -92,6 +115,8 @@ pub(crate) struct PeerLookupHandle {
 pub(crate) struct PeerLookupRequest {
     pub(crate) info_hash: [u8; 20],
     pub(crate) peer_tx: mpsc::Sender<SocketAddr>,
+    /// DHT nodes that supplied the hash. These are lookup seeds, never TCP peers.
+    pub(crate) source_nodes: Vec<NodeTuple>,
 }
 
 pub(crate) struct PeerLookupRuntime {
@@ -167,6 +192,10 @@ pub(crate) fn spawn_peer_lookup(
             Instant::now(),
         ),
         max_active_lookups: options.max_active_lookups,
+        max_queries: options.max_queries,
+        max_concurrent_queries: options.max_concurrent_queries.max(1),
+        lookup_timeout: lookup_duration(options.lookup_timeout_ms),
+        query_timeout: lookup_duration(options.query_timeout_ms),
         active: AHashMap::new(),
         pending: AHashMap::new(),
         pending_expiry: VecDeque::new(),
@@ -193,6 +222,10 @@ struct PeerLookupActor {
     response_rx: mpsc::Receiver<LookupResponse>,
     request_budget: RateBucket,
     max_active_lookups: usize,
+    max_queries: usize,
+    max_concurrent_queries: usize,
+    lookup_timeout: Duration,
+    query_timeout: Duration,
     active: AHashMap<u64, LookupState>,
     pending: AHashMap<PendingKey, PendingQuery>,
     pending_expiry: VecDeque<(Instant, PendingKey)>,
@@ -224,7 +257,11 @@ impl PeerLookupActor {
     }
 
     async fn start_lookup(&mut self, request: PeerLookupRequest, now: Instant) {
-        let PeerLookupRequest { info_hash, peer_tx } = request;
+        let PeerLookupRequest {
+            info_hash,
+            peer_tx,
+            source_nodes,
+        } = request;
         if peer_tx.is_closed() {
             return;
         }
@@ -243,29 +280,47 @@ impl PeerLookupActor {
             (false, true) => Some(true),
             _ => None,
         };
-        let frontier =
-            self.snapshot
-                .load()
-                .closest_nodes(&info_hash, MAX_QUERIES_PER_LOOKUP, filter_ipv6);
-        if frontier.is_empty() {
+        let mut frontier = self.snapshot.load().closest_nodes(
+            &info_hash,
+            self.max_queries.min(MAX_FRONTIER_NODES),
+            filter_ipv6,
+        );
+        let mut seen_sources = AHashSet::new();
+        let source_nodes: VecDeque<_> = source_nodes
+            .into_iter()
+            .filter(|node| filter_ipv6.is_none_or(|ipv6| node.addr.is_ipv6() == ipv6))
+            .filter(|node| seen_sources.insert(node.addr))
+            .take(8)
+            .collect();
+        frontier.retain(|node| !seen_sources.contains(&node.addr));
+        if frontier.is_empty() && source_nodes.is_empty() {
             self.runtime_stats.peer_lookup_empty();
+            self.runtime_stats
+                .yield_stats()
+                .inc("lookup_finished_exhausted");
             return;
         }
 
         let lookup_id = self.next_lookup_id;
         self.next_lookup_id = self.next_lookup_id.wrapping_add(1).max(1);
-        let seen_nodes = frontier.iter().map(|node| node.addr).collect();
+        let seen_nodes = frontier
+            .iter()
+            .chain(source_nodes.iter())
+            .map(|node| node.addr)
+            .collect();
         self.active.insert(
             lookup_id,
             LookupState {
                 info_hash,
                 peer_tx,
                 frontier,
+                source_nodes,
                 seen_nodes,
                 peers: AHashSet::new(),
                 queried: 0,
                 outstanding: 0,
-                deadline: now + LOOKUP_TIMEOUT,
+                deadline: lookup_deadline(now, self.lookup_timeout),
+                max_queries: self.max_queries,
             },
         );
         self.runtime_stats.peer_lookup_started();
@@ -274,21 +329,24 @@ impl PeerLookupActor {
         self.dispatch_more(lookup_id, now).await;
     }
 
-    async fn dispatch_more(&mut self, lookup_id: u64, now: Instant) {
+    async fn dispatch_more(&mut self, lookup_id: u64, _now: Instant) {
         loop {
-            let Some((node, info_hash)) = self.active.get_mut(&lookup_id).and_then(|state| {
-                if state.peer_tx.is_closed()
-                    || state.deadline <= now
-                    || state.peers.len() >= MAX_PEERS_PER_LOOKUP
-                    || state.queried >= MAX_QUERIES_PER_LOOKUP
-                    || state.outstanding >= MAX_CONCURRENT_QUERIES_PER_LOOKUP
-                {
-                    return None;
-                }
-                let node = state.pop_closest()?;
-                state.queried += 1;
-                Some((node, state.info_hash))
-            }) else {
+            let now = Instant::now();
+            let Some((node, source_seed, info_hash)) =
+                self.active.get_mut(&lookup_id).and_then(|state| {
+                    if state.peer_tx.is_closed()
+                        || state.deadline <= now
+                        || state.peers.len() >= MAX_PEERS_PER_LOOKUP
+                        || state.queried >= self.max_queries
+                        || state.outstanding >= self.max_concurrent_queries
+                    {
+                        return None;
+                    }
+                    let (node, source_seed) = state.pop_closest()?;
+                    state.queried += 1;
+                    Some((node, source_seed, state.info_hash))
+                })
+            else {
                 break;
             };
 
@@ -304,8 +362,14 @@ impl PeerLookupActor {
             } else {
                 self.socket_v6.clone()
             };
+            let operation_deadline = self.active[&lookup_id].deadline;
             let sent = match socket {
-                Some(socket) => socket.send_to(&buffer, node.addr).await.is_ok(),
+                Some(socket) => tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(operation_deadline),
+                    socket.send_to(&buffer, node.addr),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok()),
                 None => false,
             };
             if !sent {
@@ -313,7 +377,13 @@ impl PeerLookupActor {
                 continue;
             }
 
-            let deadline = now + QUERY_TIMEOUT;
+            if source_seed {
+                self.runtime_stats
+                    .yield_stats()
+                    .inc("lookup_source_seed_queries");
+            }
+            let deadline =
+                lookup_deadline(Instant::now(), self.query_timeout).min(operation_deadline);
             self.pending.insert(
                 key,
                 PendingQuery {
@@ -330,7 +400,7 @@ impl PeerLookupActor {
             #[cfg(feature = "metrics")]
             counter!("dht_peer_lookup_queries_total").increment(1);
         }
-        self.finish_if_complete(lookup_id, now);
+        self.finish_if_complete(lookup_id, Instant::now());
     }
 
     async fn handle_response(&mut self, event: LookupResponse, now: Instant) {
@@ -341,6 +411,14 @@ impl PeerLookupActor {
         let Some(pending) = self.pending.remove(&key) else {
             return;
         };
+        if self
+            .active
+            .get(&pending.lookup_id)
+            .is_some_and(|state| state.deadline <= now)
+        {
+            self.finish_lookup(pending.lookup_id, now);
+            return;
+        }
         let Some(state) = self.active.get_mut(&pending.lookup_id) else {
             return;
         };
@@ -414,7 +492,7 @@ impl PeerLookupActor {
             .filter_map(|(lookup_id, state)| state.is_complete(now).then_some(*lookup_id))
             .collect();
         for lookup_id in expired {
-            self.finish_lookup(lookup_id);
+            self.finish_lookup(lookup_id, now);
         }
     }
 
@@ -424,12 +502,16 @@ impl PeerLookupActor {
             .get(&lookup_id)
             .is_some_and(|state| state.is_complete(now))
         {
-            self.finish_lookup(lookup_id);
+            self.finish_lookup(lookup_id, now);
         }
     }
 
-    fn finish_lookup(&mut self, lookup_id: u64) {
-        self.active.remove(&lookup_id);
+    fn finish_lookup(&mut self, lookup_id: u64, now: Instant) {
+        if let Some(state) = self.active.remove(&lookup_id)
+            && let Some(reason) = state.finish_reason(now)
+        {
+            self.runtime_stats.yield_stats().inc(reason);
+        }
         self.pending
             .retain(|_, pending| pending.lookup_id != lookup_id);
     }
@@ -482,6 +564,7 @@ mod tests {
                 .send(PeerLookupRequest {
                     info_hash: [3; 20],
                     peer_tx,
+                    source_nodes: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -533,6 +616,7 @@ mod tests {
             .send(PeerLookupRequest {
                 info_hash: [3; 20],
                 peer_tx,
+                source_nodes: Vec::new(),
             })
             .await
             .unwrap();
@@ -562,6 +646,7 @@ mod tests {
                         })
                         .collect(),
                 ),
+                ..DhtResponse::default()
             },
         );
 
@@ -585,6 +670,165 @@ mod tests {
         assert_eq!(
             snapshot.peer_lookup_peers_found,
             MAX_PEERS_PER_LOOKUP as u64
+        );
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn lookup_extreme_timeouts_are_bounded_without_panics() {
+        let now = Instant::now();
+        assert_eq!(lookup_duration(0), Duration::from_millis(1));
+        assert_eq!(lookup_duration(u64::MAX), Duration::from_secs(300));
+        assert_eq!(
+            lookup_deadline(now, Duration::MAX).duration_since(now),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_seed_is_sent_before_a_closer_snapshot_node_and_budget_is_exact() {
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source_node = NodeTuple {
+            id: [255; 20],
+            addr: source.local_addr().unwrap(),
+        };
+        let fallback_node = NodeTuple {
+            id: [3; 20],
+            addr: fallback.local_addr().unwrap(),
+        };
+        let sockets = std::collections::HashMap::from([(local.local_addr().unwrap(), local)]);
+        let stats = DhtRuntimeStats::default();
+        let shutdown = CancellationToken::new();
+        let handle = spawn_peer_lookup(
+            NetMode::Ipv4Only,
+            [7; 20],
+            &sockets,
+            Arc::new(ArcSwap::from_pointee(RoutingSnapshot::from_nodes(
+                vec![fallback_node],
+                1,
+            ))),
+            PeerLookupRuntime {
+                options: PeerLookupOptions {
+                    max_queries: 2,
+                    max_concurrent_queries: 1,
+                    ..PeerLookupOptions::default()
+                },
+                stats: stats.clone(),
+                shutdown: shutdown.clone(),
+            },
+        );
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
+        handle
+            .request_tx
+            .send(PeerLookupRequest {
+                info_hash: [3; 20],
+                peer_tx,
+                source_nodes: vec![source_node],
+            })
+            .await
+            .unwrap();
+        let mut buffer = [0; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), source.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fallback.try_recv_from(&mut [0; 512]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let message: DhtMessage = serde_bencode::from_bytes(&buffer[..len]).unwrap();
+        handle.route_response(
+            source_node.addr,
+            message.t.as_ref().try_into().unwrap(),
+            DhtResponse::default(),
+        );
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), fallback.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        let message: DhtMessage = serde_bencode::from_bytes(&buffer[..len]).unwrap();
+        handle.route_response(
+            fallback.local_addr().unwrap(),
+            message.t.as_ref().try_into().unwrap(),
+            DhtResponse::default(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), peer_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stats.snapshot().peer_lookup_queries, 2);
+        assert_eq!(
+            stats.yield_stats().snapshot()["lookup_source_seed_queries"],
+            1
+        );
+        assert_eq!(stats.yield_stats().snapshot()["lookup_finished_budget"], 1);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lookup_deadline_does_not_dispatch_more_queries_after_a_slow_seed() {
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source_node = NodeTuple {
+            id: [255; 20],
+            addr: source.local_addr().unwrap(),
+        };
+        let sockets = std::collections::HashMap::from([(local.local_addr().unwrap(), local)]);
+        let stats = DhtRuntimeStats::default();
+        let shutdown = CancellationToken::new();
+        let handle = spawn_peer_lookup(
+            NetMode::Ipv4Only,
+            [7; 20],
+            &sockets,
+            Arc::new(ArcSwap::from_pointee(RoutingSnapshot::from_nodes(
+                vec![NodeTuple {
+                    id: [3; 20],
+                    addr: fallback.local_addr().unwrap(),
+                }],
+                1,
+            ))),
+            PeerLookupRuntime {
+                options: PeerLookupOptions {
+                    max_queries: 12,
+                    max_concurrent_queries: 1,
+                    lookup_timeout_ms: 30,
+                    query_timeout_ms: 500,
+                    ..PeerLookupOptions::default()
+                },
+                stats: stats.clone(),
+                shutdown: shutdown.clone(),
+            },
+        );
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
+        handle
+            .request_tx
+            .send(PeerLookupRequest {
+                info_hash: [3; 20],
+                peer_tx,
+                source_nodes: vec![source_node],
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), peer_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stats.snapshot().peer_lookup_queries, 1);
+        assert_eq!(
+            stats.yield_stats().snapshot()["lookup_finished_deadline"],
+            1
+        );
+        assert_eq!(
+            fallback.try_recv_from(&mut [0; 512]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
         shutdown.cancel();
     }
