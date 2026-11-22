@@ -10,7 +10,7 @@ use crate::routing_snapshot::RoutingSnapshot;
 use crate::runtime_stats::DhtRuntimeLimits;
 use crate::runtime_stats::DhtRuntimeStats;
 use crate::types::{NetMode, NodeTuple};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
 #[cfg(feature = "metrics")]
@@ -18,7 +18,7 @@ use metrics::{counter, gauge};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -27,6 +27,14 @@ use tokio_util::sync::CancellationToken;
 
 const SCHEDULE_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_POOL_SCAN_PER_SCHEDULE: usize = 256;
+const MAX_REVISIT_SCAN_PER_SCHEDULE: usize = 64;
+
+struct ResetFlagGuard(Arc<AtomicBool>);
+impl Drop for ResetFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 fn recent_probe_capacity(config: &ResolvedCrawlConfig) -> usize {
     let ttl = config.recent_probe_ttl.as_secs() as u128;
@@ -321,6 +329,7 @@ struct CrawlActor {
     responsive: ResponsiveReservoir,
     pending: AHashMap<PendingKey, PendingRequest>,
     pending_expiry: VecDeque<(Instant, PendingKey)>,
+    in_flight_addrs: AHashSet<SocketAddr>,
     subnet_in_flight: AHashMap<SubnetKey, usize>,
     query_budget: RateBucket,
     destination_budget: RateBucket,
@@ -328,6 +337,7 @@ struct CrawlActor {
     bootstrap_pool: BootstrapSourcePool,
     bootstrap_queue: VecDeque<SocketAddr>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
+    snapshot_building: Arc<AtomicBool>,
     node_count: Arc<AtomicUsize>,
     metadata_queue_len: Arc<AtomicUsize>,
     max_metadata_queue_size: usize,
@@ -373,6 +383,7 @@ impl CrawlActor {
             ),
             pending: AHashMap::with_capacity(config.max_in_flight),
             pending_expiry: VecDeque::with_capacity(config.max_in_flight),
+            in_flight_addrs: AHashSet::with_capacity(config.max_in_flight),
             subnet_in_flight: AHashMap::new(),
             query_budget: RateBucket::per_second(
                 config.max_find_node_rate_per_sec,
@@ -402,6 +413,7 @@ impl CrawlActor {
             bootstrap_gate: BootstrapGate::new(),
             bootstrap_queue: VecDeque::new(),
             snapshot,
+            snapshot_building: Arc::new(AtomicBool::new(false)),
             node_count,
             metadata_queue_len,
             max_metadata_queue_size,
@@ -432,14 +444,14 @@ impl CrawlActor {
                         .set_crawl_priority_queue_depth(self.priority_rx.len());
                     let Some(event) = event else { break };
                     self.handle_priority(event, Instant::now());
-                    self.drain_events();
+                    self.drain_events(false);
                 }
                 node = self.discovery_rx.recv() => {
                     self.runtime_stats
                         .set_crawl_discovery_queue_depth(self.discovery_rx.len());
                     let Some(node) = node else { break };
                     self.admit(node, Instant::now());
-                    self.drain_events();
+                    self.drain_events(true);
                 }
             }
         }
@@ -447,33 +459,41 @@ impl CrawlActor {
         self.runtime_stats.set_crawl_discovery_queue_depth(0);
     }
 
-    fn drain_events(&mut self) {
-        let mut events = 1;
-        let mut nodes = 0;
-        while events < self.config.event_batch_limit && nodes < self.config.node_batch_limit {
-            if events % 8 == 0
+    fn drain_events(&mut self, initial_is_node: bool) {
+        let mut priority_events = usize::from(!initial_is_node);
+        let mut nodes = usize::from(initial_is_node);
+        let mut step = 0usize;
+        while priority_events < self.config.event_batch_limit || nodes < self.config.node_batch_limit
+        {
+            if step.is_multiple_of(8)
+                && nodes < self.config.node_batch_limit
                 && let Ok(node) = self.discovery_rx.try_recv()
             {
                 self.runtime_stats
                     .set_crawl_discovery_queue_depth(self.discovery_rx.len());
                 self.admit(node, Instant::now());
-                events += 1;
                 nodes += 1;
+                step += 1;
                 continue;
             }
-            if let Ok(event) = self.priority_rx.try_recv() {
+            if priority_events < self.config.event_batch_limit
+                && let Ok(event) = self.priority_rx.try_recv()
+            {
                 self.runtime_stats
                     .set_crawl_priority_queue_depth(self.priority_rx.len());
                 self.handle_priority(event, Instant::now());
-                events += 1;
+                priority_events += 1;
+                step += 1;
                 continue;
             }
-            if let Ok(node) = self.discovery_rx.try_recv() {
+            if nodes < self.config.node_batch_limit
+                && let Ok(node) = self.discovery_rx.try_recv()
+            {
                 self.runtime_stats
                     .set_crawl_discovery_queue_depth(self.discovery_rx.len());
                 self.admit(node, Instant::now());
-                events += 1;
                 nodes += 1;
+                step += 1;
                 continue;
             }
             break;
@@ -618,7 +638,8 @@ impl CrawlActor {
                 break;
             };
             let subnet = SubnetKey::from_addr(&node.addr);
-            if self.subnet_count(&subnet) >= self.config.max_in_flight_per_subnet
+            if self.in_flight_addrs.contains(&node.addr)
+                || self.subnet_count(&subnet) >= self.config.max_in_flight_per_subnet
                 || self.responsive.is_backing_off(&node.addr, now)
             {
                 self.pool.rotate_front_to_back();
@@ -644,31 +665,42 @@ impl CrawlActor {
     }
 
     fn schedule_revisit(&mut self, now: Instant) -> bool {
-        let Some(node) = self.responsive.next_revisit(now) else {
+        if self.pending.len() >= self.config.max_in_flight {
             return false;
-        };
-        let was_recent = self.pool.contains_recent(&node.addr, now);
-        if !was_recent && !self.destination_budget.try_take_one(now) {
+        }
+        for _ in 0..MAX_REVISIT_SCAN_PER_SCHEDULE {
+            let Some(node) = self.responsive.next_revisit(now) else {
+                return false;
+            };
+            if self.in_flight_addrs.contains(&node.addr) {
+                self.responsive
+                    .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
+                continue;
+            }
+            let was_recent = self.pool.contains_recent(&node.addr, now);
+            if !was_recent && !self.destination_budget.try_take_one(now) {
+                self.responsive
+                    .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
+                continue;
+            }
+            if self.try_dispatch(node, ProbePurpose::Revisit, now) {
+                self.pool.record_probe(node.addr, now);
+                self.metrics.queries_revisit += 1;
+                self.runtime_stats.query_revisit();
+                return true;
+            }
+            if !was_recent {
+                self.destination_budget.refund_one();
+            }
             self.responsive
                 .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
-            return false;
         }
-        if self.try_dispatch(node, ProbePurpose::Revisit, now) {
-            self.pool.record_probe(node.addr, now);
-            self.metrics.queries_revisit += 1;
-            self.runtime_stats.query_revisit();
-            return true;
-        }
-        if !was_recent {
-            self.destination_budget.refund_one();
-        }
-        self.responsive
-            .defer_revisit(node.addr, now + SCHEDULE_INTERVAL, now);
         false
     }
 
     fn try_dispatch(&mut self, node: NodeTuple, purpose: ProbePurpose, now: Instant) -> bool {
         if self.pending.len() >= self.config.max_in_flight
+            || self.in_flight_addrs.contains(&node.addr)
             || self.responsive.is_backing_off(&node.addr, now)
         {
             return false;
@@ -707,6 +739,7 @@ impl CrawlActor {
             },
         );
         self.pending_expiry.push_back((deadline, key));
+        self.in_flight_addrs.insert(node.addr);
         *self.subnet_in_flight.entry(subnet).or_insert(0) += 1;
         self.runtime_stats
             .set_find_node_in_flight(self.pending.len());
@@ -778,6 +811,7 @@ impl CrawlActor {
     }
 
     fn release_pending(&mut self, pending: PendingRequest) {
+        self.in_flight_addrs.remove(&pending.node.addr);
         if let Some(count) = self.subnet_in_flight.get_mut(&pending.subnet) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -816,13 +850,28 @@ impl CrawlActor {
     }
 
     fn publish_snapshot(&mut self, now: Instant) {
-        let nodes = self
-            .responsive
-            .snapshot(self.config.routing_snapshot_size, now);
-        self.snapshot.store(Arc::new(RoutingSnapshot::from_nodes(
-            nodes,
-            self.config.routing_snapshot_size,
-        )));
+        if self
+            .snapshot_building
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let guard = ResetFlagGuard(self.snapshot_building.clone());
+        let limit = self.config.routing_snapshot_size;
+        let nodes = self.responsive.snapshot(limit, now);
+        let snapshot_target = self.snapshot.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _guard = guard;
+                let built = RoutingSnapshot::from_nodes(nodes, limit);
+                snapshot_target.store(Arc::new(built));
+            });
+        } else {
+            let built = RoutingSnapshot::from_nodes(nodes, limit);
+            snapshot_target.store(Arc::new(built));
+            drop(guard);
+        }
     }
 
     fn metadata_pressure(&self) -> f64 {
@@ -1226,5 +1275,43 @@ mod tests {
         assert_eq!(snapshot.crawl_discovery_queue_capacity, 1);
         assert_eq!(snapshot.crawl_priority_queue_depth, 1);
         assert_eq!(snapshot.crawl_priority_queue_capacity, 1);
+    }
+
+    #[test]
+    fn schedule_revisit_skips_stale_node_when_destination_budget_empty_and_dispatches_recent_node() {
+        let mut options = CrawlOptions::default();
+        options.rate_limit.max_new_destinations_per_minute = 0;
+        options.pool.recent_probe_ttl_secs = 10;
+        options.pool.revisit_interval_secs = 0;
+        let (mut actor, mut egress_rx, _) = test_actor(ResolvedCrawlConfig::from_options(&options));
+        let start = Instant::now();
+        let stale = node(1, "8.8.8.8:1");
+        let recent = node(2, "1.1.1.1:2");
+
+        actor.responsive.record(stale, start, start);
+        actor.responsive.record(recent, start, start);
+        let now = start + Duration::from_secs(11);
+        actor.pool.record_probe(recent.addr, now);
+
+        assert!(actor.schedule_revisit(now));
+        let dispatched = egress_rx.try_recv().unwrap();
+        assert_eq!(dispatched.node, recent);
+    }
+
+    #[test]
+    fn try_dispatch_prevents_concurrent_duplicate_probes_to_same_endpoint() {
+        let mut options = CrawlOptions::default();
+        options.pool.low_watermark = 0;
+        let (mut actor, mut egress_rx, _) = test_actor(ResolvedCrawlConfig::from_options(&options));
+        let now = Instant::now();
+        let target = node(1, "8.8.8.8:6881");
+
+        assert!(actor.try_dispatch(target, ProbePurpose::New, now));
+        assert!(!actor.try_dispatch(target, ProbePurpose::Revisit, now));
+        let request = egress_rx.try_recv().unwrap();
+        assert!(egress_rx.try_recv().is_err());
+
+        actor.handle_priority(PriorityEvent::SendFailed(request.key), now);
+        assert!(actor.try_dispatch(target, ProbePurpose::New, now));
     }
 }

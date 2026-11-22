@@ -182,6 +182,8 @@ impl Default for DiscoveryOptions {
 pub struct MetadataOptions {
     /// End-to-end timeout for one Peer attempt, in seconds.
     pub timeout_secs: u64,
+    /// Independent TCP connect timeout per Peer attempt, in milliseconds (clamped by `timeout_secs`; zero uses 2000ms).
+    pub connect_timeout_ms: u64,
     /// Maximum number of deduplicated pending InfoHashes.
     pub max_queue_size: usize,
     /// Maximum number of concurrent Metadata jobs.
@@ -341,6 +343,7 @@ impl Default for MetadataOptions {
     fn default() -> Self {
         Self {
             timeout_secs: 4,
+            connect_timeout_ms: 2_000,
             max_queue_size: 10_000,
             max_worker_count: 256,
             peer_failure_cache_capacity: 200_000,

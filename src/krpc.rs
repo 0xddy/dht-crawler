@@ -134,12 +134,19 @@ pub(crate) fn encode_sample_infohashes_query(
     buffer.extend_from_slice(b"1:y1:qe");
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResponseNodes<'a> {
+    Omit,
+    Empty,
+    Slice(&'a [NodeTuple]),
+}
+
 pub(crate) fn encode_response(
     buffer: &mut BytesMut,
     tid: &[u8],
     node_id: &[u8; 20],
     token: &[u8; 8],
-    nodes: &[NodeTuple],
+    nodes: ResponseNodes<'_>,
     ipv6: bool,
 ) {
     buffer.clear();
@@ -147,32 +154,44 @@ pub(crate) fn encode_response(
     buffer.extend_from_slice(b"d1:rd2:id20:");
     buffer.extend_from_slice(node_id);
 
-    let compact_len = if ipv6 {
-        nodes.iter().filter(|node| node.addr.is_ipv6()).count() * 38
-    } else {
-        nodes.iter().filter(|node| node.addr.is_ipv4()).count() * 26
-    };
-    if compact_len > 0 {
-        if ipv6 {
-            buffer.extend_from_slice(b"6:nodes6");
-        } else {
-            buffer.extend_from_slice(b"5:nodes");
+    match nodes {
+        ResponseNodes::Omit => {}
+        ResponseNodes::Empty => {
+            if ipv6 {
+                buffer.extend_from_slice(b"6:nodes60:");
+            } else {
+                buffer.extend_from_slice(b"5:nodes0:");
+            }
         }
-        push_usize(buffer, compact_len);
-        buffer.extend_from_slice(b":");
-        for node in nodes {
-            match node.addr.ip() {
-                IpAddr::V4(ip) if !ipv6 => {
-                    buffer.extend_from_slice(&node.id);
-                    buffer.extend_from_slice(&ip.octets());
-                    buffer.extend_from_slice(&node.addr.port().to_be_bytes());
+        ResponseNodes::Slice(nodes) => {
+            let compact_len = if ipv6 {
+                nodes.iter().filter(|node| node.addr.is_ipv6()).count() * 38
+            } else {
+                nodes.iter().filter(|node| node.addr.is_ipv4()).count() * 26
+            };
+            if compact_len > 0 {
+                if ipv6 {
+                    buffer.extend_from_slice(b"6:nodes6");
+                } else {
+                    buffer.extend_from_slice(b"5:nodes");
                 }
-                IpAddr::V6(ip) if ipv6 => {
-                    buffer.extend_from_slice(&node.id);
-                    buffer.extend_from_slice(&ip.octets());
-                    buffer.extend_from_slice(&node.addr.port().to_be_bytes());
+                push_usize(buffer, compact_len);
+                buffer.extend_from_slice(b":");
+                for node in nodes {
+                    match node.addr.ip() {
+                        IpAddr::V4(ip) if !ipv6 => {
+                            buffer.extend_from_slice(&node.id);
+                            buffer.extend_from_slice(&ip.octets());
+                            buffer.extend_from_slice(&node.addr.port().to_be_bytes());
+                        }
+                        IpAddr::V6(ip) if ipv6 => {
+                            buffer.extend_from_slice(&node.id);
+                            buffer.extend_from_slice(&ip.octets());
+                            buffer.extend_from_slice(&node.addr.port().to_be_bytes());
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -279,10 +298,47 @@ mod tests {
             id: [4; 20],
             addr: "8.8.8.8:6881".parse().unwrap(),
         }];
-        encode_response(&mut buffer, &[1, 2], &[2; 20], &[3; 8], &nodes, false);
+        encode_response(
+            &mut buffer,
+            &[1, 2],
+            &[2; 20],
+            &[3; 8],
+            ResponseNodes::Slice(&nodes),
+            false,
+        );
         let message: DhtMessage = serde_bencode::from_bytes(&buffer).unwrap();
         let response = message.r.unwrap();
         assert_eq!(response.nodes.unwrap().len(), 26);
+    }
+
+    #[test]
+    fn empty_response_nodes_encode_explicit_empty_field_for_v4_and_v6() {
+        let mut buffer = BytesMut::new();
+        encode_response(
+            &mut buffer,
+            &[1, 2],
+            &[2; 20],
+            &[3; 8],
+            ResponseNodes::Empty,
+            false,
+        );
+        let v4: DhtMessage = serde_bencode::from_bytes(&buffer).unwrap();
+        let v4_r = v4.r.unwrap();
+        assert_eq!(v4_r.nodes.unwrap().as_ref(), b"");
+        assert!(v4_r.nodes6.is_none());
+
+        encode_response(
+            &mut buffer,
+            &[1, 2],
+            &[2; 20],
+            &[3; 8],
+            ResponseNodes::Empty,
+            true,
+        );
+        let v6: DhtMessage = serde_bencode::from_bytes(&buffer).unwrap();
+        let v6_r = v6.r.unwrap();
+        assert!(v6_r.nodes.is_none());
+        assert_eq!(v6_r.nodes6.unwrap().as_ref(), b"");
     }
 
     #[test]

@@ -27,8 +27,9 @@ const MAX_HASH_SOURCES: usize = 4;
 const INPUT_CAPACITY: usize = 1_024;
 const RESPONSE_CAPACITY: usize = 256;
 const TICK: Duration = Duration::from_millis(50);
-const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 const SEED_REFRESH: Duration = Duration::from_secs(5);
+const DRAIN_BATCH_LIMIT: usize = 128;
 type DueKey = (Instant, u64, SocketAddr);
 
 pub(crate) fn is_sample_tid(tid: &TransactionId) -> bool {
@@ -128,6 +129,13 @@ struct PendingSample {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct CooldownEntry {
+    node: NodeTuple,
+    until: Instant,
+    readmit_on_expiry: bool,
+}
+
 struct HashDedup {
     entries: AHashMap<[u8; 20], Vec<(SocketAddr, HashSource)>>,
     expiry: VecDeque<(Instant, [u8; 20])>,
@@ -203,7 +211,7 @@ struct DiscoveryActor {
     due: BTreeSet<DueKey>,
     sequence: u64,
     pending: AHashMap<SocketAddr, PendingSample>,
-    cooldowns: AHashMap<SocketAddr, (NodeTuple, Instant)>,
+    cooldowns: AHashMap<SocketAddr, CooldownEntry>,
     cooldown_expiry: BTreeSet<(Instant, SocketAddr)>,
     next_tid: u64,
     query_budget: RateBucket,
@@ -294,11 +302,21 @@ impl DiscoveryActor {
                 _ = tick.tick() => self.on_tick(Instant::now()).await,
                 event = responses.recv() => {
                     let Some(event) = event else { break };
-                    self.handle_response(event, Instant::now());
+                    let now = Instant::now();
+                    self.handle_response(event, now);
+                    for _ in 1..DRAIN_BATCH_LIMIT {
+                        let Ok(event) = responses.try_recv() else { break; };
+                        self.handle_response(event, now);
+                    }
                 }
                 candidate = input.recv() => {
                     let Some(candidate) = candidate else { break };
-                    self.emit_hash(candidate.hash, candidate.node, HashSource::GetPeers, Instant::now());
+                    let now = Instant::now();
+                    self.emit_hash(candidate.hash, candidate.node, HashSource::GetPeers, now);
+                    for _ in 1..DRAIN_BATCH_LIMIT {
+                        let Ok(candidate) = input.try_recv() else { break; };
+                        self.emit_hash(candidate.hash, candidate.node, HashSource::GetPeers, now);
+                    }
                 }
             }
         }
@@ -313,12 +331,12 @@ impl DiscoveryActor {
         if !is_valid_node_addr(&node.addr) || !addr_allowed_by_netmode(&node.addr, self.netmode) {
             return;
         }
-        if let Some((_, until)) = self.cooldowns.get(&node.addr).copied() {
-            if until > now {
+        if let Some(entry) = self.cooldowns.get(&node.addr).copied() {
+            if entry.until > now {
                 return; // Re-discovery cannot reset an advertised interval.
             }
             self.cooldowns.remove(&node.addr);
-            self.cooldown_expiry.remove(&(until, node.addr));
+            self.cooldown_expiry.remove(&(entry.until, node.addr));
         }
         if let Some(entry) = self.nodes.get_mut(&node.addr) {
             entry.node = node;
@@ -356,7 +374,7 @@ impl DiscoveryActor {
         Duration::from_secs(self.options.sample_failure_backoff_secs.max(1))
     }
 
-    fn enter_cooldown(&mut self, addr: SocketAddr, until: Instant) {
+    fn enter_cooldown(&mut self, addr: SocketAddr, until: Instant, readmit_on_expiry: bool) {
         let Some(entry) = self.nodes.remove(&addr) else {
             return;
         };
@@ -365,7 +383,14 @@ impl DiscoveryActor {
         }
         // Dispatch reserved this history slot, including for a local send failure.
         debug_assert!(self.cooldowns.len() < self.options.sample_cooldown_capacity.max(1));
-        self.cooldowns.insert(addr, (entry.node, until));
+        self.cooldowns.insert(
+            addr,
+            CooldownEntry {
+                node: entry.node,
+                until,
+                readmit_on_expiry,
+            },
+        );
         self.cooldown_expiry.insert((until, addr));
     }
 
@@ -380,8 +405,10 @@ impl DiscoveryActor {
                 break;
             };
             self.cooldown_expiry.remove(&(until, addr));
-            if let Some((node, _)) = self.cooldowns.remove(&addr) {
-                self.admit_node(node, now);
+            if let Some(entry) = self.cooldowns.remove(&addr)
+                && entry.readmit_on_expiry
+            {
+                self.admit_node(entry.node, now);
             }
         }
         let expired: Vec<_> = self
@@ -392,7 +419,7 @@ impl DiscoveryActor {
         for addr in expired {
             self.pending.remove(&addr);
             self.stats.yield_stats().inc("discovery_sample_timeouts");
-            self.enter_cooldown(addr, now + self.failure_delay());
+            self.enter_cooldown(addr, now + self.failure_delay(), false);
         }
         if now >= self.next_seed_refresh {
             self.next_seed_refresh = now + SEED_REFRESH;
@@ -406,6 +433,7 @@ impl DiscoveryActor {
                 self.admit_node(node, now);
             }
         }
+        let mut buffer = BytesMut::with_capacity(128);
         // A large configured burst cannot monopolize the single actor iteration.
         for _ in 0..self.options.sample_burst.min(64) {
             if self.pending.len() >= self.options.sample_max_in_flight {
@@ -432,7 +460,6 @@ impl DiscoveryActor {
             let mut tid = self.next_tid.to_be_bytes();
             tid[0] = SAMPLE_TID_TAG;
             self.next_tid = self.next_tid.wrapping_add(1).max(1);
-            let mut buffer = BytesMut::with_capacity(128);
             encode_sample_infohashes_query(&mut buffer, &tid, &random_node_id(), &self.local_id);
             let socket = if node.addr.is_ipv4() {
                 &self.v4
@@ -440,10 +467,15 @@ impl DiscoveryActor {
                 &self.v6
             };
             let sent = match socket {
-                Some(socket) => matches!(
-                    tokio::time::timeout(SEND_TIMEOUT, socket.send_to(&buffer, node.addr)).await,
-                    Ok(Ok(_))
-                ),
+                Some(socket) => match socket.try_send_to(&buffer, node.addr) {
+                    Ok(_) => true,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => matches!(
+                        tokio::time::timeout(SEND_TIMEOUT, socket.send_to(&buffer, node.addr))
+                            .await,
+                        Ok(Ok(_))
+                    ),
+                    Err(_) => false,
+                },
                 None => false,
             };
             if sent {
@@ -459,7 +491,7 @@ impl DiscoveryActor {
                 self.stats.yield_stats().inc("discovery_sample_queries");
             } else {
                 self.stats.yield_stats().inc("discovery_sample_send_failed");
-                self.enter_cooldown(node.addr, now + self.failure_delay());
+                self.enter_cooldown(node.addr, now + self.failure_delay(), false);
             }
         }
         self.stats
@@ -485,14 +517,14 @@ impl DiscoveryActor {
         self.pending.remove(&event.addr);
         let Some(response) = event.response else {
             self.stats.yield_stats().inc("discovery_sample_unsupported");
-            self.enter_cooldown(event.addr, now + self.failure_delay());
+            self.enter_cooldown(event.addr, now + self.failure_delay(), false);
             return;
         };
         let (Some(samples), Some(interval), Some(num)) =
             (&response.samples, response.interval, response.num)
         else {
             self.stats.yield_stats().inc("discovery_sample_unsupported");
-            self.enter_cooldown(event.addr, now + self.failure_delay());
+            self.enter_cooldown(event.addr, now + self.failure_delay(), false);
             return;
         };
         let id = response
@@ -511,6 +543,7 @@ impl DiscoveryActor {
                 now + self
                     .failure_delay()
                     .max(Duration::from_secs(interval.min(MAX_REMOTE_INTERVAL))),
+                false,
             );
             return;
         }
@@ -538,7 +571,7 @@ impl DiscoveryActor {
             self.stats.yield_stats().inc("discovery_sample_no_new");
             wait_secs = wait_secs.max(self.options.sample_no_new_backoff_secs);
         }
-        self.enter_cooldown(event.addr, now + Duration::from_secs(wait_secs));
+        self.enter_cooldown(event.addr, now + Duration::from_secs(wait_secs), true);
         let mut neighbors = Vec::new();
         for_each_response_node(&response, self.netmode, |node| {
             if neighbors.len() < 64 {
@@ -557,31 +590,43 @@ impl DiscoveryActor {
         source: HashSource,
         now: Instant,
     ) -> bool {
-        if self.dedup.contains(&hash, node.addr, source, now) {
-            self.stats.yield_stats().inc("discovery_hash_duplicate");
-            return false;
-        }
-        let budget = if source == HashSource::GetPeers {
-            &mut self.get_peers_budget
+        let info_hash = if source == HashSource::GetPeers {
+            if !self.get_peers_budget.try_take_one(now) {
+                self.stats
+                    .yield_stats()
+                    .inc("discovery_get_peers_rate_limited");
+                return false;
+            }
+            if self.dedup.contains(&hash, node.addr, source, now) {
+                self.get_peers_budget.refund_one();
+                self.stats.yield_stats().inc("discovery_hash_duplicate");
+                return false;
+            }
+            let info_hash = hex::encode(hash);
+            if let Some(filter) = self.filter.load_full()
+                && !filter(&info_hash)
+            {
+                self.get_peers_budget.refund_one();
+                return false;
+            }
+            info_hash
         } else {
-            &mut self.sample_hash_budget
+            if self.dedup.contains(&hash, node.addr, source, now) {
+                self.stats.yield_stats().inc("discovery_hash_duplicate");
+                return false;
+            }
+            let info_hash = hex::encode(hash);
+            if let Some(filter) = self.filter.load_full()
+                && !filter(&info_hash)
+            {
+                return false;
+            }
+            if !self.sample_hash_budget.try_take_one(now) {
+                self.stats.yield_stats().inc("discovery_hash_rate_limited");
+                return false;
+            }
+            info_hash
         };
-        if !budget.try_take_one(now) {
-            self.stats
-                .yield_stats()
-                .inc(if source == HashSource::GetPeers {
-                    "discovery_get_peers_rate_limited"
-                } else {
-                    "discovery_hash_rate_limited"
-                });
-            return false;
-        }
-        let info_hash = hex::encode(hash);
-        if let Some(filter) = self.filter.load_full()
-            && !filter(&info_hash)
-        {
-            return false;
-        }
         let event = HashDiscovered {
             info_hash,
             peer_addr: None,
@@ -590,6 +635,11 @@ impl DiscoveryActor {
             discovered_at: now,
         };
         if self.hash_tx.try_send(event).is_err() {
+            if source == HashSource::GetPeers {
+                self.get_peers_budget.refund_one();
+            } else {
+                self.sample_hash_budget.refund_one();
+            }
             self.stats.yield_stats().inc("discovery_hash_queue_full");
             return false;
         }
@@ -653,8 +703,8 @@ mod tests {
     ) -> TransactionId {
         // Test setup can create a new synthetic pending transaction independently
         // of a previous test response; production dispatch always checks history.
-        if let Some((_, until)) = actor.cooldowns.remove(&target.addr) {
-            actor.cooldown_expiry.remove(&(until, target.addr));
+        if let Some(entry) = actor.cooldowns.remove(&target.addr) {
+            actor.cooldown_expiry.remove(&(entry.until, target.addr));
         }
         actor.admit_node(target, now);
         let key = actor
@@ -704,12 +754,12 @@ mod tests {
         assert_eq!(candidate.source_node, Some(node()));
         assert_eq!(candidate.source, HashSource::Sample);
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(21_600)
         );
         actor.admit_node(node(), now + Duration::from_secs(1));
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(21_600)
         );
     }
@@ -749,7 +799,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(900)
         );
     }
@@ -801,7 +851,7 @@ mod tests {
             now,
         );
         let next = now + Duration::from_secs(1_800);
-        assert_eq!(actor.cooldowns[&node().addr].1, next);
+        assert_eq!(actor.cooldowns[&node().addr].until, next);
         actor.admit_node(
             NodeTuple {
                 id: [4; 20],
@@ -810,7 +860,7 @@ mod tests {
             now,
         );
         assert_eq!(actor.nodes.len(), 1);
-        assert_eq!(actor.cooldowns[&node().addr].1, next);
+        assert_eq!(actor.cooldowns[&node().addr].until, next);
     }
 
     #[tokio::test]
@@ -824,13 +874,13 @@ mod tests {
         actor.on_tick(now + Duration::from_secs(3)).await;
         assert!(actor.pending.is_empty());
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(903)
         );
         actor.on_tick(now + Duration::from_secs(904)).await;
         assert!(actor.pending.is_empty());
         assert!(!actor.cooldowns.contains_key(&node().addr));
-        assert!(actor.nodes.contains_key(&node().addr));
+        assert!(!actor.nodes.contains_key(&node().addr));
     }
 
     #[test]
@@ -847,7 +897,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(900)
         );
         let tid = expect_response(&mut actor, now);
@@ -860,7 +910,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(21_600)
         );
         assert!(rx.try_recv().is_err());
@@ -940,7 +990,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(300)
         );
     }
@@ -966,7 +1016,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(MAX_LOCAL_INTERVAL)
         );
         assert_eq!(actor.options.sample_query_timeout_secs, 300);
@@ -1053,7 +1103,7 @@ mod tests {
         assert!(actor.nodes.contains_key(&other.addr));
         assert!(!actor.nodes.contains_key(&node().addr));
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(21_600)
         );
         assert_eq!(actor.cooldown_expiry.len(), 1);
@@ -1146,8 +1196,74 @@ mod tests {
         assert!(actor.nodes.contains_key(&neighbor.addr));
         assert!(!actor.nodes.contains_key(&node().addr));
         assert_eq!(
-            actor.cooldowns[&node().addr].1,
+            actor.cooldowns[&node().addr].until,
             now + Duration::from_secs(21_600)
         );
+    }
+
+    #[tokio::test]
+    async fn supported_sample_node_is_readmitted_after_interval_while_unsupported_is_not() {
+        let (mut actor, _rx) = actor(DiscoveryOptions {
+            sample_queries_per_second: 0,
+            sample_min_interval_secs: 10,
+            sample_failure_backoff_secs: 10,
+            ..Default::default()
+        });
+        let now = Instant::now();
+        let supported = node();
+        let unsupported = NodeTuple {
+            id: [9; 20],
+            addr: "1.1.1.1:6881".parse().unwrap(),
+        };
+
+        let tid_ok = expect_node_response(&mut actor, supported, now);
+        actor.handle_response(
+            SampleResponse {
+                addr: supported.addr,
+                tid: tid_ok,
+                response: Some(response(10, [3; 20])),
+            },
+            now,
+        );
+        let tid_err = expect_node_response(&mut actor, unsupported, now);
+        actor.handle_response(
+            SampleResponse {
+                addr: unsupported.addr,
+                tid: tid_err,
+                response: None,
+            },
+            now,
+        );
+
+        actor.on_tick(now + Duration::from_secs(11)).await;
+        assert!(actor.nodes.contains_key(&supported.addr));
+        assert!(!actor.nodes.contains_key(&unsupported.addr));
+        assert!(actor.cooldowns.is_empty());
+    }
+
+    #[test]
+    fn filter_rejection_does_not_spend_discovery_hash_budget() {
+        let (mut actor, mut rx) = actor(DiscoveryOptions {
+            get_peers_hashes_per_second: 1,
+            get_peers_burst: 1,
+            sample_hashes_per_second: 1,
+            sample_hash_burst: 1,
+            ..Default::default()
+        });
+        let filtered_hash = [1u8; 20];
+        let allowed_hash = [2u8; 20];
+        let filtered_hex = hex::encode(filtered_hash);
+        actor
+            .filter
+            .store(Some(Arc::new(Box::new(move |h| h != filtered_hex))));
+        let now = Instant::now();
+
+        assert!(!actor.emit_hash(filtered_hash, node(), HashSource::GetPeers, now));
+        assert!(actor.emit_hash(allowed_hash, node(), HashSource::GetPeers, now));
+        assert!(!actor.emit_hash(filtered_hash, node(), HashSource::Sample, now));
+        assert!(actor.emit_hash(allowed_hash, node(), HashSource::Sample, now));
+
+        assert_eq!(rx.try_recv().unwrap().source, HashSource::GetPeers);
+        assert_eq!(rx.try_recv().unwrap().source, HashSource::Sample);
     }
 }

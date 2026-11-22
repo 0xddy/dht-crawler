@@ -1,10 +1,11 @@
+mod response_limiter;
+use response_limiter::{ResponsePermit, WorkerResponseLimiter};
 use crate::addr::is_valid_node_addr;
-use crate::budget::RateBucket;
 use crate::crawl_config::ResolvedCrawlConfig;
 use crate::crawl_engine::CrawlEngine;
 use crate::discovery::{DiscoveryHandle, DiscoveryRuntime, is_sample_tid, spawn_discovery};
 use crate::error::Result;
-use crate::krpc::encode_response;
+use crate::krpc::{ResponseNodes, encode_response};
 use crate::metadata::RbitFetcher;
 use crate::node_id::{neighbor_node_id, random_node_id, transaction_id_from_bytes};
 use crate::peer_lookup::{
@@ -20,14 +21,13 @@ use crate::scheduler::{
 use crate::types::{DHTOptions, MetadataFetchCompletion, NetMode, NodeTuple, TorrentInfo};
 use crate::udp_buffer::UdpBufferPool;
 use crate::udp_ingress::{WorkerHandle, spawn_udp_listener};
-use ahash::AHashMap;
 use arc_swap::ArcSwapOption;
 use bytes::BytesMut;
 #[cfg(feature = "metrics")]
 use metrics::counter;
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -48,188 +48,6 @@ struct QueryResponse<'a> {
     query_type: &'a str,
     sender_id: Option<&'a [u8]>,
     target_id: Option<&'a [u8]>,
-}
-
-#[derive(Clone, Copy)]
-struct SourceResponseWindow {
-    started_at: Instant,
-    last_seen: Instant,
-    count: u32,
-}
-
-struct WorkerResponseLimiter {
-    regular_packets: RateBucket,
-    regular_bytes: RateBucket,
-    priority_packets: RateBucket,
-    priority_bytes: RateBucket,
-    per_source_rate: u32,
-    sources: AHashMap<SocketAddr, SourceResponseWindow>,
-    source_expiry: VecDeque<(Instant, SocketAddr)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponsePermit {
-    Regular,
-    PriorityReserve,
-    Rejected,
-}
-
-fn reserve_quota(total: u32) -> u32 {
-    if total == 0 {
-        0
-    } else {
-        total.div_ceil(10).min(total)
-    }
-}
-
-impl WorkerResponseLimiter {
-    fn new(packet_rate: u32, byte_rate: u64, per_source_rate: u32, now: Instant) -> Self {
-        let byte_rate = byte_rate.min(u32::MAX as u64) as u32;
-        let priority_packet_rate = reserve_quota(packet_rate);
-        let priority_byte_rate = reserve_quota(byte_rate);
-        let packet_rate = packet_rate.saturating_sub(priority_packet_rate);
-        let byte_rate = byte_rate.saturating_sub(priority_byte_rate);
-        Self {
-            regular_packets: RateBucket::per_second(
-                packet_rate,
-                packet_rate.div_ceil(5).max(1),
-                true,
-                now,
-            ),
-            regular_bytes: RateBucket::per_second(
-                byte_rate,
-                byte_rate.div_ceil(5).max(512),
-                true,
-                now,
-            ),
-            priority_packets: RateBucket::per_second(
-                priority_packet_rate,
-                priority_packet_rate.div_ceil(5).max(1),
-                true,
-                now,
-            ),
-            priority_bytes: RateBucket::per_second(
-                priority_byte_rate,
-                priority_byte_rate.div_ceil(5).max(512),
-                true,
-                now,
-            ),
-            per_source_rate,
-            sources: AHashMap::new(),
-            source_expiry: VecDeque::new(),
-        }
-    }
-
-    fn acquire(
-        &mut self,
-        addr: SocketAddr,
-        encoded_len: usize,
-        is_priority: bool,
-        now: Instant,
-    ) -> ResponsePermit {
-        self.expire_sources(now);
-        if Self::take_budget(
-            &mut self.regular_packets,
-            &mut self.regular_bytes,
-            encoded_len,
-            now,
-        ) {
-            if self.acquire_source_slot(addr, now) {
-                return ResponsePermit::Regular;
-            }
-            Self::refund_budget(
-                &mut self.regular_packets,
-                &mut self.regular_bytes,
-                encoded_len,
-            );
-            return ResponsePermit::Rejected;
-        }
-
-        if is_priority
-            && Self::take_budget(
-                &mut self.priority_packets,
-                &mut self.priority_bytes,
-                encoded_len,
-                now,
-            )
-        {
-            if self.acquire_source_slot(addr, now) {
-                return ResponsePermit::PriorityReserve;
-            }
-            Self::refund_budget(
-                &mut self.priority_packets,
-                &mut self.priority_bytes,
-                encoded_len,
-            );
-        }
-
-        ResponsePermit::Rejected
-    }
-
-    fn take_budget(
-        packets: &mut RateBucket,
-        bytes: &mut RateBucket,
-        encoded_len: usize,
-        now: Instant,
-    ) -> bool {
-        if !packets.try_take_one(now) {
-            return false;
-        }
-        if !bytes.try_take_exact(encoded_len, now) {
-            packets.refund_one();
-            return false;
-        }
-        true
-    }
-
-    fn refund_budget(packets: &mut RateBucket, bytes: &mut RateBucket, encoded_len: usize) {
-        packets.refund_one();
-        bytes.refund(encoded_len);
-    }
-
-    fn acquire_source_slot(&mut self, addr: SocketAddr, now: Instant) -> bool {
-        if self.per_source_rate == 0 {
-            return false;
-        }
-
-        let entry = self.sources.entry(addr).or_insert(SourceResponseWindow {
-            started_at: now,
-            last_seen: now,
-            count: 0,
-        });
-        if now
-            .checked_duration_since(entry.started_at)
-            .unwrap_or_default()
-            >= Duration::from_secs(1)
-        {
-            entry.started_at = now;
-            entry.count = 0;
-        }
-        if entry.count >= self.per_source_rate {
-            return false;
-        }
-        entry.count += 1;
-        entry.last_seen = now;
-        self.source_expiry
-            .push_back((now + Duration::from_secs(60), addr));
-        true
-    }
-
-    fn expire_sources(&mut self, now: Instant) {
-        while let Some((deadline, addr)) = self.source_expiry.front().copied() {
-            if deadline > now {
-                break;
-            }
-            self.source_expiry.pop_front();
-            if self.sources.get(&addr).is_some_and(|entry| {
-                now.checked_duration_since(entry.last_seen)
-                    .unwrap_or_default()
-                    >= Duration::from_secs(60)
-            }) {
-                self.sources.remove(&addr);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -369,8 +187,9 @@ impl DHTServer {
 
         let (hash_events_tx, hash_rx) =
             mpsc::channel::<HashDiscovered>(options.hash_queue_capacity);
-        let fetcher = Arc::new(RbitFetcher::new_with_runtime_stats(
+        let fetcher = Arc::new(RbitFetcher::new_with_options(
             options.metadata.timeout_secs,
+            options.metadata.connect_timeout_ms,
             options.metadata.peer_failure_cache_capacity,
             options.metadata.peer_failure_ttl_secs,
             runtime_stats.clone(),
@@ -737,17 +556,20 @@ impl DHTServer {
                         self.discovery
                             .route_response(remote_addr, tid, Some(response));
                     } else if is_peer_lookup_tid(&tid) {
-                        self.peer_lookup.route_response(remote_addr, tid, response);
+                        self.peer_lookup
+                            .route_response(remote_addr, tid, Some(response));
                     } else {
                         self.crawl_engine.route_response(remote_addr, tid, response);
                     }
                 }
             }
             "e" => {
-                if let Some(tid) = transaction_id_from_bytes(&msg.t)
-                    && is_sample_tid(&tid)
-                {
-                    self.discovery.route_response(remote_addr, tid, None);
+                if let Some(tid) = transaction_id_from_bytes(&msg.t) {
+                    if is_sample_tid(&tid) {
+                        self.discovery.route_response(remote_addr, tid, None);
+                    } else if is_peer_lookup_tid(&tid) {
+                        self.peer_lookup.route_response(remote_addr, tid, None);
+                    }
                 }
             }
             _ => {}
@@ -771,12 +593,15 @@ impl DHTServer {
 
         let transaction_id = &msg.t;
         let sender_id: Option<&[u8]> = args.id.as_deref().map(|v| v.as_slice());
-        let target_id_fallback: Option<&[u8]> = args
-            .target
-            .as_deref()
-            .or(args.info_hash.as_deref())
-            .map(|v| v.as_slice());
         let q_str = std::str::from_utf8(query_type).unwrap_or("");
+        let target_id_fallback: Option<&[u8]> = if q_str == "get_peers" {
+            args.info_hash.as_deref().map(|v| v.as_slice())
+        } else {
+            args.target
+                .as_deref()
+                .or(args.info_hash.as_deref())
+                .map(|v| v.as_slice())
+        };
         self.runtime_stats.inbound_query(q_str);
 
         if let Some(sender_id) = sender_id
@@ -922,6 +747,56 @@ impl DHTServer {
         Ok(())
     }
 
+    fn build_response_packet(
+        &self,
+        response: &QueryResponse<'_>,
+        response_buffer: &mut BytesMut,
+    ) -> bool {
+        let reference_id = if response.query_type == "get_peers" {
+            response
+                .target_id
+                .filter(|id| id.len() == 20)
+                .or(response.sender_id)
+        } else {
+            response.sender_id.or(response.target_id)
+        };
+        let my_id = if let Some(target) = reference_id {
+            let generated = neighbor_node_id(target, &self.node_id);
+            <[u8; 20]>::try_from(generated.as_slice()).expect("neighbor id is always 20 bytes")
+        } else {
+            self.node_id
+        };
+        let token = self.generate_token(response.remote_addr);
+        let requestor_is_ipv6 = response.remote_addr.is_ipv6();
+        let snapshot_nodes = if response.query_type == "find_node" {
+            let filter_ipv6 = match self.options.netmode {
+                NetMode::Ipv4Only => Some(false),
+                NetMode::Ipv6Only => Some(true),
+                NetMode::DualStack => Some(requestor_is_ipv6),
+            };
+            let snapshot = self.crawl_engine.snapshot.load();
+            Some(snapshot.random_nodes(8, filter_ipv6))
+        } else {
+            None
+        };
+        let nodes = if response.query_type == "get_peers" {
+            ResponseNodes::Empty
+        } else if let Some(ref nodes) = snapshot_nodes {
+            ResponseNodes::Slice(nodes)
+        } else {
+            ResponseNodes::Omit
+        };
+        encode_response(
+            response_buffer,
+            response.transaction_id,
+            &my_id,
+            &token,
+            nodes,
+            requestor_is_ipv6,
+        );
+        response.query_type == "ping" || response.query_type == "get_peers"
+    }
+
     async fn send_response(
         &self,
         response: QueryResponse<'_>,
@@ -933,37 +808,7 @@ impl DHTServer {
             None => return Ok(()),
         };
 
-        let reference_id = response.sender_id.or(response.target_id);
-        let my_id = if let Some(target) = reference_id {
-            let generated = neighbor_node_id(target, &self.node_id);
-            <[u8; 20]>::try_from(generated.as_slice()).expect("neighbor id is always 20 bytes")
-        } else {
-            self.node_id
-        };
-        let token = self.generate_token(response.remote_addr);
-        let include_nodes =
-            response.query_type == "get_peers" || response.query_type == "find_node";
-        let requestor_is_ipv6 = response.remote_addr.is_ipv6();
-        let nodes = if include_nodes {
-            let filter_ipv6 = match self.options.netmode {
-                NetMode::Ipv4Only => Some(false),
-                NetMode::Ipv6Only => Some(true),
-                NetMode::DualStack => Some(requestor_is_ipv6),
-            };
-            let snapshot = self.crawl_engine.snapshot.load();
-            snapshot.random_nodes(8, filter_ipv6)
-        } else {
-            Vec::new()
-        };
-        encode_response(
-            response_buffer,
-            response.transaction_id,
-            &my_id,
-            &token,
-            &nodes,
-            requestor_is_ipv6,
-        );
-        let is_priority = response.query_type == "ping" || response.query_type == "get_peers";
+        let is_priority = self.build_response_packet(&response, response_buffer);
         match response_limiter.acquire(
             response.remote_addr,
             response_buffer.len(),
@@ -1021,64 +866,51 @@ impl DHTServer {
 }
 
 #[cfg(test)]
-mod response_limiter_tests {
+mod tests {
     use super::*;
+    #[tokio::test]
+    async fn get_peers_response_forges_info_hash_neighbor_and_empty_nodes() {
+        let options = DHTOptions { port: 0, ..DHTOptions::default() };
+        let server = DHTServer::new(options).await.unwrap();
+        let remote_addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        let local_addr = *server.sockets_by_bind_addr.keys().next().unwrap();
+        let sender_id = [0x11; 20];
+        let info_hash = [0xab; 20];
+        let mut buffer = BytesMut::new();
 
-    #[test]
-    fn response_limiter_enforces_packet_byte_and_source_limits() {
-        let start = Instant::now();
-        let addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
-        let mut limiter = WorkerResponseLimiter::new(2, 200, 1, start);
-        assert_eq!(
-            limiter.acquire(addr, 100, false, start),
-            ResponsePermit::Regular
+        let is_priority = server.build_response_packet(
+            &QueryResponse {
+                transaction_id: b"gp",
+                remote_addr,
+                local_addr,
+                query_type: "get_peers",
+                sender_id: Some(&sender_id),
+                target_id: Some(&info_hash),
+            },
+            &mut buffer,
         );
-        assert_eq!(
-            limiter.acquire(addr, 100, false, start),
-            ResponsePermit::Rejected
-        );
-        assert_eq!(
-            limiter.acquire(addr, 100, false, start + Duration::from_secs(1)),
-            ResponsePermit::Regular
-        );
-        assert_eq!(
-            limiter.acquire(
-                "1.1.1.1:6881".parse().unwrap(),
-                513,
-                false,
-                start + Duration::from_secs(2)
-            ),
-            ResponsePermit::Rejected
-        );
-    }
+        assert!(is_priority);
+        let decoded: DhtMessage = serde_bencode::from_bytes(&buffer).unwrap();
+        let r = decoded.r.unwrap();
+        assert_eq!(&r.id.unwrap()[..6], &info_hash[..6]);
+        assert_eq!(r.nodes.unwrap().as_ref(), b"");
 
-    #[test]
-    fn ping_and_get_peers_can_use_the_priority_reserve() {
-        let start = Instant::now();
-        let mut limiter = WorkerResponseLimiter::new(10, 1_000, 100, start);
-        let first: SocketAddr = "8.8.8.8:6881".parse().unwrap();
-        let second: SocketAddr = "1.1.1.1:6881".parse().unwrap();
-        let priority: SocketAddr = "9.9.9.9:6881".parse().unwrap();
+        let mut fn_buffer = BytesMut::new();
+        let is_fn_priority = server.build_response_packet(
+            &QueryResponse {
+                transaction_id: b"fn",
+                remote_addr,
+                local_addr,
+                query_type: "find_node",
+                sender_id: Some(&sender_id),
+                target_id: Some(&[0xcd; 20]),
+            },
+            &mut fn_buffer,
+        );
+        assert!(!is_fn_priority);
+        let fn_decoded: DhtMessage = serde_bencode::from_bytes(&fn_buffer).unwrap();
+        assert_eq!(&fn_decoded.r.unwrap().id.unwrap()[..6], &sender_id[..6]);
 
-        assert_eq!(
-            limiter.acquire(first, 50, false, start),
-            ResponsePermit::Regular
-        );
-        assert_eq!(
-            limiter.acquire(second, 50, false, start),
-            ResponsePermit::Regular
-        );
-        assert_eq!(
-            limiter.acquire(priority, 50, false, start),
-            ResponsePermit::Rejected
-        );
-        assert_eq!(
-            limiter.acquire(priority, 50, true, start),
-            ResponsePermit::PriorityReserve
-        );
-        assert_eq!(
-            limiter.acquire("4.4.4.4:6881".parse().unwrap(), 50, true, start),
-            ResponsePermit::Rejected
-        );
+        server.shutdown();
     }
 }

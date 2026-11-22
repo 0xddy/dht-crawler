@@ -17,7 +17,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tokio-util = { version = "0.7" }
 serde = { version = "1.0", features = ["derive"] }
 serde_bencode = "0.2"
@@ -27,12 +27,10 @@ rand = "0.8"
 log = "0.4"
 thiserror = "1.0"
 socket2 = { version = "0.5", features = ["all"] }
-rbit = "0.2"
 bytes = "1.0"
 ahash = "0.8"
 serde_bytes = "0.11.19"
 metrics = { version = "0.24", optional = true }
-async-channel = "2.5.0"
 crossbeam-queue = "0.3"
 jni = { version = "0.21", optional = true }
 arc-swap = "1.7"

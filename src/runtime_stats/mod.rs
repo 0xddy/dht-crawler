@@ -1,124 +1,15 @@
+mod histogram;
+mod yield_stats;
+
+use histogram::AtomicFixedHistogram;
+#[allow(unused_imports)]
+pub use histogram::{
+    FixedHistogramSnapshot, METADATA_FETCH_BUCKETS_MS, METADATA_QUEUE_WAIT_BUCKETS_MS,
+    METADATA_SIZE_BUCKETS_BYTES,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-// Fixed names keep the packet path allocation-free and prevent high-cardinality labels.
-macro_rules! yield_counters {
-    ($($name:ident),+ $(,)?) => {
-        /// Discovery, retry and lookup outcomes shared by all crawler tasks.
-        #[derive(Default)]
-        pub struct YieldRuntimeStats {
-            $($name: AtomicU64,)+
-            metadata_retry_waiting: AtomicU64,
-            metadata_retry_history: AtomicU64,
-            discovery_candidate_nodes: AtomicU64,
-            discovery_cooldown_nodes: AtomicU64,
-            discovery_samples_in_flight: AtomicU64,
-        }
-
-        impl YieldRuntimeStats {
-            /// Increment one of the fixed, bounded counters.
-            pub(crate) fn inc(&self, name: &'static str) {
-                match name {
-                    $(stringify!($name) => { self.$name.fetch_add(1, Ordering::Relaxed); }),+
-                    _ => debug_assert!(false, "unknown yield counter: {name}"),
-                }
-                #[cfg(feature = "metrics")]
-                metrics::counter!("dht_yield_events_total", "event" => name).increment(1);
-            }
-
-            /// Read counters without requiring the Prometheus exporter.
-            pub fn snapshot(&self) -> std::collections::BTreeMap<String, u64> {
-                [$( (stringify!($name).to_owned(), self.$name.load(Ordering::Relaxed)) ),+]
-                    .into_iter().collect()
-            }
-
-            /// Set a fixed current-size gauge separately from monotonically increasing events.
-            pub(crate) fn set(&self, name: &'static str, value: u64) {
-                let gauge = match name {
-                    "metadata_retry_waiting" => &self.metadata_retry_waiting,
-                    "metadata_retry_history" => &self.metadata_retry_history,
-                    "discovery_candidate_nodes" => &self.discovery_candidate_nodes,
-                    "discovery_cooldown_nodes" => &self.discovery_cooldown_nodes,
-                    "discovery_samples_in_flight" => &self.discovery_samples_in_flight,
-                    _ => { debug_assert!(false, "unknown yield gauge: {name}"); return; }
-                };
-                gauge.store(value, Ordering::Relaxed);
-                #[cfg(feature = "metrics")]
-                metrics::gauge!("dht_yield_current", "state" => name).set(value as f64);
-            }
-
-            /// Load current state sizes without interpreting a decrease as a counter reset.
-            pub fn gauges_snapshot(&self) -> std::collections::BTreeMap<String, u64> {
-                [
-                    ("metadata_retry_waiting", &self.metadata_retry_waiting),
-                    ("metadata_retry_history", &self.metadata_retry_history),
-                    ("discovery_candidate_nodes", &self.discovery_candidate_nodes),
-                    ("discovery_cooldown_nodes", &self.discovery_cooldown_nodes),
-                    ("discovery_samples_in_flight", &self.discovery_samples_in_flight),
-                ].into_iter().map(|(name, gauge)|
-                    (name.to_owned(), gauge.load(Ordering::Relaxed))).collect()
-            }
-        }
-    };
-}
-
-yield_counters!(
-    discovery_get_peers_observed,
-    discovery_get_peers_rate_limited,
-    discovery_get_peers_enqueued,
-    discovery_sample_queries,
-    discovery_sample_responses,
-    discovery_sample_timeouts,
-    discovery_sample_send_failed,
-    discovery_sample_unsupported,
-    discovery_sample_invalid,
-    discovery_sample_unmatched,
-    discovery_sample_no_new,
-    discovery_sample_hashes_enqueued,
-    discovery_hash_duplicate,
-    discovery_hash_rate_limited,
-    discovery_hash_queue_full,
-    discovery_input_dropped,
-    discovery_node_capacity_dropped,
-    discovery_sample_cooldown_full,
-    metadata_source_announce_started,
-    metadata_source_announce_succeeded,
-    metadata_source_announce_failed,
-    metadata_source_get_peers_started,
-    metadata_source_get_peers_succeeded,
-    metadata_source_get_peers_failed,
-    metadata_source_sample_started,
-    metadata_source_sample_succeeded,
-    metadata_source_sample_failed,
-    metadata_retry_scheduled,
-    metadata_retry_dispatched,
-    metadata_retry_exhausted,
-    metadata_retry_evicted,
-    metadata_retry_deferred,
-    metadata_retry_new_peer,
-    metadata_retry_history_full,
-    metadata_hash_only_started,
-    lookup_finished_deadline,
-    lookup_finished_budget,
-    lookup_finished_exhausted,
-    lookup_finished_peers,
-    lookup_finished_canceled,
-    lookup_source_seed_queries,
-    lookup_request_queue_full,
-);
-
-pub const METADATA_QUEUE_WAIT_BUCKETS_MS: [u64; 8] = [10, 50, 100, 250, 500, 1_000, 2_000, 5_000];
-pub const METADATA_FETCH_BUCKETS_MS: [u64; 7] = [250, 500, 1_000, 2_000, 4_000, 6_000, 10_000];
-pub const METADATA_SIZE_BUCKETS_BYTES: [u64; 8] = [
-    16 * 1024,
-    32 * 1024,
-    64 * 1024,
-    128 * 1024,
-    256 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    10 * 1024 * 1024,
-];
+pub use yield_stats::YieldRuntimeStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataTimeoutStage {
@@ -229,9 +120,9 @@ pub struct MetadataConnectionErrorsSnapshot {
     pub reset: u64,
     /// OS reported connection aborted.
     pub aborted: u64,
-    /// rbit reported a closed connection, or I/O reported unexpected EOF.
+    /// Peer closed the connection or I/O reported unexpected EOF.
     pub closed: u64,
-    /// rbit's inner timeout or an OS I/O timeout fired before the outer deadline.
+    /// An OS I/O timeout fired before the outer deadline.
     pub timeout: u64,
     /// Peer sent an invalid base BitTorrent handshake.
     pub invalid_handshake: u64,
@@ -239,94 +130,8 @@ pub struct MetadataConnectionErrorsSnapshot {
     pub info_hash_mismatch: u64,
     /// Other typed I/O errors; no string-based cause inference is performed.
     pub io_other: u64,
-    /// Other rbit error variants.
+    /// Other connection wire errors.
     pub other: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Snapshot of a non-cumulative fixed-bucket histogram.
-pub struct FixedHistogramSnapshot {
-    /// Inclusive upper bound for each bucket.
-    pub bounds: Vec<u64>,
-    /// Per-bucket counts; values are not cumulative.
-    pub counts: Vec<u64>,
-    /// Values larger than the final bound.
-    pub overflow: u64,
-    /// Total observations including overflow.
-    pub count: u64,
-    /// Wrapping sum of all observed values.
-    pub sum: u64,
-}
-
-impl FixedHistogramSnapshot {
-    /// Returns the inclusive bucket bound containing the requested approximate percentile.
-    ///
-    /// `percentile` is clamped to `0.0..=1.0`. Overflow observations return the final finite
-    /// bound because the histogram intentionally stores no dynamic maximum.
-    pub fn percentile(&self, percentile: f64) -> Option<u64> {
-        if self.count == 0 {
-            return None;
-        }
-        let rank = ((self.count as f64 * percentile.clamp(0.0, 1.0)).ceil() as u64).max(1);
-        let mut cumulative = 0u64;
-        for (bound, count) in self.bounds.iter().zip(&self.counts) {
-            cumulative = cumulative.saturating_add(*count);
-            if cumulative >= rank {
-                return Some(*bound);
-            }
-        }
-        self.bounds.last().copied()
-    }
-}
-
-struct AtomicFixedHistogram<const N: usize> {
-    bounds: [u64; N],
-    counts: [AtomicU64; N],
-    overflow: AtomicU64,
-    count: AtomicU64,
-    sum: AtomicU64,
-}
-
-impl<const N: usize> AtomicFixedHistogram<N> {
-    fn new(bounds: [u64; N]) -> Self {
-        Self {
-            bounds,
-            counts: std::array::from_fn(|_| AtomicU64::new(0)),
-            overflow: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-            sum: AtomicU64::new(0),
-        }
-    }
-
-    fn record(&self, value: u64) {
-        if let Some(index) = self.bounds.iter().position(|bound| value <= *bound) {
-            self.counts[index].fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.overflow.fetch_add(1, Ordering::Relaxed);
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(value, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> FixedHistogramSnapshot {
-        FixedHistogramSnapshot {
-            bounds: self.bounds.to_vec(),
-            counts: self
-                .counts
-                .iter()
-                .map(|count| count.load(Ordering::Relaxed))
-                .collect(),
-            overflow: self.overflow.load(Ordering::Relaxed),
-            count: self.count.load(Ordering::Relaxed),
-            sum: self.sum.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl<const N: usize> Default for AtomicFixedHistogram<N> {
-    fn default() -> Self {
-        Self::new([0; N])
-    }
 }
 
 /// Transport-neutral counters and fixed-bucket histograms used by dashboards.
@@ -394,6 +199,10 @@ pub struct DhtObservabilitySnapshot {
     pub metadata_failure_sha1: u64,
     /// Validated payloads that could not be parsed as torrent info.
     pub metadata_failure_parse: u64,
+    /// Peer closed/reset the connection during extension handshake or metadata piece exchange.
+    pub metadata_failure_peer_closed: u64,
+    /// Wire/protocol framing errors during extension handshake or metadata piece exchange.
+    pub metadata_failure_protocol: u64,
     /// Other receive, piece or worker failures.
     pub metadata_failure_other: u64,
     /// Failure-cache hits for previously timed-out Peers.
@@ -658,6 +467,8 @@ struct DhtRuntimeStatsInner {
     metadata_failure_size_limit: AtomicU64,
     metadata_failure_sha1: AtomicU64,
     metadata_failure_parse: AtomicU64,
+    metadata_failure_peer_closed: AtomicU64,
+    metadata_failure_protocol: AtomicU64,
     metadata_failure_other: AtomicU64,
     peer_cache_timeout_hits: AtomicU64,
     peer_cache_connect_hits: AtomicU64,
@@ -782,6 +593,8 @@ impl Default for DhtRuntimeStatsInner {
             metadata_failure_size_limit: AtomicU64::new(0),
             metadata_failure_sha1: AtomicU64::new(0),
             metadata_failure_parse: AtomicU64::new(0),
+            metadata_failure_peer_closed: AtomicU64::new(0),
+            metadata_failure_protocol: AtomicU64::new(0),
             metadata_failure_other: AtomicU64::new(0),
             peer_cache_timeout_hits: AtomicU64::new(0),
             peer_cache_connect_hits: AtomicU64::new(0),
@@ -824,7 +637,6 @@ impl DhtRuntimeStats {
         &self.yield_stats
     }
 
-    /// Load every exposed value once using relaxed atomics.
     /// Loads the core runtime counters and gauges using relaxed atomics.
     pub fn snapshot(&self) -> DhtRuntimeSnapshot {
         let inner = &self.inner;
@@ -963,6 +775,10 @@ impl DhtRuntimeStats {
             metadata_failure_size_limit: inner.metadata_failure_size_limit.load(Ordering::Relaxed),
             metadata_failure_sha1: inner.metadata_failure_sha1.load(Ordering::Relaxed),
             metadata_failure_parse: inner.metadata_failure_parse.load(Ordering::Relaxed),
+            metadata_failure_peer_closed: inner
+                .metadata_failure_peer_closed
+                .load(Ordering::Relaxed),
+            metadata_failure_protocol: inner.metadata_failure_protocol.load(Ordering::Relaxed),
             metadata_failure_other: inner.metadata_failure_other.load(Ordering::Relaxed),
             peer_cache_timeout_hits: inner.peer_cache_timeout_hits.load(Ordering::Relaxed),
             peer_cache_connect_hits: inner.peer_cache_connect_hits.load(Ordering::Relaxed),
@@ -1384,6 +1200,18 @@ impl DhtRuntimeStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn metadata_failure_peer_closed(&self) {
+        self.inner
+            .metadata_failure_peer_closed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_failure_protocol(&self) {
+        self.inner
+            .metadata_failure_protocol
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn metadata_failure_other(&self) {
         self.inner
             .metadata_failure_other
@@ -1646,6 +1474,8 @@ mod tests {
         stats.metadata_failure_reject();
         stats.metadata_failure_tcp_connect();
         stats.metadata_failure_base_handshake();
+        stats.metadata_failure_peer_closed();
+        stats.metadata_failure_protocol();
         stats.peer_cache_endpoint_hits();
         stats.peer_cache_metadata_hits();
         stats.set_crawl_recent_probe_entries(7, 10);
@@ -1667,6 +1497,8 @@ mod tests {
         assert_eq!(obs.metadata_failure_reject, 1);
         assert_eq!(obs.metadata_failure_tcp_connect, 1);
         assert_eq!(obs.metadata_failure_base_handshake, 1);
+        assert_eq!(obs.metadata_failure_peer_closed, 1);
+        assert_eq!(obs.metadata_failure_protocol, 1);
         assert_eq!(obs.peer_cache_endpoint_hits, 1);
         assert_eq!(obs.peer_cache_metadata_hits, 1);
         assert_eq!(
@@ -1718,30 +1550,5 @@ mod tests {
         assert_eq!(snapshot.queue_wait_ms.percentile(0.95), Some(1_000));
         assert_eq!(snapshot.fetch_duration_ms.percentile(0.95), Some(2_000));
         assert_eq!(snapshot.metadata_size_bytes.percentile(0.50), Some(131_072));
-    }
-}
-#[cfg(test)]
-mod yield_counter_tests {
-    use super::*;
-
-    #[test]
-    fn yield_counters_share_across_tasks_without_changing_runtime_snapshot() {
-        let stats = DhtRuntimeStats::default();
-        let clone = stats.clone();
-        let worker = std::thread::spawn(move || {
-            for _ in 0..1_000 {
-                clone.yield_stats().inc("discovery_sample_queries");
-            }
-        });
-        worker.join().unwrap();
-        assert_eq!(
-            stats.yield_stats().snapshot()["discovery_sample_queries"],
-            1_000
-        );
-        assert_eq!(
-            stats.yield_stats().snapshot()["metadata_retry_dispatched"],
-            0
-        );
-        assert_eq!(stats.snapshot().hashes_received, 0);
     }
 }
