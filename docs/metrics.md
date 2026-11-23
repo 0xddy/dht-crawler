@@ -100,8 +100,8 @@ actor 每秒把内部增量 flush 到 counter，因此 exporter 看到的 counte
 `DhtRuntimeStats` 始终可用，与 `metrics` feature 无关：
 
 - `snapshot()` 提供队列、节点池、crawl、Peer 和 UDP 运行状态。
-- `observability_snapshot()` 提供 UDP 字节/包、入站查询分类、announce、节点准入、
-  Metadata 失败分类、failure cache 分类和固定桶。
+- `observability_snapshot()` 提供 UDP 字节/包（含 `udp_rx_ipv4_packets` / `udp_rx_ipv6_packets`）、入站消息与查询分类（含 `inbound_response` / `inbound_error` / `inbound_parse_error`）、announce、节点准入、Metadata 失败分类、failure cache 分类和固定桶。
+- `DHTServer::on_inbound_dht_packet` 提供零分配栈上采样回调（`InboundDhtSample { ip, bytes, kind }`），供上层按需做 GeoIP 离线归因且避免热路径阻塞。
 
 两套出口在同一事件点更新，但读取时都不是跨字段事务快照；短时间内可能相差一个并发
 事件，Prometheus 的 crawl actor counter 还可能有最多约一秒 flush 延迟。

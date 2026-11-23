@@ -38,7 +38,7 @@ pub use runtime_stats::{
 pub use scheduler::{
     MetadataAdmission, MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits,
 };
-pub use server::{DHTServer, HashDiscovered, HashSource};
+pub use server::{DHTServer, HashDiscovered, HashSource, InboundDhtKind, InboundDhtSample};
 pub use types::{
     BootstrapOptions, CrawlOptions, DHTOptions, DiscoveryOptions, FileInfo,
     MetadataFetchCompletion, MetadataFetchCompletionStatus, MetadataOptions, NetMode, NodeTuple,
@@ -52,7 +52,7 @@ pub mod prelude {
     pub use crate::scheduler::{
         MetadataAdmission, MetadataScheduler, MetadataSchedulerCallbacks, MetadataSchedulerLimits,
     };
-    pub use crate::server::{DHTServer, HashDiscovered, HashSource};
+    pub use crate::server::{DHTServer, HashDiscovered, HashSource, InboundDhtKind, InboundDhtSample};
     pub use crate::types::{
         BootstrapOptions, CrawlOptions, DHTOptions, DiscoveryOptions, FileInfo,
         MetadataFetchCompletion, MetadataFetchCompletionStatus, MetadataOptions, NetMode,

@@ -139,6 +139,10 @@ pub struct MetadataConnectionErrorsSnapshot {
 pub struct DhtObservabilitySnapshot {
     /// UDP datagrams received before validation.
     pub udp_rx_packets: u64,
+    /// UDP datagrams received from IPv4 peers before validation.
+    pub udp_rx_ipv4_packets: u64,
+    /// UDP datagrams received from IPv6 peers before validation.
+    pub udp_rx_ipv6_packets: u64,
     /// UDP bytes received before validation.
     pub udp_rx_bytes: u64,
     /// Successfully sent UDP query and response datagrams.
@@ -155,6 +159,12 @@ pub struct DhtObservabilitySnapshot {
     pub inbound_announce_peer: u64,
     /// Other or invalid inbound query names.
     pub inbound_other: u64,
+    /// Valid inbound KRPC response (`y = "r"`) datagrams.
+    pub inbound_response: u64,
+    /// Valid inbound KRPC error (`y = "e"`) datagrams.
+    pub inbound_error: u64,
+    /// Inbound UDP datagrams that failed KRPC bencode parsing.
+    pub inbound_parse_error: u64,
     /// Replies admitted by the regular response budget.
     pub response_normal: u64,
     /// Priority ping/get_peers replies admitted by the reserve.
@@ -439,6 +449,8 @@ struct DhtRuntimeStatsInner {
     udp_responses_rate_limited: AtomicU64,
     udp_responses_priority_reserved: AtomicU64,
 
+    udp_rx_ipv4_packets: AtomicU64,
+    udp_rx_ipv6_packets: AtomicU64,
     udp_rx_bytes: AtomicU64,
     udp_tx_packets: AtomicU64,
     udp_tx_bytes: AtomicU64,
@@ -447,6 +459,9 @@ struct DhtRuntimeStatsInner {
     inbound_get_peers: AtomicU64,
     inbound_announce_peer: AtomicU64,
     inbound_other: AtomicU64,
+    inbound_response: AtomicU64,
+    inbound_error: AtomicU64,
+    inbound_parse_error: AtomicU64,
     response_normal: AtomicU64,
     response_send_failed: AtomicU64,
     announce_accepted: AtomicU64,
@@ -565,6 +580,8 @@ impl Default for DhtRuntimeStatsInner {
             udp_invalid: AtomicU64::new(0),
             udp_responses_rate_limited: AtomicU64::new(0),
             udp_responses_priority_reserved: AtomicU64::new(0),
+            udp_rx_ipv4_packets: AtomicU64::new(0),
+            udp_rx_ipv6_packets: AtomicU64::new(0),
             udp_rx_bytes: AtomicU64::new(0),
             udp_tx_packets: AtomicU64::new(0),
             udp_tx_bytes: AtomicU64::new(0),
@@ -573,6 +590,9 @@ impl Default for DhtRuntimeStatsInner {
             inbound_get_peers: AtomicU64::new(0),
             inbound_announce_peer: AtomicU64::new(0),
             inbound_other: AtomicU64::new(0),
+            inbound_response: AtomicU64::new(0),
+            inbound_error: AtomicU64::new(0),
+            inbound_parse_error: AtomicU64::new(0),
             response_normal: AtomicU64::new(0),
             response_send_failed: AtomicU64::new(0),
             announce_accepted: AtomicU64::new(0),
@@ -721,6 +741,8 @@ impl DhtRuntimeStats {
         let inner = &self.inner;
         DhtObservabilitySnapshot {
             udp_rx_packets: inner.udp_received.load(Ordering::Relaxed),
+            udp_rx_ipv4_packets: inner.udp_rx_ipv4_packets.load(Ordering::Relaxed),
+            udp_rx_ipv6_packets: inner.udp_rx_ipv6_packets.load(Ordering::Relaxed),
             udp_rx_bytes: inner.udp_rx_bytes.load(Ordering::Relaxed),
             udp_tx_packets: inner.udp_tx_packets.load(Ordering::Relaxed),
             udp_tx_bytes: inner.udp_tx_bytes.load(Ordering::Relaxed),
@@ -729,6 +751,9 @@ impl DhtRuntimeStats {
             inbound_get_peers: inner.inbound_get_peers.load(Ordering::Relaxed),
             inbound_announce_peer: inner.inbound_announce_peer.load(Ordering::Relaxed),
             inbound_other: inner.inbound_other.load(Ordering::Relaxed),
+            inbound_response: inner.inbound_response.load(Ordering::Relaxed),
+            inbound_error: inner.inbound_error.load(Ordering::Relaxed),
+            inbound_parse_error: inner.inbound_parse_error.load(Ordering::Relaxed),
             response_normal: inner.response_normal.load(Ordering::Relaxed),
             response_fallback: inner
                 .udp_responses_priority_reserved
@@ -1063,6 +1088,15 @@ impl DhtRuntimeStats {
         self.inner.udp_received.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn udp_received_family(&self, is_ipv6: bool) {
+        let counter = if is_ipv6 {
+            &self.inner.udp_rx_ipv6_packets
+        } else {
+            &self.inner.udp_rx_ipv4_packets
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn udp_received_bytes(&self, bytes: usize) {
         self.inner
             .udp_rx_bytes
@@ -1085,6 +1119,20 @@ impl DhtRuntimeStats {
             _ => &self.inner.inbound_other,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inbound_response(&self) {
+        self.inner.inbound_response.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inbound_error(&self) {
+        self.inner.inbound_error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inbound_parse_error(&self) {
+        self.inner
+            .inbound_parse_error
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn response_normal(&self) {
@@ -1524,10 +1572,16 @@ mod tests {
     fn observability_snapshot_tracks_fixed_histograms_and_categories() {
         let stats = DhtRuntimeStats::default();
         stats.udp_received();
+        stats.udp_received_family(false);
+        stats.udp_received_family(true);
+        stats.udp_received_family(true);
         stats.udp_received_bytes(128);
         stats.udp_sent(64);
         stats.inbound_query("ping");
         stats.inbound_query("unknown");
+        stats.inbound_response();
+        stats.inbound_error();
+        stats.inbound_parse_error();
         stats.node_admitted();
         stats.metadata_bytes_downloaded(1_024);
         stats.metadata_failure_parse();
@@ -1538,11 +1592,16 @@ mod tests {
 
         let snapshot = stats.observability_snapshot();
         assert_eq!(snapshot.udp_rx_packets, 1);
+        assert_eq!(snapshot.udp_rx_ipv4_packets, 1);
+        assert_eq!(snapshot.udp_rx_ipv6_packets, 2);
         assert_eq!(snapshot.udp_rx_bytes, 128);
         assert_eq!(snapshot.udp_tx_packets, 1);
         assert_eq!(snapshot.udp_tx_bytes, 64);
         assert_eq!(snapshot.inbound_ping, 1);
         assert_eq!(snapshot.inbound_other, 1);
+        assert_eq!(snapshot.inbound_response, 1);
+        assert_eq!(snapshot.inbound_error, 1);
+        assert_eq!(snapshot.inbound_parse_error, 1);
         assert_eq!(snapshot.node_admitted, 1);
         assert_eq!(snapshot.metadata_bytes_downloaded, 1_024);
         assert_eq!(snapshot.metadata_failure_parse, 1);

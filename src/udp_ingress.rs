@@ -80,6 +80,7 @@ fn process_udp_packet(
     workers: &mut Vec<WorkerHandle>,
 ) -> std::result::Result<(), ProcessUdpPacketError> {
     runtime_stats.udp_received();
+    runtime_stats.udp_received_family(origin_addr.is_ipv6());
     runtime_stats.udp_received_bytes(size);
     #[cfg(feature = "metrics")]
     counter!("dht_udp_bytes_received_total").increment(size as u64);
@@ -341,5 +342,60 @@ mod tests {
         assert_eq!(snapshot.udp_received, 1);
         assert_eq!(snapshot.udp_invalid, 1);
         assert_eq!(snapshot.udp_queue_full, 0);
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_family_counters_are_tracked_separately() {
+        let pool = UdpBufferPool::new();
+        let stats = DhtRuntimeStats::default();
+        let v4_remote: SocketAddr = "1.1.1.1:6881".parse().unwrap();
+        let v6_remote: SocketAddr = "[2606:4700:4700::1111]:6881".parse().unwrap();
+        let local_addr: SocketAddr = "0.0.0.0:12313".parse().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut workers = vec![tx];
+
+        assert!(
+            process_udp_packet(
+                buffer(&pool, b'd'),
+                1,
+                v4_remote,
+                local_addr,
+                &pool,
+                &stats,
+                &mut workers,
+            )
+            .is_ok()
+        );
+        assert!(
+            process_udp_packet(
+                buffer(&pool, b'd'),
+                2,
+                v6_remote,
+                local_addr,
+                &pool,
+                &stats,
+                &mut workers,
+            )
+            .is_ok()
+        );
+        // Invalid packets also increment family counters right at UDP receipt.
+        let _ = process_udp_packet(
+            buffer(&pool, b'x'),
+            1,
+            v6_remote,
+            local_addr,
+            &pool,
+            &stats,
+            &mut workers,
+        );
+
+        let obs = stats.observability_snapshot();
+        assert_eq!(obs.udp_rx_packets, 3);
+        assert_eq!(obs.udp_rx_ipv4_packets, 1);
+        assert_eq!(obs.udp_rx_ipv6_packets, 2);
+
+        while let Ok((pkt, _, _)) = rx.try_recv() {
+            pool.release(pkt.buf);
+        }
     }
 }

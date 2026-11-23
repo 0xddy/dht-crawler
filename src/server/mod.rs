@@ -40,6 +40,42 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) type FilterCallback = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
 type ErrorCallback = Box<dyn Fn(crate::error::DHTError) + Send + Sync + 'static>;
+type InboundPacketCallback = Box<dyn Fn(InboundDhtSample) + Send + Sync + 'static>;
+
+/// Classifies inbound KRPC datagrams for lightweight traffic attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboundDhtKind {
+    Ping,
+    FindNode,
+    GetPeers,
+    AnnouncePeer,
+    Response,
+    Error,
+    Other,
+}
+
+impl InboundDhtKind {
+    pub(crate) fn from_query_str(q: &str) -> Self {
+        match q {
+            "ping" => Self::Ping,
+            "find_node" => Self::FindNode,
+            "get_peers" => Self::GetPeers,
+            "announce_peer" => Self::AnnouncePeer,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Zero-allocation stack sample emitted for valid inbound KRPC datagrams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundDhtSample {
+    /// Source peer IP address.
+    pub ip: IpAddr,
+    /// Raw UDP datagram payload size in bytes, saturated at `u16::MAX`.
+    pub bytes: u16,
+    /// Parsed KRPC message category.
+    pub kind: InboundDhtKind,
+}
 
 struct QueryResponse<'a> {
     transaction_id: &'a [u8],
@@ -86,6 +122,7 @@ pub struct DHTServer {
     on_metadata_fetch: Arc<ArcSwapOption<MetadataFetchCallback>>,
     metadata_completion_callback: Arc<ArcSwapOption<MetadataCompletionCallback>>,
     error_callback: Arc<ArcSwapOption<ErrorCallback>>,
+    on_inbound_packet: Arc<ArcSwapOption<InboundPacketCallback>>,
     crawl_engine: Arc<CrawlEngine>,
     peer_lookup: PeerLookupHandle,
     discovery: DiscoveryHandle,
@@ -264,6 +301,7 @@ impl DHTServer {
             on_metadata_fetch,
             metadata_completion_callback,
             error_callback: Arc::new(ArcSwapOption::empty()),
+            on_inbound_packet: Arc::new(ArcSwapOption::empty()),
             crawl_engine,
             peer_lookup,
             discovery,
@@ -378,6 +416,32 @@ impl DHTServer {
     {
         let callback: Arc<ErrorCallback> = Arc::new(Box::new(callback));
         self.error_callback.store(Some(callback));
+    }
+
+    /// Registers a synchronous, non-blocking observer invoked for each valid inbound KRPC datagram.
+    ///
+    /// Callers must avoid blocking or allocating inside `callback` because it runs on the UDP worker hot path.
+    /// Registering a new callback replaces any previous observer.
+    pub fn on_inbound_dht_packet<F>(&self, callback: F)
+    where
+        F: Fn(InboundDhtSample) + Send + Sync + 'static,
+    {
+        let callback: Arc<InboundPacketCallback> = Arc::new(Box::new(callback));
+        self.on_inbound_packet.store(Some(callback));
+    }
+
+    /// Clears the registered inbound DHT packet observer callback, if any.
+    pub fn clear_inbound_dht_packet_observer(&self) {
+        self.on_inbound_packet.store(None);
+    }
+
+    #[inline]
+    fn emit_inbound_packet(&self, ip: IpAddr, payload_len: usize, kind: InboundDhtKind) {
+        let guard = self.on_inbound_packet.load();
+        if let Some(callback) = guard.as_ref() {
+            let bytes = u16::try_from(payload_len).unwrap_or(u16::MAX);
+            callback(InboundDhtSample { ip, bytes, kind });
+        }
     }
 
     fn emit_error(&self, error: crate::error::DHTError) {
@@ -517,6 +581,7 @@ impl DHTServer {
         let msg: DhtMessage = match serde_bencode::from_bytes(data) {
             Ok(m) => m,
             Err(_) => {
+                self.runtime_stats.inbound_parse_error();
                 #[cfg(feature = "metrics")]
                 counter!("dht_messages_parse_error_total").increment(1);
                 return Ok(());
@@ -540,6 +605,7 @@ impl DHTServer {
                     self.handle_query(
                         &msg,
                         q_type.as_bytes(),
+                        data.len(),
                         remote_addr,
                         local_addr,
                         response_limiter,
@@ -549,6 +615,8 @@ impl DHTServer {
                 }
             }
             "r" => {
+                self.runtime_stats.inbound_response();
+                self.emit_inbound_packet(remote_addr.ip(), data.len(), InboundDhtKind::Response);
                 if let Some(response) = msg.r
                     && let Some(tid) = transaction_id_from_bytes(&msg.t)
                 {
@@ -564,6 +632,8 @@ impl DHTServer {
                 }
             }
             "e" => {
+                self.runtime_stats.inbound_error();
+                self.emit_inbound_packet(remote_addr.ip(), data.len(), InboundDhtKind::Error);
                 if let Some(tid) = transaction_id_from_bytes(&msg.t) {
                     if is_sample_tid(&tid) {
                         self.discovery.route_response(remote_addr, tid, None);
@@ -572,15 +642,19 @@ impl DHTServer {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                self.emit_inbound_packet(remote_addr.ip(), data.len(), InboundDhtKind::Other);
+            }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_query(
         &self,
         msg: &DhtMessage,
         query_type: &[u8],
+        payload_len: usize,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         response_limiter: &mut WorkerResponseLimiter,
@@ -603,6 +677,11 @@ impl DHTServer {
                 .map(|v| v.as_slice())
         };
         self.runtime_stats.inbound_query(q_str);
+        self.emit_inbound_packet(
+            remote_addr.ip(),
+            payload_len,
+            InboundDhtKind::from_query_str(q_str),
+        );
 
         if let Some(sender_id) = sender_id
             && sender_id.len() == 20
@@ -910,6 +989,139 @@ mod tests {
         assert!(!is_fn_priority);
         let fn_decoded: DhtMessage = serde_bencode::from_bytes(&fn_buffer).unwrap();
         assert_eq!(&fn_decoded.r.unwrap().id.unwrap()[..6], &sender_id[..6]);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn handle_message_tracks_new_counters_and_inbound_observer() {
+        use std::sync::Mutex;
+
+        let options = DHTOptions {
+            port: 0,
+            ..DHTOptions::default()
+        };
+        let server = DHTServer::new(options).await.unwrap();
+        let local_addr = *server.sockets_by_bind_addr.keys().next().unwrap();
+        let mut response_limiter = WorkerResponseLimiter::new(0, 0, 0, Instant::now());
+        let mut response_buffer = BytesMut::with_capacity(512);
+
+        let recorded: Arc<Mutex<Vec<InboundDhtSample>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_cb = recorded.clone();
+        server.on_inbound_dht_packet(move |sample| {
+            recorded_cb.lock().unwrap().push(sample);
+        });
+
+        let peer_v4: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+        let peer_v6: SocketAddr = "[2001:4860:4860::8888]:6881".parse().unwrap();
+
+        let ping = b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:aa1:y1:qe";
+        let find_node =
+            b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaa6:target20:bbbbbbbbbbbbbbbbbbbbe1:q9:find_node1:t2:bb1:y1:qe";
+        let get_peers =
+            b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaa9:info_hash20:cccccccccccccccccccce1:q9:get_peers1:t2:cc1:y1:qe";
+        let announce_peer = b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaa9:info_hash20:cccccccccccccccccccc4:porti6881e5:token8:12345678e1:q13:announce_peer1:t2:dd1:y1:qe";
+        let response = b"d1:rd2:id20:aaaaaaaaaaaaaaaaaaaae1:t2:ee1:y1:re";
+        let error_pkt = b"d1:t2:ff1:y1:ee";
+        let invalid = b"not-valid-bencode";
+
+        let packets: &[(&[u8], SocketAddr)] = &[
+            (ping, peer_v4),
+            (find_node, peer_v4),
+            (get_peers, peer_v4),
+            (announce_peer, peer_v4),
+            (response, peer_v6),
+            (error_pkt, peer_v4),
+            (invalid, peer_v4),
+        ];
+
+        for (payload, remote) in packets {
+            server
+                .handle_message(
+                    payload,
+                    *remote,
+                    local_addr,
+                    &mut response_limiter,
+                    &mut response_buffer,
+                )
+                .await
+                .unwrap();
+        }
+
+        {
+            let guard = recorded.lock().unwrap();
+            assert_eq!(guard.len(), 6);
+            assert_eq!(
+                guard[0],
+                InboundDhtSample {
+                    ip: peer_v4.ip(),
+                    bytes: ping.len() as u16,
+                    kind: InboundDhtKind::Ping,
+                }
+            );
+            assert_eq!(
+                guard[1],
+                InboundDhtSample {
+                    ip: peer_v4.ip(),
+                    bytes: find_node.len() as u16,
+                    kind: InboundDhtKind::FindNode,
+                }
+            );
+            assert_eq!(
+                guard[2],
+                InboundDhtSample {
+                    ip: peer_v4.ip(),
+                    bytes: get_peers.len() as u16,
+                    kind: InboundDhtKind::GetPeers,
+                }
+            );
+            assert_eq!(
+                guard[3],
+                InboundDhtSample {
+                    ip: peer_v4.ip(),
+                    bytes: announce_peer.len() as u16,
+                    kind: InboundDhtKind::AnnouncePeer,
+                }
+            );
+            assert_eq!(
+                guard[4],
+                InboundDhtSample {
+                    ip: peer_v6.ip(),
+                    bytes: response.len() as u16,
+                    kind: InboundDhtKind::Response,
+                }
+            );
+            assert_eq!(
+                guard[5],
+                InboundDhtSample {
+                    ip: peer_v4.ip(),
+                    bytes: error_pkt.len() as u16,
+                    kind: InboundDhtKind::Error,
+                }
+            );
+        }
+
+        server.clear_inbound_dht_packet_observer();
+        server
+            .handle_message(
+                ping,
+                peer_v4,
+                local_addr,
+                &mut response_limiter,
+                &mut response_buffer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded.lock().unwrap().len(), 6);
+
+        let obs = server.runtime_stats().observability_snapshot();
+        assert_eq!(obs.inbound_ping, 2);
+        assert_eq!(obs.inbound_find_node, 1);
+        assert_eq!(obs.inbound_get_peers, 1);
+        assert_eq!(obs.inbound_announce_peer, 1);
+        assert_eq!(obs.inbound_response, 1);
+        assert_eq!(obs.inbound_error, 1);
+        assert_eq!(obs.inbound_parse_error, 1);
 
         server.shutdown();
     }
