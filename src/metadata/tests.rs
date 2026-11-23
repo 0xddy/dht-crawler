@@ -10,11 +10,17 @@ use tokio::net::TcpListener;
 async fn serve_metadata(mut conn: TestPeerConn, metadata: Bytes, reject: bool) {
     let (id, _) = conn.receive_extended().await.unwrap();
     assert_eq!(id, 0);
-    conn.send_extended(0, &encode_ext_handshake(Some(3), Some(metadata.len() as i64)))
-        .await
-        .unwrap();
+    conn.send_extended(
+        0,
+        &encode_ext_handshake(Some(3), Some(metadata.len() as i64)),
+    )
+    .await
+    .unwrap();
     let (ext_id, payload) = conn.receive_extended().await.unwrap();
-    assert_eq!(ext_id, 3, "expected metadata request using the remote extension ID");
+    assert_eq!(
+        ext_id, 3,
+        "expected metadata request using the remote extension ID"
+    );
     assert_eq!(
         MetadataMsg::decode(payload).unwrap(),
         MetadataMsg::Request { piece: 0 }
@@ -393,9 +399,15 @@ async fn base_handshake_errors_preserve_aggregate_connection_failures() {
 fn connection_errors_use_typed_variants_not_error_text() {
     use std::io::Error;
     for (kind, expected) in [
-        (ErrorKind::ConnectionRefused, MetadataConnectionError::Refused),
+        (
+            ErrorKind::ConnectionRefused,
+            MetadataConnectionError::Refused,
+        ),
         (ErrorKind::ConnectionReset, MetadataConnectionError::Reset),
-        (ErrorKind::ConnectionAborted, MetadataConnectionError::Aborted),
+        (
+            ErrorKind::ConnectionAborted,
+            MetadataConnectionError::Aborted,
+        ),
         (ErrorKind::UnexpectedEof, MetadataConnectionError::Closed),
         (ErrorKind::TimedOut, MetadataConnectionError::Timeout),
         (ErrorKind::Other, MetadataConnectionError::IoOther),
@@ -435,13 +447,19 @@ async fn successful_local_metadata_does_not_increment_failure_diagnostics() {
             .await
             .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 0);
-        conn.send_extended(0, &encode_ext_handshake(Some(3), Some(metadata.len() as i64)))
-            .await
-            .unwrap();
+        conn.send_extended(
+            0,
+            &encode_ext_handshake(Some(3), Some(metadata.len() as i64)),
+        )
+        .await
+        .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 3);
-        conn.send_extended(1, &encode_metadata_data(0, metadata.len() as u64, &metadata))
-            .await
-            .unwrap();
+        conn.send_extended(
+            1,
+            &encode_metadata_data(0, metadata.len() as u64, &metadata),
+        )
+        .await
+        .unwrap();
     });
     let stats = DhtRuntimeStats::default();
     let fetcher = RbitFetcher::new_with_runtime_stats(5, 0, 0, stats.clone());
@@ -518,12 +536,9 @@ async fn oversized_i64_metadata_size_above_u32_max_triggers_size_limit() {
             .await
             .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 0);
-        conn.send_extended(
-            0,
-            &encode_ext_handshake(Some(3), Some((1i64 << 32) + 100)),
-        )
-        .await
-        .unwrap();
+        conn.send_extended(0, &encode_ext_handshake(Some(3), Some((1i64 << 32) + 100)))
+            .await
+            .unwrap();
     });
 
     let stats = DhtRuntimeStats::default();
@@ -566,9 +581,12 @@ async fn multi_piece_metadata_exceeding_window_downloads_with_sliding_window() {
             .await
             .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 0);
-        conn.send_extended(0, &encode_ext_handshake(Some(3), Some(meta_clone.len() as i64)))
-            .await
-            .unwrap();
+        conn.send_extended(
+            0,
+            &encode_ext_handshake(Some(3), Some(meta_clone.len() as i64)),
+        )
+        .await
+        .unwrap();
 
         for expected_piece in 0..total_pieces {
             let (ext_id, payload) = conn.receive_extended().await.unwrap();
@@ -590,8 +608,7 @@ async fn multi_piece_metadata_exceeding_window_downloads_with_sliding_window() {
 
     let stats = DhtRuntimeStats::default();
     let fetcher = RbitFetcher::new_with_runtime_stats(5, 0, 0, stats.clone());
-    let MetadataFetchOutcome::Fetched((name, size, _, _)) =
-        fetcher.fetch(&info_hash, addr).await
+    let MetadataFetchOutcome::Fetched((name, size, _, _)) = fetcher.fetch(&info_hash, addr).await
     else {
         panic!("sliding window fetch should succeed");
     };
@@ -612,13 +629,19 @@ async fn invalid_piece_index_or_length_is_rejected_cleanly() {
             .await
             .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 0);
-        conn.send_extended(0, &encode_ext_handshake(Some(3), Some(metadata.len() as i64)))
-            .await
-            .unwrap();
+        conn.send_extended(
+            0,
+            &encode_ext_handshake(Some(3), Some(metadata.len() as i64)),
+        )
+        .await
+        .unwrap();
         assert_eq!(conn.receive_extended().await.unwrap().0, 3);
-        conn.send_extended(1, &encode_metadata_data(99, metadata.len() as u64, &metadata))
-            .await
-            .unwrap();
+        conn.send_extended(
+            1,
+            &encode_metadata_data(99, metadata.len() as u64, &metadata),
+        )
+        .await
+        .unwrap();
     });
 
     let stats = DhtRuntimeStats::default();
@@ -704,7 +727,8 @@ fn parse_metadata_prefers_utf8_fields_handles_lossy_and_rejects_negative_lengths
         Bytes::from_static(b"name"),
         BencodeValue::Bytes(Bytes::from_static(b"bad\xff")),
     );
-    let (lossy_name, size, _, _) = parse_metadata(&encode(&BencodeValue::Dict(lossy_info))).unwrap();
+    let (lossy_name, size, _, _) =
+        parse_metadata(&encode(&BencodeValue::Dict(lossy_info))).unwrap();
     assert_eq!(lossy_name, "bad\u{fffd}");
     assert_eq!(size, 50);
 
@@ -712,6 +736,100 @@ fn parse_metadata_prefers_utf8_fields_handles_lossy_and_rejects_negative_lengths
     neg_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(-5));
     neg_info.insert(Bytes::from_static(b"name"), BencodeValue::string("neg"));
     assert!(parse_metadata(&encode(&BencodeValue::Dict(neg_info))).is_none());
+}
+
+#[test]
+fn parse_metadata_decodes_legacy_gbk_big5_shift_jis_and_win1251_torrents() {
+    use encoding_rs::{BIG5, GB18030, SHIFT_JIS, WINDOWS_1251};
+
+    // 1. 典型老式中文 GBK 种子（无 name.utf-8，对应 ԭƻ@... 场景）
+    let gbk_title = "原创计划@老牌影视论坛X-英12岁少女";
+    let gbk_file = "正片合集/第01集高清版.mkv";
+    let (gbk_title_bytes, _, _) = GB18030.encode(gbk_title);
+    let (gbk_dir_bytes, _, _) = GB18030.encode("正片合集");
+    let (gbk_name_bytes, _, _) = GB18030.encode("第01集高清版.mkv");
+    let mut f1 = BTreeMap::new();
+    f1.insert(Bytes::from_static(b"length"), BencodeValue::Integer(1024));
+    f1.insert(
+        Bytes::from_static(b"path"),
+        BencodeValue::List(vec![
+            BencodeValue::Bytes(Bytes::copy_from_slice(&gbk_dir_bytes)),
+            BencodeValue::Bytes(Bytes::copy_from_slice(&gbk_name_bytes)),
+        ]),
+    );
+    let mut gbk_info = BTreeMap::new();
+    gbk_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&gbk_title_bytes)),
+    );
+    gbk_info.insert(
+        Bytes::from_static(b"files"),
+        BencodeValue::List(vec![BencodeValue::Dict(f1)]),
+    );
+    let (name, total_size, files, _) =
+        parse_metadata(&encode(&BencodeValue::Dict(gbk_info))).unwrap();
+    assert_eq!(name, gbk_title);
+    assert_eq!(total_size, 1024);
+    assert_eq!(files[0].path, gbk_file);
+
+    // 2. 极短中文 GB2312 标题（2 个汉字）
+    let (short_gbk, _, _) = GB18030.encode("电影.mkv");
+    let mut short_info = BTreeMap::new();
+    short_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(512));
+    short_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&short_gbk)),
+    );
+    let (short_name, _, _, _) = parse_metadata(&encode(&BencodeValue::Dict(short_info))).unwrap();
+    assert_eq!(short_name, "电影.mkv");
+
+    // 3. 繁体中文 Big5 种子
+    let big5_title = "經典電影合集繁體中文字幕版";
+    let (big5_bytes, _, _) = BIG5.encode(big5_title);
+    let mut big5_info = BTreeMap::new();
+    big5_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(2048));
+    big5_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&big5_bytes)),
+    );
+    let (decoded_big5, _, _, _) = parse_metadata(&encode(&BencodeValue::Dict(big5_info))).unwrap();
+    assert_eq!(decoded_big5, big5_title);
+
+    // 4. 日文 Shift_JIS 种子
+    let sjis_title = "アニメーション映画コレクション完全版";
+    let (sjis_bytes, _, _) = SHIFT_JIS.encode(sjis_title);
+    let mut sjis_info = BTreeMap::new();
+    sjis_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(4096));
+    sjis_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&sjis_bytes)),
+    );
+    let (decoded_sjis, _, _, _) = parse_metadata(&encode(&BencodeValue::Dict(sjis_info))).unwrap();
+    assert_eq!(decoded_sjis, sjis_title);
+
+    // 5. 俄文 Windows-1251 种子
+    let ru_title = "Коллекция фильмов высокого качества";
+    let (ru_bytes, _, _) = WINDOWS_1251.encode(ru_title);
+    let mut ru_info = BTreeMap::new();
+    ru_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(4096));
+    ru_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&ru_bytes)),
+    );
+    let (decoded_ru, _, _, _) = parse_metadata(&encode(&BencodeValue::Dict(ru_info))).unwrap();
+    assert_eq!(decoded_ru, ru_title);
+
+    // 6. 西欧 Windows-1252 种子（不被 GB18030 误抢）
+    let fr_title = "Les Misérables - Édition Spéciale.mkv";
+    let (fr_bytes, _, _) = encoding_rs::WINDOWS_1252.encode(fr_title);
+    let mut fr_info = BTreeMap::new();
+    fr_info.insert(Bytes::from_static(b"length"), BencodeValue::Integer(4096));
+    fr_info.insert(
+        Bytes::from_static(b"name"),
+        BencodeValue::Bytes(Bytes::copy_from_slice(&fr_bytes)),
+    );
+    let (decoded_fr, _, _, _) = parse_metadata(&encode(&BencodeValue::Dict(fr_info))).unwrap();
+    assert_eq!(decoded_fr, fr_title);
 }
 
 #[test]

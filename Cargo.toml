@@ -30,6 +30,8 @@ socket2 = { version = "0.5", features = ["all"] }
 bytes = "1.0"
 ahash = "0.8"
 serde_bytes = "0.11.19"
+encoding_rs = "0.8"
+chardetng = "0.1"
 metrics = { version = "0.24", optional = true }
 crossbeam-queue = "0.3"
 jni = { version = "0.21", optional = true }
